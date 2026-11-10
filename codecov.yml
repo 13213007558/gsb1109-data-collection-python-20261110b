@@ -1,0 +1,9 @@
+ignore:
+    - "tests/**"
+coverage:
+    status:
+        project:
+            default:
+                target: 90%
+                threshold: 50%
+        patch: off

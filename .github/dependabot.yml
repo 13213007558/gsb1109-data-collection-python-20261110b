@@ -1,0 +1,22 @@
+
+version: 2
+updates:
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions-deps:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    versioning-strategy: increase-if-necessary
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      deps:
+        patterns:
+          - "*"
