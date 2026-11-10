@@ -1,0 +1,15 @@
+*.egg-info
+*.egg
+*.pyc
+*.so
+*.pyd
+.DS_Store
+/.claude/
+/MANIFEST
+/.coverage
+/coverage.xml
+/htmlcov
+/build
+/dist
+/docs
+/tsan_report.txt
