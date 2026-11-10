@@ -1,0 +1,93 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+env:
+  LATEST_PY_VERSION: '3.14'
+  PYTEST_VERBOSE: 'true'
+
+jobs:
+  # Run tests for each supported python version
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version:
+          [
+            '3.15',
+            '3.14',
+            '3.13',
+            '3.12',
+            '3.11',
+            '3.10',
+            '3.9',
+            '3.8',
+            'pypy3.11',
+            'pypy3.10',
+          ]
+      fail-fast: false
+    services:
+      nginx:
+        image: mccutchen/go-httpbin
+        ports:
+          - 8080:8080
+
+    steps:
+      # Install dependencies, with caching
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install dependencies
+        run: |
+          uv python install ${{ matrix.python-version }}
+          uv sync --all-extras
+
+      # Start integration test databases
+      - uses: supercharge/mongodb-github-action@89d1ecb837145f486898e235478a7e267f68c44e # main
+        with:
+          mongodb-version: 8
+          mongodb-extra-env: GLIBC_TUNABLES=glibc.pthread.rseq=1
+      - uses: supercharge/redis-github-action@bc274cb7238cd63a45029db04ee48c07a72609fd # 1.8.1
+        with:
+          redis-version: 7
+      - uses: rrainn/dynamodb-action@6a3badf0a22ac70eeff82cc9f4f263b0e5ddfaf7 # v5.0.0
+
+      # Run tests with coverage report
+      - name: Run unit + integration tests
+        if: ${{ !contains(matrix.python-version, 'pypy') }}
+        run: |
+          uv run nox -e cov -- xml
+          uv run nox -e stress -- 1
+
+      # pypy tests aren't run in parallel, so too slow for integration tests
+      - name: Run unit tests only
+        if: ${{ contains(matrix.python-version, 'pypy') }}
+        run: uv run pytest tests/unit
+
+      # Latest python version: send coverage report to codecov
+      - name: 'Upload coverage report to Codecov'
+        if: ${{ matrix.python-version == env.LATEST_PY_VERSION }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+
+  # Run code analysis checks via pre-commit hooks
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.LATEST_PY_VERSION }}
+      - name: Run style checks & linting
+        uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
+      - name: Scan dependencies for known vulnerabilities
+        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
+        with:
+          inputs: .
+          vulnerability-service: osv
