@@ -1,0 +1,667 @@
+"""Test language selectors."""
+from .. import util
+
+
+class TestLang(util.TestCase):
+    """Test language selectors."""
+
+    MARKUP = """
+    <div lang="de-DE">
+        <p id="1"></p>
+    </div>
+    <div lang="de-DE-1996">
+        <p id="2"></p>
+    </div>
+    <div lang="de-Latn-DE">
+        <p id="3"></p>
+    </div>
+    <div lang="de-Latf-DE">
+        <p id="4"></p>
+    </div>
+    <div lang="de-Latn-DE-1996">
+        <p id="5"></p>
+    </div>
+    <p id="6" lang="de-DE"></p>
+    <div lang="a-DE">
+        <p id="7"></p>
+    </div>
+    <!-- Singletons don't match implicit wildcards (* not at start are ignored and treated as implicit) -->
+    <div lang="a-a-DE">
+        <p id="8"></p>
+    </div>
+    <div lang="en-a-DE">
+        <p id="9"></p>
+    </div>
+    """
+
+    def test_lang(self):
+        """Test language and that it uses implicit wildcard."""
+
+        # Implicit wild
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang(de-DE)",
+            ['1', '2', '3', '4', '5', '6'],
+            flags=util.HTML
+        )
+
+    def test_lang_missing_range(self):
+        """Test language range with a missing range."""
+
+        # Implicit wild
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang(de--DE)",
+            [],
+            flags=util.HTML
+        )
+
+    def test_explicit_wildcard(self):
+        """Test language with explicit wildcard (same as implicit)."""
+
+        # Explicit wild
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang(de-\\*-DE)",
+            ['1', '2', '3', '4', '5', '6'],
+            flags=util.HTML
+        )
+
+    def test_only_wildcard(self):
+        """Test language with only a wildcard."""
+
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang('*')",
+            ['1', '2', '3', '4', '5', '6', '7', '8', '9'],
+            flags=util.HTML
+        )
+
+    def test_wildcard_start_no_match(self):
+        """Test language with a wildcard at start, but it matches nothing."""
+
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang('*-de-DE')",
+            [],
+            flags=util.HTML
+        )
+
+    def test_wildcard_start_collapse(self):
+        """Test that language with multiple wildcard patterns at start collapse."""
+
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang('*-*-*-DE')",
+            ['1', '2', '3', '4', '5', '6', '7'],
+            flags=util.HTML
+        )
+
+    def test_wildcard_at_start_escaped(self):
+        """
+        Test language with wildcard at start (escaped).
+
+        Wildcard in the middle is same as implicit, but at the start, it has specific meaning.
+        """
+
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang(\\*-DE)",
+            ['1', '2', '3', '4', '5', '6', '7'],
+            flags=util.HTML
+        )
+
+    def test_wildcard_trailing(self):
+        """Test that wildcards after the first subtag are ignored, even at the end of the range."""
+
+        markup = """
+        <div id="1" lang="en"></div>
+        <div id="2" lang="en-US"></div>
+        <div id="3" lang="en-Latn-US"></div>
+        <div id="4" lang="de-DE"></div>
+        <div id="5" lang="de-Latn-DE"></div>
+        <div id="6" lang="en-x-foo"></div>
+        <div id="7" lang=""></div>
+        <div id="8"></div>
+        """
+
+        self.assert_selector(markup, "div:lang('en-*')", ['1', '2', '3', '6'], flags=util.HTML)
+        self.assert_selector(markup, "div:lang('en-*-*')", ['1', '2', '3', '6'], flags=util.HTML)
+        self.assert_selector(markup, "div:lang('*-*')", ['1', '2', '3', '4', '5', '6'], flags=util.HTML)
+        self.assert_selector(markup, "div:lang('*-*-*')", ['1', '2', '3', '4', '5', '6'], flags=util.HTML)
+        self.assert_selector(markup, "div:lang('en-*-US')", ['2', '3'], flags=util.HTML)
+        self.assert_selector(markup, "div:lang('de-*-DE')", ['4', '5'], flags=util.HTML)
+        self.assert_selector(markup, "div:lang('en-x-*')", ['6'], flags=util.HTML)
+
+    def test_language_quoted(self):
+        """Test language (quoted)."""
+
+        # Normal quoted
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang('de-DE')",
+            ['1', '2', '3', '4', '5', '6'],
+            flags=util.HTML
+        )
+
+    def test_language_quoted_with_escaped_newline(self):
+        """Test language (quoted) with escaped new line."""
+
+        # Normal quoted
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang('de-\\\nDE')",
+            ['1', '2', '3', '4', '5', '6'],
+            flags=util.HTML
+        )
+
+    def test_wildcard_at_start_quoted(self):
+        """Test language with wildcard at start (quoted)."""
+
+        # First wild quoted
+        self.assert_selector(
+            self.MARKUP,
+            "p:lang('*-DE')",
+            ['1', '2', '3', '4', '5', '6', '7'],
+            flags=util.HTML
+        )
+
+    def test_avoid_implicit_language(self):
+        """Test that we can narrow language selection to elements that match and explicitly state language."""
+
+        # Target element with language and language attribute
+        self.assert_selector(
+            self.MARKUP,
+            "p[lang]:lang(de-DE)",
+            ['6'],
+            flags=util.HTML
+        )
+
+    def test_language_und(self):
+        """Test that undefined language can be matched by `*`."""
+
+        markup = """
+        <div id="1" lang=""></div>
+        <div id="2" lang="und"></div>
+        <div id="3" lang=>
+            <div id="4"></div>
+        </div>
+        <div id="5"></div>
+        """
+
+        self.assert_selector(
+            markup,
+            "div:lang('*')",
+            ['2'],
+            flags=util.HTML
+        )
+
+    def test_language_empty_string(self):
+        """Test that an empty string language will match untagged languages `lang=""` and unknown languages."""
+
+        markup = """
+        <div id="1" lang=""></div>
+        <div id="2" lang="und"></div>
+        <div id="3" lang=>
+            <div id="4"></div>
+        </div>
+        <div id="5"></div>
+        """
+
+        self.assert_selector(
+            markup,
+            "div:lang('')",
+            ['1', '3', '4', '5'],
+            flags=util.HTML
+        )
+
+    def test_language_empty_string_in_tagged_ancestor(self):
+        """Test that an empty string language is not replaced by the language of a tagged ancestor."""
+
+        markup = """
+        <div lang="de">
+            <p id="1" lang=""></p>
+            <div lang="">
+                <p id="2"></p>
+            </div>
+            <p id="3"></p>
+        </div>
+        """
+
+        self.assert_selector(
+            markup,
+            "p:lang(de)",
+            ['3'],
+            flags=util.HTML
+        )
+
+    def test_language_list(self):
+        """Test language list."""
+
+        # Multiple languages
+        markup = """
+        <div lang="de-DE">
+            <p id="1"></p>
+        </div>
+        <div lang="en">
+            <p id="2"></p>
+        </div>
+        <div lang="de-Latn-DE">
+            <p id="3"></p>
+        </div>
+        <div lang="de-Latf-DE">
+            <p id="4"></p>
+        </div>
+        <div lang="en-US">
+            <p id="5"></p>
+        </div>
+        <p id="6" lang="de-DE"></p>
+        """
+
+        self.assert_selector(
+            markup,
+            "p:lang(de-DE, '*-US')",
+            ['1', '3', '4', '5', '6'],
+            flags=util.HTML
+        )
+
+    def test_undetermined_language(self):
+        """Test undetermined language."""
+
+        markup = """
+        <div>
+            <p id="1"></p>
+        </div>
+        """
+
+        self.assert_selector(
+            markup,
+            "p:lang(en)",
+            [],
+            flags=util.HTML
+        )
+
+    def test_language_in_header(self):
+        """Test that we can find language in header."""
+
+        markup = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta http-equiv="content-language" content="en-US">
+        </head>
+        <body>
+        <div>
+            <p id="1"></p>
+        </div>
+        <div>
+            <p id="2"></p>
+        </div>
+        </body>
+        """
+
+        self.assert_selector(
+            markup,
+            "p:lang('*-US')",
+            ['1', '2'],
+            flags=util.HTML
+        )
+
+    def test_svg_language_in_html5(self):
+        """Test that SVG elements use a `lang` attribute, but MathML elements don't."""
+
+        markup = """
+        <div lang="fr">
+            <svg id="1" lang="en">
+                <g id="2"></g>
+                <foreignObject id="3"><p id="4"></p></foreignObject>
+            </svg>
+            <svg id="5" lang="en" xml:lang="de"><g id="6"></g></svg>
+            <math id="7" lang="en"><mi id="8"></mi></math>
+        </div>
+        """
+
+        self.assert_selector(
+            markup,
+            ":lang(en)",
+            ['1', '2', '3', '4'],
+            flags=util.HTML5
+        )
+
+        self.assert_selector(
+            markup,
+            ":lang(de)",
+            ['5', '6'],
+            flags=util.HTML5
+        )
+
+        self.assert_selector(
+            markup,
+            "[id]:lang(fr)",
+            ['7', '8'],
+            flags=util.HTML5
+        )
+
+    def test_xml_style_language_in_html5(self):
+        """Test XML style language when out of HTML5 namespace."""
+
+        markup = """
+        <math xml:lang="en">
+            <mtext id="1"></mtext>
+        </math>
+        <div xml:lang="en">
+            <mtext id="2"></mtext>
+        </div>
+        """
+
+        self.assert_selector(
+            markup,
+            "mtext:lang(en)",
+            ['1'],
+            flags=util.HTML5
+        )
+
+    def test_xml_style_language(self):
+        """Test XML style language."""
+
+        # XML style language
+        markup = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <html>
+        <head>
+        </head>
+        <body>
+        <div xml:lang="de-DE">
+            <p id="1"></p>
+        </div>
+        <div xml:lang="de-DE-1996">
+            <p id="2"></p>
+        </div>
+        <div xml:lang="de-Latn-DE">
+            <p id="3"></p>
+        </div>
+        <div xml:lang="de-Latf-DE">
+            <p id="4"></p>
+        </div>
+        <div xml:lang="de-Latn-DE-1996">
+            <p id="5"></p>
+        </div>
+        <p id="6" xml:lang="de-DE"></p>
+        </body>
+        </html>
+        """
+
+        self.assert_selector(
+            markup,
+            "p:lang(de-DE)",
+            ['1', '2', '3', '4', '5', '6'],
+            flags=util.XML
+        )
+
+    def test_xml_style_language_empty_string(self):
+        """Test that an empty XML style language is not replaced by the language of a tagged ancestor."""
+
+        markup = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <html>
+        <head>
+        </head>
+        <body xml:lang="de">
+        <p id="1" xml:lang=""></p>
+        <p id="2"></p>
+        </body>
+        </html>
+        """
+
+        self.assert_selector(
+            markup,
+            "p:lang(de)",
+            ['2'],
+            flags=util.XML
+        )
+
+    def test_language_in_xhtml(self):
+        """Test language in XHTML."""
+
+        markup = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+            "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+        <html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+        <head>
+        </head>
+        <body>
+        <div lang="de-DE" xml:lang="de-DE">
+            <p id="1"></p>
+        </div>
+        <div lang="de-DE-1996" xml:lang="de-DE-1996">
+            <p id="2"></p>
+        </div>
+        <div lang="de-Latn-DE" xml:lang="de-Latn-DE">
+            <p id="3"></p>
+        </div>
+        <div lang="de-Latf-DE" xml:lang="de-Latf-DE">
+            <p id="4"></p>
+        </div>
+        <div lang="de-Latn-DE-1996" xml:lang="de-Latn-DE-1996">
+            <p id="5"></p>
+        </div>
+        <p id="6" lang="de-DE" xml:lang="de-DE"></p>
+        </body>
+        </html>
+        """
+
+        self.assert_selector(
+            markup,
+            "p:lang(de-DE)",
+            ['1', '2', '3', '4', '5', '6'],
+            flags=util.XML
+        )
+
+    def test_language_in_xhtml_without_html_style_lang(self):
+        """
+        Test language in XHTML.
+
+        HTML namespace elements must use HTML style language.
+        """
+
+        # XHTML language: `lang`
+        markup = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+            "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+        <html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+        <head>
+        </head>
+        <body>
+        <div xml:lang="de-DE">
+            <p id="1"></p>
+        </div>
+        <div xml:lang="de-DE-1996">
+            <p id="2"></p>
+        </div>
+        <div xml:lang="de-Latn-DE">
+            <p id="3"></p>
+        </div>
+        <div xml:lang="de-Latf-DE">
+            <p id="4"></p>
+        </div>
+        <div xml:lang="de-Latn-DE-1996">
+            <p id="5"></p>
+        </div>
+        <p id="6" xml:lang="de-DE"></p>
+        </body>
+        </html>
+        """
+
+        self.assert_selector(
+            markup,
+            "p:lang(de-DE)",
+            [],
+            flags=util.XHTML
+        )
+
+    def test_language_shared_ancestors(self):
+        """Test that the language of an ancestor does not leak into elements that have another language."""
+
+        markup = """
+        <div id="1" lang="en">
+            <p id="2"><span id="3"></span></p>
+            <div id="4" lang="fr"><p id="5"><span id="6"></span></p></div>
+            <p id="7"><span id="8" lang="fr"></span></p>
+        </div>
+        <div id="9"><p id="10" lang="en"><span id="11"></span></p></div>
+        """
+
+        self.assert_selector(markup, ":lang(en)", ['1', '2', '3', '7', '10', '11'], flags=util.HTML | util.NOCACHE)
+        self.assert_selector(markup, ":lang(fr)", ['4', '5', '6', '8'], flags=util.HTML | util.NOCACHE)
+
+    def test_no_language_in_header(self):
+        """Test that every element without a language has an unknown language when the header has none."""
+
+        markup = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        </head>
+        <body>
+        <div id="1"></div>
+        <div id="2"><p id="3"></p></div>
+        <div id="4" lang=""></div>
+        </body>
+        </html>
+        """
+
+        self.assert_selector(markup, "[id]:lang('')", ['1', '2', '3', '4'], flags=util.HTML | util.NOCACHE)
+        self.assert_selector(markup, "[id]:lang('*')", [], flags=util.HTML | util.NOCACHE)
+
+    def test_deeply_nested_language(self):
+        """Test that each ancestor is checked once for the language of a deeply nested document."""
+
+        import soupsieve as sv
+        from bs4 import BeautifulSoup
+        from unittest import mock
+
+        n = 32
+        soup = BeautifulSoup("<ul>" + "<li>" * n, "html.parser")
+        get_parent = sv.css_match.CSSMatch.get_parent
+        with mock.patch.object(sv.css_match.CSSMatch, "get_parent", autospec=True, side_effect=get_parent) as patched:
+            self.assertEqual(len(sv.select("li:lang(en)", soup)), 0)
+        self.assertLessEqual(patched.call_count, 2 * n)
+
+    def test_language_ill_formed_tag(self):
+        """Test that an element whose language tag is not well-formed matches no language range."""
+
+        markup = """
+        <div id="1" lang="-"><p id="2"></p></div>
+        <div id="3" lang="en-"><p id="4"></p></div>
+        <div id="5" lang="en--us"></div>
+        <div id="6" lang="en_US"></div>
+        <div id="7" lang=" en"></div>
+        <div id="8" lang="en "></div>
+        <div id="9" lang="abcdefghi"></div>
+        <div id="10" lang="åå"></div>
+        <div id="11" lang="*"></div>
+        <div id="12" lang="1en"></div>
+        <div id="13" lang="en-abcdefghi"></div>
+        <div id="14" lang="en"></div>
+        <div id="15" lang=""></div>
+        """
+
+        self.assert_selector(markup, "[id]:lang('')", ['15'], flags=util.HTML)
+        self.assert_selector(markup, "[id]:lang('*')", ['14'], flags=util.HTML)
+        self.assert_selector(markup, "[id]:lang(en)", ['14'], flags=util.HTML)
+        self.assert_selector(
+            markup,
+            "[id]:not(:lang('*'))",
+            ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '15'],
+            flags=util.HTML
+        )
+
+    def test_language_well_formed_unregistered_tag(self):
+        """Test that a well-formed language tag matches without being checked against the registry."""
+
+        markup = """
+        <div id="1" lang="qq"></div>
+        <div id="2" lang="x-foo"></div>
+        <div id="3" lang="i-default"></div>
+        <div id="4" lang="fr-x"></div>
+        <div id="5" lang="abcdefgh-12345678"></div>
+        <div id="6" lang="ZXX"></div>
+        """
+
+        self.assert_selector(markup, "[id]:lang('*')", ['1', '2', '3', '4', '5', '6'], flags=util.HTML)
+        self.assert_selector(markup, "[id]:lang(fr-x)", ['4'], flags=util.HTML)
+        self.assert_selector(markup, "[id]:lang(x)", ['2'], flags=util.HTML)
+
+    def test_language_ill_formed_range(self):
+        """Test that a language range that is not well-formed matches nothing, even an identical tag."""
+
+        markup = """
+        <div id="1" lang="en"></div>
+        <div id="2" lang="en-US"></div>
+        <div id="3" lang="de-Latn-DE"></div>
+        <div id="4" lang="åå"></div>
+        """
+
+        for selector in (
+            ":lang(åå)", ":lang('en-')", ":lang('-')", ":lang('-en')", ":lang('en--US')", ":lang('en_US')",
+            ":lang(abcdefghi)", ":lang('en ')", ":lang('1en')", ":lang('en-*a')"
+        ):
+            self.assert_selector(markup, f"[id]{selector}", [], flags=util.HTML)
+
+        # Wildcards are allowed anywhere in a range.
+        self.assert_selector(markup, "[id]:lang('*-US')", ['2'], flags=util.HTML)
+        self.assert_selector(markup, "[id]:lang('de-*-DE')", ['3'], flags=util.HTML)
+
+        # An ill-formed range in a list does not prevent the others from matching.
+        self.assert_selector(markup, "[id]:lang('en-', en)", ['1', '2'], flags=util.HTML)
+
+    def test_language_ill_formed_subtag_length(self):
+        """Test that a subtag longer than 8 characters makes a tag ill-formed, so it is not matched by its prefix."""
+
+        markup = """
+        <div id="1" lang="fr-x"></div>
+        <div id="2" lang="fr-x-standard"></div>
+        <div id="3" lang="fr-standard"></div>
+        <div id="4" lang="fr-ninechars"></div>
+        """
+
+        self.assert_selector(markup, "[id]:lang(fr)", ['1', '2', '3'], flags=util.HTML)
+
+    def test_language_ill_formed_meta(self):
+        """Test that an ill-formed language tag from a `content-language` `meta` matches nothing."""
+
+        markup = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta http-equiv="content-language" content="en_US">
+        </head>
+        <body>
+        <div id="1"></div>
+        <div id="2" lang="en"></div>
+        <div id="3" lang=""></div>
+        </body>
+        </html>
+        """
+
+        self.assert_selector(markup, "[id]:lang('')", ['3'], flags=util.HTML)
+        self.assert_selector(markup, "[id]:lang('*')", ['2'], flags=util.HTML)
+
+    def test_language_ill_formed_xml(self):
+        """Test that an ill-formed `xml:lang` matches nothing."""
+
+        markup = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <root>
+        <a id="1" xml:lang="-"><b id="2"/></a>
+        <a id="3" xml:lang="en_US"/>
+        <a id="4" xml:lang="en"/>
+        <a id="5" xml:lang=""/>
+        </root>
+        """
+
+        self.assert_selector(markup, "[id]:lang('')", ['5'], flags=util.XML)
+        self.assert_selector(markup, "[id]:lang('*')", ['4'], flags=util.XML)

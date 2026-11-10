@@ -1,0 +1,177 @@
+"""Test attribute selectors."""
+from .. import util
+import soupsieve as sv
+
+
+class TestAttribute(util.TestCase):
+    """Test attribute selectors."""
+
+    MARKUP = """
+    <div id="div">
+    <p id="0">Some text <span id="1"> in a paragraph</span>.</p>
+    <a id="2" href="http://google.com">Link</a>
+    <span id="3">Direct child</span>
+    <pre id="pre">
+    <span id="4">Child 1</span>
+    <span id="5">Child 2</span>
+    <span id="6">Child 3</span>
+    </pre>
+    </div>
+    """
+
+    def test_attribute_not_equal_no_quotes(self):
+        """Test attribute with value that does not equal specified value (no quotes)."""
+
+        # No quotes
+        self.assert_selector(
+            self.MARKUP,
+            'body [id!=\\35]',
+            ["div", "0", "1", "2", "3", "pre", "4", "6"],
+            flags=util.HTML5
+        )
+
+    def test_attribute_not_equal_quotes(self):
+        """Test attribute with value that does not equal specified value (quotes)."""
+
+        # Quotes
+        self.assert_selector(
+            self.MARKUP,
+            "body [id!='5']",
+            ["div", "0", "1", "2", "3", "pre", "4", "6"],
+            flags=util.HTML5
+        )
+
+    def test_attribute_not_equal_double_quotes(self):
+        """Test attribute with value that does not equal specified value (double quotes)."""
+
+        # Double quotes
+        self.assert_selector(
+            self.MARKUP,
+            'body [id!="5"]',
+            ["div", "0", "1", "2", "3", "pre", "4", "6"],
+            flags=util.HTML5
+        )
+
+    def test_bad_attribute(self):
+        """Test bad attribute fails."""
+
+        with self.assertRaises(sv.SelectorSyntaxError) as cm:
+            sv.compile(r"[\]!=D4XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
+
+        e = cm.exception
+        self.assertEqual(e.context, '[\\]!=D4XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n^')
+        self.assertEqual(e.line, 1)
+        self.assertEqual(e.col, 1)
+
+    def test_bad_attribute_unclused(self):
+        """Test bad attribute fails for syntax error, not timeout error."""
+
+        import platform
+
+        if platform.system() == 'Windows':
+            with self.assertRaises(sv.SelectorSyntaxError):
+                sv.compile('[a="' + ('x' * 300))
+        else:
+            import signal
+
+            def timeout_handler(signum, frame):
+                raise TimeoutError
+
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(3)
+
+            passed = False
+            try:
+                with self.assertRaises(sv.SelectorSyntaxError):
+                    sv.compile('[a="' + ('x' * 300))
+                passed = True
+            except TimeoutError:
+                pass
+            finally:
+                signal.alarm(0)
+            self.assertTrue(passed)
+
+
+class TestAttributeEquivalence(util.TestCase):
+    """Test attribute selectors."""
+
+    MARKUP = """
+    <table id="0"><tr id="1"><td id="2">a</td><td id="3" class="center">b</td><td id="4" class="x y">c</td></tr></table>
+    """
+
+    def test_attribute_not_equal_values(self):
+        """Test unequal attribute values."""
+
+        self.assert_selector(
+            self.MARKUP,
+            'td[class!="c"]',
+            ["2", "3", "4"],
+            flags=util.HTML
+        )
+        self.assert_selector(
+            self.MARKUP,
+            'td:not([class="c"])',
+            ["2", "3", "4"],
+            flags=util.HTML
+        )
+        self.assert_selector(
+            self.MARKUP,
+            'td[class!="C" i]',
+            ["2", "3", "4"],
+            flags=util.HTML
+        )
+        self.assert_selector(
+            self.MARKUP,
+            'td:not([class="C" i])',
+            ["2", "3", "4"],
+            flags=util.HTML
+        )
+
+        self.assert_selector(
+            self.MARKUP,
+            'td[class!="CENTER" i]',
+            ["2", "4"],
+            flags=util.HTML
+        )
+        self.assert_selector(
+            self.MARKUP,
+            'td[class!="c.*"]',
+            ["2", "3", "4"],
+            flags=util.HTML
+        )
+        self.assert_selector(
+            '<r><p id="0" type="a"/><p id="1" type="a&#10;&#10;"/><p id="2" type="&#10;a"/></r>',
+            'p[type!="a"]',
+            ["1", "2"],
+            flags=util.XML
+        )
+
+    def test_attribute_not_equal_trailing_newline(self):
+        """Test a value with a trailing newline is not equal to the value without it."""
+
+        markup = '<r><p id="0" type="a"/><p id="1" type="a&#10;"/></r>'
+        self.assert_selector(markup, 'p[type!="a"]', ["1"], flags=util.XML)
+        self.assert_selector(markup, 'p:not([type="a"])', ["1"], flags=util.XML)
+        self.assert_selector(
+            '<p id="0" title="a"></p><p id="1" title="a&#10;"></p>',
+            'p[title!="a"]',
+            ["1"],
+            flags=util.HTML
+        )
+
+    def test_missing_attribute(self):
+        """Test missing attribute."""
+
+        # `[attr!=value]` == `:not([attr=value])`
+        self.assert_selector(
+            self.MARKUP,
+            'td[class!="center micro screen-only"]',
+            ["2", "3", "4"],
+            flags=util.HTML5
+        )
+        self.assert_selector(
+            self.MARKUP,
+            "td:not([class='center micro screen-only'])",
+            ["2", "3", "4"],
+            flags=util.HTML5
+        )

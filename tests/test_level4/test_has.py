@@ -1,0 +1,292 @@
+"""Test has selectors."""
+from .. import util
+from soupsieve import SelectorSyntaxError, NOSTRICT
+
+
+class TestHas(util.TestCase):
+    """Test has selectors."""
+
+    MARKUP = """
+    <div id="0" class="aaaa">
+        <p id="1" class="bbbb"></p>
+        <p id="2" class="cccc"></p>
+        <p id="3" class="dddd"></p>
+        <div id="4" class="eeee">
+        <div id="5" class="ffff">
+        <div id="6" class="gggg">
+            <p id="7" class="hhhh"></p>
+            <p id="8" class="iiii zzzz"></p>
+            <p id="9" class="jjjj"></p>
+            <div id="10" class="kkkk">
+                <p id="11" class="llll zzzz"></p>
+            </div>
+        </div>
+        </div>
+        </div>
+    </div>
+    """
+
+    MARKUP2 = """
+    <div id="0" class="aaaa">
+        <p id="1" class="bbbb"></p>
+    </div>
+    <div id="2" class="cccc">
+        <p id="3" class="dddd"></p>
+    </div>
+    <div id="4" class="eeee">
+        <p id="5" class="ffff"></p>
+    </div>
+    <div id="6" class="gggg">
+        <p id="7" class="hhhh"></p>
+    </div>
+    <div id="8" class="iiii">
+        <p id="9" class="jjjj"></p>
+        <span id="10"></span>
+    </div>
+    """
+
+    def test_has_descendant(self):
+        """Test has descendant."""
+
+        self.assert_selector(
+            self.MARKUP,
+            'div:not(.aaaa):has(.kkkk > p.llll)',
+            ['4', '5', '6'],
+            flags=util.HTML | util.NOCACHE,
+            options=NOSTRICT
+        )
+
+    def test_has_next_sibling(self):
+        """Test has next sibling."""
+
+        self.assert_selector(
+            self.MARKUP,
+            'p:has(+ .dddd:has(+ div .jjjj))',
+            ['2'],
+            flags=util.HTML | util.NOCACHE,
+            options=NOSTRICT
+        )
+
+    def test_has_subsequent_sibling(self):
+        """Test has subsequent sibling."""
+
+        self.assert_selector(
+            self.MARKUP,
+            'p:has(~ .jjjj)',
+            ['7', '8'],
+            flags=util.HTML | util.NOCACHE
+        )
+
+    def test_has_child(self):
+        """Test has2."""
+
+        self.assert_selector(
+            self.MARKUP2,
+            'div:has(> .bbbb)',
+            ['0'],
+            flags=util.HTML | util.NOCACHE
+        )
+
+    def test_has_case(self):
+        """Test has case insensitive."""
+
+        self.assert_selector(
+            self.MARKUP,
+            'div:NOT(.aaaa):HAS(.kkkk > p.llll)',
+            ['4', '5', '6'],
+            flags=util.HTML | util.NOCACHE,
+            options=NOSTRICT
+        )
+
+    def test_has_mixed(self):
+        """Test has mixed."""
+
+        self.assert_selector(
+            self.MARKUP2,
+            'div:has(> .bbbb, .ffff, .jjjj)',
+            ['0', '4', '8'],
+            flags=util.HTML | util.NOCACHE
+        )
+
+        self.assert_selector(
+            self.MARKUP2,
+            'div:has(.ffff, > .bbbb, .jjjj)',
+            ['0', '4', '8'],
+            flags=util.HTML | util.NOCACHE
+        )
+
+    def test_has_nested_pseudo(self):
+        """Test has with nested pseudo."""
+
+        self.assert_selector(
+            self.MARKUP2,
+            'div:has(> :not(.bbbb, .ffff, .jjjj))',
+            ['2', '6', '8'],
+            flags=util.HTML | util.NOCACHE
+        )
+
+        self.assert_selector(
+            self.MARKUP2,
+            'div:not(:has(> .bbbb, .ffff, .jjjj))',
+            ['2', '6'],
+            flags=util.HTML | util.NOCACHE
+        )
+
+    def test_has_no_match(self):
+        """Test has with a non-matching selector."""
+
+        self.assert_selector(
+            self.MARKUP2,
+            'div:has(:paused)',
+            [],
+            flags=util.HTML | util.NOCACHE
+        )
+
+    def test_many_siblings(self):
+        """Test many siblings case."""
+
+        import soupsieve as sv
+        from bs4 import BeautifulSoup
+
+        selector = "div:has(a ~ b)"
+        for n in (1000, 2000, 4000, 8000):
+            html = "<div>" + ("<a></a>" * n) + "</div>"
+            soup = BeautifulSoup(html, "html.parser")
+            self.assertEqual(len(sv.select(selector, soup, flags=sv.NOSTRICT)), 0)
+
+    def test_many_siblings_late_match(self):
+        """Test many siblings case where the matching sibling is in the middle."""
+
+        import soupsieve as sv
+        from bs4 import BeautifulSoup
+
+        selector = "a:has(~ b)"
+        for n in (1000, 2000, 4000, 8000):
+            html = "<div>" + ("<a></a> " * n) + "<b></b> " + ("<a></a> " * n) + "</div>"
+            soup = BeautifulSoup(html, "html.parser")
+            self.assertEqual(len(sv.select(selector, soup)), n)
+
+    def test_shared_descendants(self):
+        """Test that the result for a descendant does not leak into elements that have other descendants."""
+
+        markup = """
+        <section id="1">
+          <div id="2"><p id="3"><span id="4"></span></p></div>
+          <p id="5"></p>
+        </section>
+        <div id="6"><p id="7"><span id="8"></span></p></div>
+        <div id="9"><section id="10"><p id="11"><span id="12"></span></p></section></div>
+        """
+
+        self.assert_selector(markup, "div:has(span)", ["2", "6", "9"], flags=util.HTML | util.NOCACHE)
+        self.assert_selector(markup, "section:has(div)", ["1"], flags=util.HTML | util.NOCACHE)
+        self.assert_selector(markup, "section:has(p)", ["1", "10"], flags=util.HTML | util.NOCACHE)
+        self.assert_selector(markup, "div:has(div)", [], flags=util.HTML | util.NOCACHE)
+        self.assert_selector(markup, ":has(> p)", ["1", "2", "6", "10"], flags=util.HTML | util.NOCACHE)
+        self.assert_selector(markup, "div :not(:has(span))", ["4", "8", "12"], flags=util.HTML | util.NOCACHE)
+        self.assert_selector(
+            markup, "div:has(span), p:has(span)", ["2", "3", "6", "7", "9", "11"], flags=util.HTML | util.NOCACHE
+        )
+        self.assert_selector(markup, "div:has(span):has(+ p)", ["2"], flags=util.HTML | util.NOCACHE)
+
+    def test_many_nested_has(self):
+        """Test that `:has()` searches each descendant once in a deeply nested document."""
+
+        import soupsieve as sv
+        from bs4 import BeautifulSoup
+        from unittest import mock
+
+        n = 32
+        match = sv.css_match.CSSMatch._match_selectors
+        for markup, selector, matches in (
+            ("<div>" * n, "div:has(p)", 0),
+            ("<div>" * n + "<span></span>", "div:has(span)", n),
+            ("<div>" * n, "div:not(:has(p))", n)
+        ):
+            soup = BeautifulSoup(markup, "html.parser")
+            with mock.patch.object(
+                sv.css_match.CSSMatch, "_match_selectors", autospec=True, side_effect=match
+            ) as patched:
+                self.assertEqual(len(sv.select(selector, soup)), matches)
+            self.assertLessEqual(patched.call_count, 5 * n)
+
+    def test_strict_has(self):
+        """Test strict has behavior."""
+
+        self.assert_raises(':has(a ~ b)', SelectorSyntaxError)
+
+    def test_has_empty(self):
+        """Test has with empty slot due to no selectors."""
+
+        self.assert_raises('div:has()', SelectorSyntaxError)
+        self.assert_raises('div:has(,a)', SelectorSyntaxError)
+        self.assert_raises('div:has(a,)', SelectorSyntaxError)
+        self.assert_raises('div:has(a,,a)', SelectorSyntaxError)
+
+    def test_invalid_incomplete_has(self):
+        """Test `:has()` fails with just a combinator."""
+
+        self.assert_raises(':has(>)', SelectorSyntaxError)
+
+    def test_invalid_has_double_combinator(self):
+        """Test `:has()` fails with consecutive combinators."""
+
+        self.assert_raises(':has(>> has a)', SelectorSyntaxError)
+        self.assert_raises(':has(> has, >> a)', SelectorSyntaxError)
+        self.assert_raises(':has(> has >> a)', SelectorSyntaxError)
+
+    def test_invalid_has_trailing_combinator(self):
+        """Test `:has()` fails with trailing combinator."""
+
+        self.assert_raises(':has(> has >)', SelectorSyntaxError)
+
+    def test_nested_has(self):
+        """Test `:has()` being nested under `:has()`."""
+
+        from bs4 import BeautifulSoup
+
+        text = """
+        <div>
+        <!-- These are animals -->
+        <p class="a">Cat</p>
+        <p class="b">Dog</p>
+        <p class="c">Mouse</p>
+        </div>
+        """
+        soup = BeautifulSoup(text, 'html.parser')
+
+        with self.assertRaises(SelectorSyntaxError):
+            soup.select_one('div:has(> p:has(+ .b))')
+
+        tag = soup.select_one('div:has(> p:has(+ .b))', flags=NOSTRICT)
+        self.assertEqual(tag.name, 'div')
+
+    def test_only_later_siblings_valid(self):
+        """Test that earlier siblings do not count."""
+
+        self.assert_selector(
+            '<div id="1"><a id="2"></a><b id="3"></b><c id="4"></c></div>',
+            "div > :has(~ b)",
+            ['2'],
+            flags=util.HTML
+        )
+
+    def test_only_later_siblings_valid_preceding(self):
+        """Test that the sibling immediately before the match is not excluded."""
+
+        self.assert_selector(
+            '<div id="0"><x id="1"></x><a id="2"></a><b id="3"></b><c id="4"></c></div>',
+            "div > :has(~ b)",
+            ['1', '2'],
+            flags=util.HTML
+        )
+
+    def test_only_later_siblings_valid_multiple(self):
+        """Test general sibling matching with multiple candidate siblings."""
+
+        self.assert_selector(
+            '<div><a id="1"></a><b id="2"></b><a id="3"></a><b id="4"></b><a id="5"></a></div>',
+            "div > :has(~ b)",
+            ['1', '2', '3'],
+            flags=util.HTML
+        )
