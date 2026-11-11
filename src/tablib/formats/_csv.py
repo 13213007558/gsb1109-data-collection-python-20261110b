@@ -15,14 +15,19 @@ class CSVFormat:
 
     @classmethod
     def export_stream_set(cls, dataset, **kwargs):
-        """Returns CSV representation of Dataset as file-like."""
+        """Returns CSV representation of Dataset as file-like.
+
+        :param display: optional :class:`tablib.DisplayConfig` with per-export
+                        column formatters, e.g. human-friendly price strings.
+        """
         stream = StringIO()
 
+        display = kwargs.pop('display', None)
         kwargs.setdefault('delimiter', cls.DEFAULT_DELIMITER)
 
         _csv = csv.writer(stream, **kwargs)
 
-        for row in dataset._package(dicts=False):
+        for row in dataset._package(dicts=False, display=display):
             _csv.writerow(row)
 
         stream.seek(0)

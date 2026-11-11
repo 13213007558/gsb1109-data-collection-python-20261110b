@@ -158,6 +158,47 @@ Tablib's killer feature is the ability to export your :class:`Dataset` objects i
     1     Bessie     Monke   21
 
 
+.. _display-conventions:
+
+---------------------
+Per-Export Formatting
+---------------------
+
+Sometimes the same :class:`Dataset` needs two views of its values: a
+human-readable CSV with formatted strings and a machine-readable JSON export
+that keeps the raw values. :class:`DisplayConfig` attaches formatting rules to
+a single export without changing the dataset's data, headers or labels. ::
+
+    import decimal
+    import tablib
+
+    products = tablib.Dataset(headers=('name', 'price'))
+    products.append(('Apple', decimal.Decimal('1999.5')))
+
+    display = tablib.DisplayConfig()
+    display.add_formatter('price', lambda value: f'${value:,.2f}')
+
+    # Human-readable export: the price is rendered as a formatted string.
+    products.export('csv', display=display)
+    # 'name,price\r\nApple,$1,999.50\r\n'
+
+    # Machine-readable export: raw values, structure and labels unchanged.
+    products.export('json')
+    # '[{"name": "Apple", "price": "1999.5"}]'
+
+Formatters are identified by header name or column index; pass ``None`` as
+the column to apply a formatter to every cell. The same
+:class:`DisplayConfig` can be reused across exports and never mutates the
+underlying dataset. Formatters added with
+:meth:`Dataset.add_formatter` still apply to every export and run before the
+per-export formatters.
+
+If a formatter raises, tablib wraps the error in :class:`FormatterError`
+whose ``row_number`` (1-based), ``col`` (0-based) and ``header`` attributes
+locate the failing cell; the original exception is available as
+``__cause__``.
+
+
 ------------------------
 Selecting Rows & Columns
 ------------------------

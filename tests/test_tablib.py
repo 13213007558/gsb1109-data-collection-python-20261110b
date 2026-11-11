@@ -19,7 +19,7 @@ from openpyxl.reader.excel import load_workbook
 
 import tablib
 from tablib.core import Row, detect_format
-from tablib.exceptions import UnsupportedFormat
+from tablib.exceptions import InvalidDatasetIndex, UnsupportedFormat
 from tablib.formats import registry
 
 try:
@@ -1774,6 +1774,184 @@ class JSONTests(BaseTestCase):
         expected_yaml = "- [1, 2]\n- [3, 4]\n"
         dset = tablib.Dataset().load(in_stream=input_json, format="json")
         self.assertEqual(dset.export("yaml"), expected_yaml)
+
+
+class DisplayConfigTests(BaseTestCase):
+    """Per-export display conventions and formatter error location."""
+
+    def setUp(self):
+        super().setUp()
+        self.products = tablib.Dataset(headers=('name', 'price'))
+        self.products.append(('Apple', Decimal('1999.5')))
+        self.products.append(('Banana', Decimal('3.2')))
+
+    def test_csv_uses_display_formatter_for_humans(self):
+        display = tablib.DisplayConfig()
+        display.add_formatter('price', lambda value: f'${value:,.2f}')
+
+        csv_text = self.products.export('csv', display=display, lineterminator='\n')
+
+        self.assertEqual(csv_text, 'name,price\nApple,"$1,999.50"\nBanana,$3.20\n')
+
+    def test_display_accepts_mapping_column_index_and_all_columns(self):
+        display = tablib.DisplayConfig({1: lambda value: f'${value:.2f}'})
+        display.add_formatter(None, lambda value: value)  # all-column no-op
+
+        csv_text = self.products.export('csv', display=display)
+
+        self.assertEqual(csv_text.splitlines()[1], 'Apple,$1999.50')
+
+    def test_tsv_inherits_display_support(self):
+        display = tablib.DisplayConfig({'price': lambda value: f'${value:.2f}'})
+
+        tsv_text = self.products.export('tsv', display=display)
+
+        self.assertIn('Apple\t$1999.50', tsv_text)
+
+    def test_display_without_headers_uses_column_index(self):
+        dataset = tablib.Dataset()
+        dataset.append(('Apple', Decimal('1999.5')))
+        display = tablib.DisplayConfig({1: lambda value: f'${value:.2f}'})
+
+        self.assertEqual(
+            dataset.export('csv', display=display, lineterminator='\n'),
+            'Apple,$1999.50\n',
+        )
+
+    def test_json_export_keeps_raw_values_structure_and_labels(self):
+        display = tablib.DisplayConfig({'price': lambda value: f'${value:.2f}'})
+
+        payload = json.loads(self.products.export('json'))
+
+        self.assertEqual(
+            payload,
+            [
+                {'name': 'Apple', 'price': '1999.5'},
+                {'name': 'Banana', 'price': '3.2'},
+            ],
+        )
+        # The machine-readable export must not take human display conventions.
+        with self.assertRaises(TypeError):
+            self.products.export('json', display=display)
+
+    def test_display_export_does_not_mutate_dataset(self):
+        display = tablib.DisplayConfig({'price': lambda value: f'${value:.2f}'})
+        self.products.export('csv', display=display)
+
+        self.assertEqual(self.products[0], ('Apple', Decimal('1999.5')))
+        self.assertEqual(
+            self.products.dict[0], {'name': 'Apple', 'price': Decimal('1999.5')}
+        )
+        self.assertEqual(self.products.headers, ['name', 'price'])
+
+    def test_display_config_is_reusable_across_exports(self):
+        display = tablib.DisplayConfig({'price': lambda value: f'${value:.2f}'})
+
+        self.assertEqual(
+            self.products.export('csv', display=display),
+            self.products.export('csv', display=display),
+        )
+
+    def test_dataset_level_formatter_combines_with_display(self):
+        self.products.add_formatter('name', lambda value: value.upper())
+        display = tablib.DisplayConfig({'price': lambda value: f'${value:.2f}'})
+
+        csv_text = self.products.export('csv', display=display)
+
+        self.assertEqual(csv_text.splitlines()[1], 'APPLE,$1999.50')
+        # Existing Dataset-level formatters remain active without a display.
+        self.assertEqual(self.products.dict[0]['name'], 'APPLE')
+
+    def test_legacy_dataset_formatter_error_is_located(self):
+        def fail(value):
+            raise ValueError('boom')
+
+        self.products.add_formatter('price', fail)
+
+        with self.assertRaises(tablib.FormatterError) as ctx:
+            self.products.export('csv')
+        self.assertEqual(ctx.exception.row_number, 1)
+        self.assertEqual(ctx.exception.col, 1)
+        self.assertEqual(ctx.exception.header, 'price')
+        self.assertIsInstance(ctx.exception.__cause__, ValueError)
+
+    def test_formatter_error_reports_row_column_and_header(self):
+        def fail(value):
+            raise ValueError('boom')
+
+        display = tablib.DisplayConfig({'price': fail})
+
+        with self.assertRaises(tablib.FormatterError) as ctx:
+            self.products.export('csv', display=display)
+
+        error = ctx.exception
+        self.assertEqual(error.row_number, 1)
+        self.assertEqual(error.col, 1)
+        self.assertEqual(error.header, 'price')
+        self.assertIsInstance(error.__cause__, ValueError)
+        self.assertEqual(str(error), "Formatter failed at row 1, column 1 ('price').")
+
+    def test_formatter_error_tracks_the_failing_row(self):
+        def fail_on_second(value):
+            if value == Decimal('3.2'):
+                raise ValueError('boom')
+            return value
+
+        display = tablib.DisplayConfig({'price': fail_on_second})
+
+        with self.assertRaises(tablib.FormatterError) as ctx:
+            self.products.export('csv', display=display)
+        self.assertEqual(ctx.exception.row_number, 2)
+        self.assertEqual(ctx.exception.header, 'price')
+
+    def test_formatter_error_for_all_column_formatter(self):
+        def fail(value):
+            raise RuntimeError('boom')
+
+        display = tablib.DisplayConfig()
+        display.add_formatter(None, fail)
+
+        with self.assertRaises(tablib.FormatterError) as ctx:
+            self.products.export('csv', display=display)
+        self.assertEqual((ctx.exception.row_number, ctx.exception.col), (1, 0))
+
+    def test_formatter_error_without_headers(self):
+        def fail(value):
+            raise ValueError('boom')
+
+        dataset = tablib.Dataset()
+        dataset.append(('Apple', Decimal('1999.5')))
+        display = tablib.DisplayConfig({1: fail})
+
+        with self.assertRaises(tablib.FormatterError) as ctx:
+            dataset.export('csv', display=display)
+        self.assertEqual(ctx.exception.row_number, 1)
+        self.assertEqual(ctx.exception.col, 1)
+        self.assertIsNone(ctx.exception.header)
+
+    def test_unknown_display_header_raises_keyerror(self):
+        display = tablib.DisplayConfig({'missing': lambda value: value})
+
+        with self.assertRaises(KeyError):
+            self.products.export('csv', display=display)
+
+    def test_display_column_index_out_of_range_raises_invalid_index(self):
+        display = tablib.DisplayConfig({5: lambda value: value})
+
+        with self.assertRaises(InvalidDatasetIndex):
+            self.products.export('csv', display=display)
+
+    def test_invalid_display_argument_type(self):
+        with self.assertRaises(TypeError):
+            self.products.export('csv', display={'price': str})
+
+    def test_display_config_rejects_invalid_arguments(self):
+        display = tablib.DisplayConfig()
+
+        with self.assertRaises(TypeError):
+            display.add_formatter(1.5, str)
+        with self.assertRaises(TypeError):
+            display.add_formatter(0, 'not callable')
 
 
 class YAMLTests(BaseTestCase):

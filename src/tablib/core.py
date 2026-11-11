@@ -11,6 +11,7 @@
 __lazy_modules__ = {
     "copy",
     "operator",
+    "tablib.display",
     "tablib.exceptions",
     "tablib.utils",
 }
@@ -19,12 +20,14 @@ from copy import copy
 from operator import itemgetter
 
 from .exceptions import (
+    FormatterError,
     HeadersNeeded,
     InvalidDatasetIndex,
     InvalidDatasetType,
     InvalidDimensions,
     UnsupportedFormat,
 )
+from .display import DisplayConfig
 from .formats import registry
 from .utils import normalize_input
 
@@ -253,6 +256,64 @@ class Dataset:
         in_stream = normalize_input(in_stream)
         return registry.get_format(fmt_key).import_set(self, in_stream, **kwargs)
 
+    def _normalize_display(self, display):
+        """Resolve a per-export display argument into (col, callback) tuples."""
+        if display is None:
+            return []
+        if not isinstance(display, DisplayConfig):
+            raise TypeError(
+                'display must be a tablib.DisplayConfig instance, '
+                f'got {type(display).__name__}.'
+            )
+        formatters = display.resolved_formatters(self.headers)
+        for col, _callback in formatters:
+            if col is not None and col > self.width:
+                raise InvalidDatasetIndex
+        return formatters
+
+    def _apply_formatters(self, row, formatters, row_number):
+        """Apply ``(col, callback)`` formatters to a copy of ``row``.
+
+        Dataset-level formatters and per-export display formatters are passed
+        together. Failures are wrapped in :class:`FormatterError` carrying the
+        row and column location. The original exception remains available as
+        ``__cause__``.
+        """
+        if not formatters:
+            return list(row)
+
+        formatted = row.copy()  # To not mutate internal data structure
+        for col, callback in formatters:
+            if col is None:
+                # Apply formatter to all cells
+                for cell_index, cell in enumerate(formatted):
+                    try:
+                        formatted[cell_index] = callback(cell)
+                    except FormatterError:
+                        raise
+                    except Exception as err:
+                        header = (
+                            self.headers[cell_index]
+                            if self.headers and cell_index < len(self.headers)
+                            else None
+                        )
+                        raise FormatterError(
+                            row_number, cell_index, header
+                        ) from err
+            else:
+                try:
+                    formatted[col] = callback(formatted[col])
+                except FormatterError:
+                    raise
+                except Exception as err:
+                    header = (
+                        self.headers[col]
+                        if self.headers and col < len(self.headers)
+                        else None
+                    )
+                    raise FormatterError(row_number, col, header) from err
+        return list(formatted)
+
     def _validate(self, row=None, col=None, safety=False):
         """Assures size of every row in dataset is of proper proportions."""
         if row:
@@ -278,31 +339,42 @@ class Dataset:
                 raise InvalidDimensions
             return False
 
-    def _package(self, dicts=True):
-        """Packages Dataset into lists of dictionaries for transmission."""
+    def _package(self, dicts=True, display=None):
+        """Packages Dataset into lists of dictionaries for transmission.
+
+        :param dicts: when headers are set, return dictionaries instead of a
+                      list containing the headers as the first row.
+        :param display: optional :class:`~tablib.DisplayConfig` holding
+                        per-export formatters. Dataset-level formatters
+                        (see :meth:`add_formatter`) run first, then these.
+        """
         # TODO: Dicts default to false?
 
         _data = list(self._data)
 
-        def format_row(row):
-            # Execute formatters
-            if self._formatters:
-                row = row.copy()  # To not mutate internal data structure
-                for col, callback in self._formatters:
-                    if col is None:
-                        # Apply formatter to all cells
-                        row = [callback(cell) for cell in row]
-                    else:
-                        row[col] = callback(row[col])
-            return list(row)
+        # Dataset-level formatters stay in effect for every export; per-export
+        # display formatters are appended so they run on the same packaged rows.
+        formatters = list(self._formatters) + self._normalize_display(display)
+
+        def format_row(row, row_number):
+            return self._apply_formatters(row, formatters, row_number)
 
         if self.headers:
             if dicts:
-                data = [dict(list(zip(self.headers, format_row(row)))) for row in _data]
+                data = [
+                    dict(list(zip(self.headers, format_row(row, row_number))))
+                    for row_number, row in enumerate(_data, start=1)
+                ]
             else:
-                data = [list(self.headers)] + [format_row(row) for row in _data]
+                data = [list(self.headers)] + [
+                    format_row(row, row_number)
+                    for row_number, row in enumerate(_data, start=1)
+                ]
         else:
-            data = [format_row(row) for row in _data]
+            data = [
+                format_row(row, row_number)
+                for row_number, row in enumerate(_data, start=1)
+            ]
         return data
 
     def _get_headers(self):
