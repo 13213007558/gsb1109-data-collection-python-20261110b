@@ -588,6 +588,83 @@ library aren't recorded or played back unless another patched library
 handles them, so e.g. ``skip_patchers=["httpx"]`` stops recording httpx's
 default transport.
 
+Concurrent cassette isolation
+------------------------------
+
+VCR.py patches HTTP library classes process-wide: while a cassette is in
+use it replaces, for example, ``aiohttp.ClientSession._request`` on the
+class. That is fine for sequential or synchronously nested cassettes, but
+two cassettes whose lifetimes overlap in different ``asyncio`` tasks share
+that one class attribute, so whichever cassette entered last also answers
+the other task's requests.
+
+Set ``use_contextvar=True`` to bind each cassette to the task that entered
+it, through a ``contextvars`` variable. A patched request then looks up the
+cassette of the task making it instead of using the one that patched the
+class last:
+
+.. code:: python
+
+    my_vcr = vcr.VCR(use_contextvar=True)
+
+    async def worker(cassette_path, url):
+        with my_vcr.use_cassette(cassette_path, record_mode="none"):
+            async with aiohttp.ClientSession() as session:
+                return await (await session.get(url)).text()
+
+    # Each task only ever sees its own cassette, even though their
+    # cassettes are installed at the same time.
+    await asyncio.gather(
+        worker("first.yaml", "https://example.com/a"),
+        worker("second.yaml", "https://example.com/b"),
+    )
+
+Properties of the isolation:
+
+- **Nested cassettes restore the caller's one.** Entering a cassette inside
+  another task's cassette (or the same one) swaps the binding for that
+  task only; on exit the outer cassette is bound again, via the context
+  variable's reset token.
+- **Cancellation is contained.** Each task owns its own context, so
+  cancelling one task and unwinding its cassette never changes the
+  cassette another task's requests use.
+- **Tasks without a cassette keep the real network behavior.** A task that
+  never entered a cassette has no binding; its requests call the original
+  unpatched method and go to the real server as if VCR.py weren't there.
+
+The option is off by default, so existing behavior is unchanged. It can be
+set on the ``VCR`` instance or overridden per ``use_cassette`` call. Use it
+consistently for every cassette whose lifetime may overlap another's: a
+cassette entered without it still installs a process-wide replacement that
+takes over the shared class until it exits.
+
+Supported clients and their boundaries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Per-task isolation currently applies to **aiohttp**, whose request method is
+a coroutine that runs in the task making the request and can therefore read
+that task's context variable. The shared replacement carries no cassette of
+its own, so concurrently open aiohttp cassettes install the exact same
+function and never disturb each other's patching.
+
+The other clients keep process-wide, last-cassette-wins routing even with
+``use_contextvar=True``, because their stubs bind the cassette when the
+patch is installed rather than per request:
+
+- The synchronous libraries ``httplib``, ``requests``/``urllib3``,
+  ``httplib2`` and ``boto3`` replace connection classes; a connection or
+  pool created under a cassette keeps that cassette for its lifetime, and
+  synchronous calls don't carry a per-task ``asyncio`` context.
+- ``tornado`` and the ``httpx``/``httpx2`` transports (including their
+  async variants) bake the cassette into the replacement callable, so an
+  open cassette still answers across tasks.
+
+The isolation also coordinates ``asyncio`` tasks in one event loop, not
+threads: a new thread starts with an empty context and doesn't inherit the
+cassette bound in another thread. For httpx or tornado, keep their cassettes
+sequential, or give each test its own process until those clients gain a
+context-aware stub.
+
 Automatic Cassette Naming
 -------------------------
 

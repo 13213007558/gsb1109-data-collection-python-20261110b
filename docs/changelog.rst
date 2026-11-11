@@ -4,6 +4,7 @@ Changelog
 All help in providing PRs to close out bug issues is appreciated. Even if that is providing a repo that fully replicates issues. We have very generous contributors that have added these to bug issues which meant another contributor picked up the bug and closed it out.
 
 -  Unreleased
+    - New opt-in ``use_contextvar`` option for per-task cassette isolation with aiohttp. When set, a cassette is bound to the ``asyncio`` task that entered it via a ``contextvars`` variable instead of relying on the process-wide class patch, so two cassettes open at the same time in different tasks each only handle their own requests. Nested cassettes restore the caller's outer cassette on exit, cancelling one task doesn't affect another task's cassette, and tasks with no cassette keep the real network behavior. Isolation currently covers aiohttp only; the synchronous clients and tornado/httpx keep process-wide routing (see the advanced docs)
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
 
 -  9.4.2

@@ -54,10 +54,14 @@ class CassetteContextDecorator:
         self._args_getter = args_getter
         self.__finish = None
         self.__cassette = None
+        self.__context_token = None
 
     def _patch_generator(self, cassette):
         with contextlib.ExitStack() as exit_stack:
-            for patcher in CassettePatcherBuilder(cassette).build():
+            for patcher in CassettePatcherBuilder(
+                cassette,
+                use_contextvar=cassette.use_contextvar,
+            ).build():
                 exit_stack.enter_context(patcher)
             log_format = "{action} context for cassette at {path}."
             log.debug(log_format.format(action="Entering", path=cassette._path))
@@ -90,22 +94,38 @@ class CassetteContextDecorator:
             cassette_kwargs["path"] = transformer(cassette_kwargs["path"])
         self.__cassette = self.cls.load(**cassette_kwargs)
         self.__finish = self._patch_generator(self.__cassette)
-        return next(self.__finish)
+        cassette = next(self.__finish)
+        if self.__cassette.use_contextvar:
+            from .context import current_cassette
+
+            # Bind this cassette to the current task's context. New tasks copy
+            # the binding, and resetting the token on exit restores whatever
+            # cassette (if any) the caller had in scope, including a nested
+            # cassette's outer one.
+            self.__context_token = current_cassette.set(self.__cassette)
+        return cassette
 
     def __exit__(self, *exc_info):
-        exception_was_raised = any(exc_info)
-        record_on_exception = self._args_getter().get("record_on_exception", True)
-        if record_on_exception or not exception_was_raised:
-            self.__cassette._save()
-            self.__cassette = None
-        # Fellow programmer, don't remove this `next`, if `self.__finish` is
-        # not consumed the unpatcher functions accumulated in the `exit_stack`
-        # object created in `_patch_generator` will not be called until
-        # `exit_stack` is not garbage collected.
-        # This works in CPython but not in Pypy, where the unpatchers will not
-        # be called until much later.
-        next(self.__finish, None)
-        self.__finish = None
+        try:
+            exception_was_raised = any(exc_info)
+            record_on_exception = self._args_getter().get("record_on_exception", True)
+            if record_on_exception or not exception_was_raised:
+                self.__cassette._save()
+                self.__cassette = None
+            # Fellow programmer, don't remove this `next`, if `self.__finish` is
+            # not consumed the unpatcher functions accumulated in the `exit_stack`
+            # object created in `_patch_generator` will not be called until
+            # `exit_stack` is not garbage collected.
+            # This works in CPython but not in Pypy, where the unpatchers will not
+            # be called until much later.
+            next(self.__finish, None)
+            self.__finish = None
+        finally:
+            if self.__context_token is not None:
+                from .context import current_cassette
+
+                current_cassette.reset(self.__context_token)
+                self.__context_token = None
 
     @wrapt.decorator
     def __call__(self, function, instance, args, kwargs):
@@ -191,6 +211,7 @@ class Cassette:
         before_save_interaction=None,
         after_load_interaction=None,
         skip_patchers=(),
+        use_contextvar=False,
     ):
         self._persister = persister or FilesystemPersister
         self._path = path
@@ -204,6 +225,7 @@ class Cassette:
         self.custom_patches = custom_patches
         self.allow_playback_repeats = allow_playback_repeats
         self.drop_unused_requests = drop_unused_requests
+        self.use_contextvar = use_contextvar
         # Hooks run on each interaction as the cassette is saved and loaded.
         # filter_sensitive_data hides values after the user's save hooks and
         # restores them before the user's load hooks, so those see real values.

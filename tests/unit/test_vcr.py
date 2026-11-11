@@ -106,6 +106,22 @@ def test_use_cassette_persister_option():
         assert cassette._persister is CustomPersister
 
 
+def test_use_contextvar_option_is_merged_and_applied(tmp_path):
+    assert VCR().get_merged_config(path="x")["use_contextvar"] is False
+    assert VCR(use_contextvar=True).get_merged_config(path="x")["use_contextvar"] is True
+    # A per-cassette override wins over the VCR default.
+    assert (
+        VCR(use_contextvar=True)
+        .get_merged_config(path="x", use_contextvar=False)["use_contextvar"]
+        is False
+    )
+
+    with VCR(use_contextvar=True).use_cassette(str(tmp_path / "c.yaml")) as cassette:
+        assert cassette.use_contextvar is True
+    with VCR().use_cassette(str(tmp_path / "d.yaml")) as cassette:
+        assert cassette.use_contextvar is False
+
+
 def test_vcr_before_record_request_params():
     base_path = "http://whatever.test/"
 

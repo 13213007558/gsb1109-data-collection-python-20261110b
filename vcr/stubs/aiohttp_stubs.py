@@ -348,9 +348,15 @@ def _recordable_data(data):
     return dict(fields) if type(data) is dict else fields
 
 
-def vcr_request(cassette, real_request):
+def _build_vcr_request(real_request, get_cassette):
     @functools.wraps(real_request)
     async def new_request(self, method, url, **kwargs):
+        cassette = get_cassette()
+        if cassette is None:
+            # No context-aware cassette is in scope in this task. Behave as
+            # if nothing were patched so the request goes to the real server.
+            return await real_request(self, method, url, **kwargs)
+
         headers = kwargs.get("headers")
         auth = kwargs.get("auth")
         headers = self._prepare_headers(headers)
@@ -420,3 +426,18 @@ def vcr_request(cassette, real_request):
         return response
 
     return new_request
+
+
+def vcr_request(cassette, real_request):
+    # Default patching: the cassette is baked into the replacement, so every
+    # request goes to it while the cassette's patchers are installed.
+    return _build_vcr_request(real_request, lambda: cassette)
+
+
+def context_vcr_request(real_request):
+    # Context-aware patching: look up the cassette of the task making the
+    # request, so overlapping cassettes in different tasks don't intercept
+    # each other's traffic.
+    from vcr.context import current_cassette
+
+    return _build_vcr_request(real_request, current_cassette.get)

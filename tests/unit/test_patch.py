@@ -4,6 +4,7 @@ import pytest
 
 from vcr import VCR
 from vcr.cassette import Cassette
+from vcr.context import current_cassette
 from vcr.patch import PATCHER_NAMES, validate_skip_patchers
 
 
@@ -82,3 +83,56 @@ def test_skip_patchers_multiple_groups(tmp_path):
         assert httpx.AsyncHTTPTransport.handle_async_request is original_async
         assert aiohttp.ClientSession._request is original_aiohttp
         assert httplib.HTTPConnection.request is not original_httplib
+
+
+def test_contextvar_cassette_installs_the_shared_aiohttp_replacement(tmp_path):
+    aiohttp = pytest.importorskip("aiohttp.client")
+    from vcr import patch as vcr_patch
+
+    myvcr = VCR(use_contextvar=True)
+    with myvcr.use_cassette(str(tmp_path / "cassette.yaml"), record_mode="none"):
+        # The replacement is built lazily on first use and shared by every
+        # context-aware cassette rather than recreated per cassette.
+        replacement = vcr_patch._AiohttpContextRequest
+        assert replacement is not None
+        assert aiohttp.ClientSession._request is replacement
+    assert aiohttp.ClientSession._request is vcr_patch._AiohttpClientSessionRequest
+
+
+def test_contextvar_cassette_is_bound_and_restored(tmp_path):
+    pytest.importorskip("aiohttp")
+    myvcr = VCR(use_contextvar=True)
+    assert current_cassette.get() is None
+
+    with myvcr.use_cassette(str(tmp_path / "outer.yaml"), record_mode="none") as outer:
+        assert current_cassette.get() is outer
+        with myvcr.use_cassette(str(tmp_path / "inner.yaml"), record_mode="none") as inner:
+            assert current_cassette.get() is inner
+        # Exiting the inner cassette restores the caller's outer cassette.
+        assert current_cassette.get() is outer
+    assert current_cassette.get() is None
+
+
+def test_overlapping_context_cassettes_keep_one_replacement(tmp_path):
+    aiohttp = pytest.importorskip("aiohttp.client")
+    from vcr import patch as vcr_patch
+
+    myvcr = VCR(use_contextvar=True)
+    # Nested in one context, as two concurrently-open cassettes would be across
+    # tasks: both install the identical replacement, so neither disturbs the
+    # other's patching while entering or leaving.
+    with myvcr.use_cassette(str(tmp_path / "outer.yaml"), record_mode="none"):
+        replacement = vcr_patch._AiohttpContextRequest
+        with myvcr.use_cassette(str(tmp_path / "inner.yaml"), record_mode="none"):
+            assert aiohttp.ClientSession._request is replacement
+        assert aiohttp.ClientSession._request is replacement
+    assert aiohttp.ClientSession._request is vcr_patch._AiohttpClientSessionRequest
+
+
+def test_default_cassette_does_not_touch_the_contextvar(tmp_path):
+    pytest.importorskip("aiohttp")
+    myvcr = VCR()
+    assert current_cassette.get() is None
+    with myvcr.use_cassette(str(tmp_path / "cassette.yaml"), record_mode="none"):
+        assert current_cassette.get() is None
+    assert current_cassette.get() is None

@@ -91,6 +91,11 @@ except ImportError:  # pragma: no cover
 else:
     _AiohttpClientSessionRequest = aiohttp.client.ClientSession._request
 
+# Built once and reused by every context-aware cassette, so overlapping
+# cassettes install the exact same replacement function and entering or
+# leaving one of them never changes what the other task's requests call.
+_AiohttpContextRequest = None
+
 
 try:
     import httpx
@@ -176,8 +181,9 @@ class CassettePatcherBuilder:
 
         return wrapped
 
-    def __init__(self, cassette):
+    def __init__(self, cassette, use_contextvar=False):
         self._cassette = cassette
+        self._use_contextvar = use_contextvar
         self._class_to_cassette_subclass = {}
 
     def build(self):
@@ -368,17 +374,31 @@ class CassettePatcherBuilder:
             new_fetch_impl = vcr_fetch_impl(self._cassette, _CurlAsyncHTTPClient_fetch_impl)
             yield curl.CurlAsyncHTTPClient, "fetch_impl", new_fetch_impl
 
-    @_build_patchers_from_mock_triples_decorator
     def _aiohttp(self):
         try:
             import aiohttp.client as client
         except ImportError:  # pragma: no cover
-            pass
-        else:
-            from .stubs.aiohttp_stubs import vcr_request
+            return ()
 
-            new_request = vcr_request(self._cassette, _AiohttpClientSessionRequest)
-            yield client.ClientSession, "_request", new_request
+        from .stubs.aiohttp_stubs import context_vcr_request, vcr_request
+
+        if self._use_contextvar:
+            global _AiohttpContextRequest
+            if _AiohttpContextRequest is None:
+                # The replacement carries no cassette; each request reads the
+                # cassette of its own task from the context variable.
+                _AiohttpContextRequest = context_vcr_request(_AiohttpClientSessionRequest)
+            patcher = mock.patch.object(
+                client.ClientSession,
+                "_request",
+                _AiohttpContextRequest,
+            )
+            return (patcher,)
+
+        new_request = vcr_request(self._cassette, _AiohttpClientSessionRequest)
+        return self._build_patchers_from_mock_triples(
+            ((client.ClientSession, "_request", new_request),),
+        )
 
     @_build_patchers_from_mock_triples_decorator
     def _httpx(self):
