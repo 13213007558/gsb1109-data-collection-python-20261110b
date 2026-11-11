@@ -231,13 +231,38 @@ def file_source(f, buf_size=64*1024):
             break
 
 
+def _check_string_chunking(backend, config):
+    if config.get('chunk_strings'):
+        if not backend['capabilities'].string_chunking:
+            raise ValueError(
+                "The %s backend cannot deliver strings in chunks: it only "
+                "learns about a complete string once the whole string has "
+                "been decoded. Use the python backend, which streams strings "
+                "incrementally" % (backend['backend'],))
+    else:
+        # Only meaningful while chunking; drop it so backends that do not
+        # know about it never receive an unexpected keyword argument
+        config.pop('string_chunk_size', None)
+
+
+def _reject_chunked_objects(routine_name, config):
+    if config.get('chunk_strings'):
+        raise ValueError(
+            "%s() reconstructs complete Python objects and cannot work with "
+            "strings delivered in chunks. Consume the events of parse() or "
+            "basic_parse() with chunk_strings=True and join consecutive "
+            "'string' events yourself instead" % (routine_name,))
+
+
 def _basic_parse_pipeline(backend, config):
+    _check_string_chunking(backend, config)
     return (
         (backend['basic_parse_basecoro'], [], config),
     )
 
 
 def _parse_pipeline(backend, config):
+    _check_string_chunking(backend, config)
     return (
         (backend['parse_basecoro'], [], {}),
         (backend['basic_parse_basecoro'], [], config)
@@ -245,6 +270,8 @@ def _parse_pipeline(backend, config):
 
 
 def _items_pipeline(backend, prefix, map_type, config):
+    _reject_chunked_objects('items', config)
+    _check_string_chunking(backend, config)
     return (
         (backend['items_basecoro'], (prefix,), {'map_type': map_type}),
         (backend['parse_basecoro'], [], {}),
@@ -253,6 +280,8 @@ def _items_pipeline(backend, prefix, map_type, config):
 
 
 def _kvitems_pipeline(backend, prefix, map_type, config):
+    _reject_chunked_objects('kvitems', config)
+    _check_string_chunking(backend, config)
     return (
         (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type}),
         (backend['parse_basecoro'], [], {}),
@@ -393,6 +422,7 @@ def _make_parse(backend):
                 source, buf_size=buf_size, **config
             )
         elif is_iterable(source):
+            _check_string_chunking(backend, config)
             return utils.coros2gen(source,
                 (backend['parse_basecoro'], (), {})
             )
@@ -412,6 +442,7 @@ def _make_items(backend):
                 source, prefix, map_type=map_type, buf_size=buf_size, **config
             )
         elif is_iterable(source):
+            _reject_chunked_objects('items', config)
             return utils.coros2gen(source,
                 (backend['items_basecoro'], (prefix,), {'map_type': map_type})
             )
@@ -431,6 +462,7 @@ def _make_kvitems(backend):
                 source, prefix, map_type=map_type, buf_size=buf_size, **config
             )
         elif is_iterable(source):
+            _reject_chunked_objects('kvitems', config)
             return utils.coros2gen(source,
                 (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type})
             )
@@ -481,6 +513,7 @@ class BackendCapabilities:
         'invalid_leading_zeros_detection': 'Detection of leading zeros in numbers, marking them as invalid',
         'incomplete_json_tokens_detection': 'Documents with incomplete JSON tokens',
         'int64': '64 bit integers supported when running with ``use_float=True``',
+        'string_chunking': 'Delivery of decoded string values in multiple ``string`` events via ``chunk_strings``',
     }
 
     def __init__(self):
@@ -489,6 +522,7 @@ class BackendCapabilities:
         self.invalid_leading_zeros_detection = True
         self.incomplete_json_tokens_detection = True
         self.int64 = True
+        self.string_chunking = False
 
 
 def enrich_backend(backend, **capabilities_overrides):

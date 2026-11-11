@@ -415,6 +415,51 @@ to give users more fine-grained control over certain operations:
   have an optional ``map_type`` argument (defaults to ``dict``)
   used to construct objects from the JSON stream.
   This should be a dict-like type supporting item assignment.
+- The ``chunk_strings`` option (defaults to ``False``)
+  makes ``basic_parse`` and ``parse`` (and all their variants)
+  deliver the decoded contents of each string value
+  as a sequence of ``string`` events
+  instead of a single event carrying the whole string.
+  A ``string_end`` event marks the successful end of each value,
+  while a malformed or truncated string raises an exception instead,
+  so consumers can always tell a completed string apart from an error.
+  Only fully decoded text is ever delivered:
+  a backslash escape, a ``\\uXXXX`` sequence,
+  a UTF-8 character or a surrogate pair
+  that straddles two input chunks is buffered until it is complete.
+  Map keys are always delivered as a single ``map_key`` event.
+  The optional ``string_chunk_size`` argument
+  (defaults to ``65536`` characters)
+  bounds the size of each delivered ``string`` event.
+  This keeps memory usage constant
+  regardless of the length of the strings in the document,
+  which matters when a single field can hold a very large text.
+  It is only supported by the ``python`` backend
+  (see capabilities_);
+  the yajl-based backends raise a ``ValueError`` rather than
+  silently accumulating the whole string before returning it.
+  Because ``items`` and ``kvitems`` reconstruct complete Python objects,
+  they reject this option; consume the events of ``parse``
+  or ``basic_parse`` and join the consecutive ``string`` events yourself.
+
+  A typical use is a single field (here ``attachment``) whose value is a
+  very large text, while every other field is read through ordinary events:
+
+  .. code-block:: python
+
+     import ijson
+
+     backend = ijson.get_backend('python')  # the only streaming backend
+     chunks = []
+     with open('document.json', 'rb') as f:
+         for prefix, event, value in backend.parse(
+                 f, chunk_strings=True, string_chunk_size=65536):
+             if prefix != 'attachment':
+                 continue  # other fields still arrive as normal events
+             if event == 'string':
+                 handle_chunk(value)      # fully-decoded piece of text
+             elif event == 'string_end':
+                 finish_attachment()      # clean end; an error raises instead
 
 
 Events
@@ -435,6 +480,10 @@ Events will be one of the following:
   Its associated value is the name itself.
 - ``null``, ``boolean``, ``integer``, ``double``, ``number`` and ``string``
   all indicate actual content, which is stored in the associated value.
+  When ``chunk_strings`` is enabled a string value produces several
+  ``string`` events, followed by a ``string_end`` event (with a ``None``
+  value) that signals the value finished successfully. An error in the
+  string raises an exception instead of producing ``string_end``.
 
 
 Prefix
@@ -524,6 +573,9 @@ It contains the following members:
   raising an ``IncompleteJSONError``.
 * ``int64``: when using ``use_float=True``,
     values greater than or equal to ``2^32`` are correctly returned.
+* ``string_chunking``: string values can be delivered in several
+  ``string`` events via the ``chunk_strings`` option
+  without the whole string being held in memory.
 
 These capabilities are supported by all backends,
 with the following exceptions:
@@ -534,6 +586,11 @@ with the following exceptions:
   in platforms with a 32-bit C ``long`` type.
 
 * The ``python`` backend doesn't support ``c_comments``.
+
+* Only the ``python`` backend supports ``string_chunking``.
+  The yajl-based backends only learn about a string once it has been fully
+  decoded, so they refuse the ``chunk_strings`` option with a ``ValueError``
+  instead of buffering the complete string and pretending to stream it.
 
 
 Performance tips

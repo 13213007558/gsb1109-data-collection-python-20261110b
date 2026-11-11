@@ -136,3 +136,14 @@ def test_reader_returning_objects_that_dont_expose_memory(backend, n):
             _exhaust(backend.basic_parse_gen(BadReader()))
 
     _repeat(n, use_bad_reader)
+
+
+@pytest.mark.parametrize("n", (100000,))
+def test_chunked_string_parsing_does_not_leak(backend, n):
+    """Repeated streaming-string parses (including the decoder) don't leak"""
+    if not backend.capabilities.string_chunking:
+        pytest.skip("backend does not support string chunking")
+    data = b'{"doc": "a\\nb\\\\c\\"d\\u00e9", "tail": [1, 2]}'
+    construction = lambda b: b.basic_parse_gen(
+        io.BytesIO(data), chunk_strings=True, string_chunk_size=4)
+    _repeat(n, construction, backend, exhaust=True)

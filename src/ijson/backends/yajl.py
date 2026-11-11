@@ -20,7 +20,8 @@ class Config(Structure):
 
 @utils.coroutine
 def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
-                         use_float=False):
+                         use_float=False, chunk_strings=False,
+                         string_chunk_size=64 * 1024):
     '''
     Iterator yielding unprefixed events.
 
@@ -31,6 +32,12 @@ def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
     - check_utf8: if True, parser will cause an error if input is invalid utf-8
     - buf_size: a size of an input buffer
     '''
+    if chunk_strings:
+        raise ValueError(
+            "The yajl backend cannot deliver strings in chunks: yajl only "
+            "invokes its string callback once the whole string has been "
+            "decoded. Use the python backend, which streams strings "
+            "incrementally")
     if multiple_values:
         raise ValueError("yajl backend doesn't support multiple_values")
     callbacks, _keepalive, pending = _yajl2_ctypes_common.make_callbaks(target.send, use_float, 1)

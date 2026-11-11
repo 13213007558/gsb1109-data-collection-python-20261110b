@@ -2,6 +2,17 @@
 
 ## Development
 
+* Added a `chunk_strings` option to `basic_parse` and `parse` (and their
+  coroutine/asynchronous variants) that streams the decoded contents of
+  string values as several `string` events followed by a `string_end`
+  event, instead of delivering each string as a single event. Decoding is
+  incremental, so a backslash escape, `\uXXXX` sequence, UTF-8 character or
+  surrogate pair split across input chunks is never delivered half-decoded,
+  and memory usage stays bounded by the input buffer instead of the string
+  length. The `string_chunk_size` option bounds each delivered chunk. Only
+  the `python` backend supports it (new `string_chunking` capability);
+  the yajl-based backends raise `ValueError` rather than buffering the whole
+  string, and `items`/`kvitems` reject it since they build complete objects.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

@@ -225,6 +225,15 @@ def basic_parse_basecoro(target, **config):
     # are kept alive until this function is done
     scope = Container()
 
+    if config.get('chunk_strings'):
+        raise ValueError(
+            "The yajl2_cffi backend cannot deliver strings in chunks: yajl "
+            "only invokes its string callback once the whole string has "
+            "been decoded. Use the python backend, which streams strings "
+            "incrementally")
+    # irrelevant when chunking is off; yajl_init does not accept it
+    config.pop('string_chunk_size', None)
+
     handle = yajl_init(scope, target.send, **config)
     try:
         while True:

@@ -17,7 +17,8 @@ YAJL_MULTIPLE_VALUES = 8
 
 @utils.coroutine
 def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
-                         use_float=False):
+                         use_float=False, chunk_strings=False,
+                         string_chunk_size=64 * 1024):
     '''
     Iterator yielding unprefixed events.
 
@@ -28,6 +29,12 @@ def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
     - buf_size: a size of an input buffer
     - multiple_values: allows the parser to parse multiple JSON objects
     '''
+    if chunk_strings:
+        raise ValueError(
+            "The yajl2 backend cannot deliver strings in chunks: yajl only "
+            "invokes its string callback once the whole string has been "
+            "decoded. Use the python backend, which streams strings "
+            "incrementally")
     callbacks, _keepalive, pending = _yajl2_ctypes_common.make_callbaks(target.send, use_float, 2)
     handle = yajl.yajl_alloc(byref(callbacks), None, None)
     if allow_comments:
