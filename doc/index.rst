@@ -49,6 +49,9 @@ Features
     :py:meth:`~jsonlines.Reader.iter()` method
   * can validate data types, including `None` checks
   * can skip invalid lines during iteration
+  * supports caller-confirmed read progress with
+    :py:meth:`~jsonlines.Reader.acknowledge()` and
+    :py:meth:`~jsonlines.Reader.checkpoint()`, for resumable reading
   * provides decent error messages
   * can be used as a context manager
   * allows complete control over decoding using a custom ``loads``
@@ -158,6 +161,58 @@ This should be enough to get started. See the API docs below for
 more details.
 
 
+Read progress and resumable reading
+===================================
+
+When importing records into a database, the records read near the end
+of the file may still belong to transactions that have not been
+committed when the program exits. To avoid losing or duplicating
+those records, reading and *confirmation* are separate steps for
+readers opened from a file name:
+
+* :py:meth:`Reader.read` only *delivers* a record;
+* :py:meth:`Reader.acknowledge` marks delivered records as durably
+  processed, typically after the corresponding database transaction
+  has been committed;
+* :py:meth:`Reader.checkpoint` returns an immutable
+  :py:class:`ReadProgress` token describing the acknowledged input
+  span.
+
+Reopening the same file with that token resumes reading right after
+the last acknowledged record. Records that were delivered but not
+acknowledged are simply delivered again::
+
+  with jsonlines.open('input.jsonl') as reader:
+      for obj in reader:
+          insert_into_database(obj)
+      commit_database()
+      progress = reader.acknowledge()
+
+  # later run, possibly after a crash:
+  with jsonlines.open('input.jsonl', progress=progress) as reader:
+      ...
+
+Acknowledgement can also be limited to a specific physical line
+number, e.g. ``reader.acknowledge(reader.lineno)``.
+
+Invalid lines can be acknowledged as consumed with
+:py:meth:`Reader.acknowledge_skipped_line`, so progress still
+describes a contiguous, explained span of the input. When iterating
+with ``iter(skip_invalid=True)`` invalid lines are acknowledged
+automatically.
+
+The progress token stores a byte offset, a physical line number, and
+a :py:class:`FileFingerprint` containing the resolved path together
+with the device and inode numbers. A token can therefore never be
+applied to a different file, even one with the same name; doing so
+raises :py:class:`ReadProgressMismatchError`. Files that were only
+appended to can be resumed without issues, including when the
+previously last line did not yet have a line terminator.
+
+Tokens are plain immutable objects and can be serialized (e.g. with
+``attrs.asdict``) and stored alongside the imported data.
+
+
 API
 ===
 
@@ -171,10 +226,19 @@ API
    :members:
    :inherited-members:
 
+.. autoclass:: jsonlines.ReadProgress
+   :members:
+
+.. autoclass:: jsonlines.FileFingerprint
+   :members:
+
 .. autoclass:: jsonlines.Error
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.ReadProgressMismatchError
    :members:
 
 
@@ -188,6 +252,13 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* unreleased
+
+  * add caller-confirmed read progress tracking for resumable
+    reading via :py:class:`ReadProgress`,
+    :py:meth:`Reader.checkpoint()`, :py:meth:`Reader.acknowledge()`
+    and :py:meth:`Reader.acknowledge_skipped_line()`
 
 * 4.0.0, released at 2023-09-01
 

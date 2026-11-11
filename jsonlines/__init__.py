@@ -5,7 +5,10 @@ Module for the jsonlines data format.
 # expose only public api
 from .jsonlines import (
     Error,
+    FileFingerprint,
     InvalidLineError,
+    ReadProgress,
+    ReadProgressMismatchError,
     Reader,
     Writer,
     open,
@@ -13,7 +16,10 @@ from .jsonlines import (
 
 __all__ = [
     "Error",
+    "FileFingerprint",
     "InvalidLineError",
+    "ReadProgress",
+    "ReadProgressMismatchError",
     "Reader",
     "Writer",
     "open",

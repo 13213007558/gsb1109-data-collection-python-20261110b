@@ -138,6 +138,280 @@ class InvalidLineError(Error, ValueError):
         super().__init__(f"{message} (line {lineno})")
 
 
+@attr.s(frozen=True, auto_attribs=True)
+class FileFingerprint:
+    """
+    Immutable identity description of the file a :py:class:`ReadProgress`
+    belongs to.
+
+    The resolved file path together with the device and inode numbers
+    uniquely identify a file, so that a progress token can never be
+    applied to a different file that happens to have the same name.
+    The recorded size is informational only and not part of the file
+    identity, which allows resuming files that were appended to.
+    """
+
+    #: Resolved file path (``str`` or ``bytes``, depending on how the
+    #: file was opened)
+    path: Union[str, bytes]
+
+    #: Device on which the file resides (``st_dev``)
+    device: int
+
+    #: Inode number of the file (``st_ino``)
+    inode: int
+
+    #: File size in bytes when the fingerprint was taken
+    size: int
+
+
+def _same_file(left: FileFingerprint, right: FileFingerprint) -> bool:
+    """
+    Return whether two fingerprints describe the same file.
+
+    The file size is deliberately ignored, since appending to a file
+    changes its size without changing its identity.
+    """
+    return (
+        left.path == right.path
+        and left.device == right.device
+        and left.inode == right.inode
+    )
+
+
+@attr.s(frozen=True, auto_attribs=True)
+class ReadProgress:
+    """
+    Immutable read progress token.
+
+    A token describes the input span that has been confirmed by the
+    caller: every physical line that ends at or before ``offset`` has
+    been delivered, and ``lineno`` is the number of physical lines that
+    ``offset`` corresponds to. Reopening the same file with this token
+    makes the reader resume at ``offset``, meaning any records that were
+    delivered but not confirmed will be delivered again.
+
+    Tokens are bound to a specific file through their
+    :py:class:`FileFingerprint`; passing a token for another file results
+    in :py:class:`ReadProgressMismatchError`.
+    """
+
+    #: Byte offset to resume reading from
+    offset: int
+
+    #: Number of physical lines fully consumed up to ``offset``
+    lineno: int
+
+    #: Identity of the file this progress belongs to
+    fingerprint: FileFingerprint
+
+
+@attr.s(auto_exc=True, auto_attribs=True, init=False)
+class ReadProgressMismatchError(Error):
+    """
+    Error raised when a :py:class:`ReadProgress` does not belong to the
+    file being opened.
+
+    The supplied token is available as the ``.progress`` attribute, and
+    the fingerprint of the opened file as ``.fingerprint``.
+    """
+
+    #: The progress token that did not match
+    progress: ReadProgress
+
+    #: The fingerprint of the file that was opened instead
+    fingerprint: FileFingerprint
+
+    def __init__(
+        self, progress: ReadProgress, fingerprint: FileFingerprint
+    ) -> None:
+        self.progress = progress
+        self.fingerprint = fingerprint
+        if progress.fingerprint.path != fingerprint.path:
+            message = (
+                "read progress belongs to "
+                f"{progress.fingerprint.path!r}, but {fingerprint.path!r} was opened"
+            )
+        else:
+            message = (
+                f"read progress belongs to a different file at "
+                f"{fingerprint.path!r} (device/inode no longer matches)"
+            )
+        super().__init__(message)
+
+
+@attr.s(auto_attribs=True)
+class _ReadProgressTracker:
+    """
+    Internal helper that tracks confirmed reading progress using byte
+    offsets on a seekable binary stream.
+
+    Reading and confirmation are separate steps. Every consumed
+    physical line extends the delivered span, while the confirmed span
+    only advances when the caller explicitly acknowledges something.
+    Both spans are prefixes of the file, described by a byte offset and
+    the corresponding physical line number.
+    """
+
+    _buffer: typing.BinaryIO
+    _fingerprint: FileFingerprint
+    _lineno: int
+    _line_end_offset: int
+    _confirmed_offset: int
+    _confirmed_lineno: int
+    #: Delivered but not yet acknowledged lines as
+    #: ``(lineno, end_offset)`` pairs, in ascending order
+    _pending: List[Tuple[int, int]] = attr.ib(factory=list, init=False)
+
+    @classmethod
+    def start(
+        cls,
+        buffer: typing.BinaryIO,
+        fingerprint: FileFingerprint,
+        progress: ReadProgress,
+    ) -> "_ReadProgressTracker":
+        offset = progress.offset
+        buffer.seek(offset)
+        if offset > 0:
+            # When the confirmed offset is not positioned directly after
+            # a newline, it points at the end of a line without a line
+            # terminator. If more data was appended in the meantime,
+            # skip the remainder of that already delivered line.
+            buffer.seek(offset - 1)
+            previous_byte = buffer.read(1)
+            buffer.seek(offset)
+            if previous_byte != b"\n":
+                buffer.readline()
+        return cls(
+            buffer=buffer,
+            fingerprint=fingerprint,
+            lineno=progress.lineno,
+            line_end_offset=offset,
+            confirmed_offset=offset,
+            confirmed_lineno=progress.lineno,
+        )
+
+    def read_line(self, *, skip_empty: bool) -> Optional[Tuple[int, bytes]]:
+        while True:
+            line = self._buffer.readline()
+            if not line:
+                return None
+            self._lineno += 1
+            self._line_end_offset = self._buffer.tell()
+            if skip_empty and not line.rstrip():
+                # Empty lines are never delivered to the caller. They
+                # are simply skipped here; on resume they may be read
+                # (and skipped) again, which is harmless.
+                continue
+            return self._lineno, line
+
+    @property
+    def lineno(self) -> int:
+        """
+        Line number of the most recently read physical line.
+        """
+        return self._lineno
+
+    def record_delivered(self) -> None:
+        """
+        Record the most recently read line as a delivered record that
+        still needs explicit acknowledgement.
+        """
+        self._pending.append((self._lineno, self._line_end_offset))
+
+    def acknowledge(self, lineno: Optional[int] = None) -> ReadProgress:
+        """
+        Acknowledge delivered records, either all of them or through the
+        given physical line number.
+        """
+        if lineno is None:
+            if self._pending:
+                self._confirmed_lineno, self._confirmed_offset = self._pending[-1]
+                self._pending.clear()
+        elif lineno <= self._confirmed_lineno:
+            pass
+        else:
+            self._require_pending_lineno(lineno)
+            self._confirm_through(lineno)
+        return self.checkpoint()
+
+    def acknowledge_skipped(self, lineno: int) -> ReadProgress:
+        """
+        Acknowledge a line that was consumed but not delivered (e.g. an
+        invalid line) by moving the confirmed span past it.
+        """
+        if lineno <= self._confirmed_lineno:
+            return self.checkpoint()
+        if lineno != self._lineno:
+            raise ValueError(
+                f"cannot acknowledge line {lineno}; the most recently "
+                f"read line is {self._lineno}"
+            )
+        # Confirming a skipped line necessarily confirms every line
+        # before it, since progress is always a prefix of the input.
+        self._pending.append((lineno, self._line_end_offset))
+        self._confirm_through(lineno)
+        return self.checkpoint()
+
+    def _require_pending_lineno(self, lineno: int) -> None:
+        if not any(pending_lineno == lineno for pending_lineno, _ in self._pending):
+            raise ValueError(
+                f"line {lineno} has not been delivered and cannot be "
+                "acknowledged"
+            )
+
+    def _confirm_through(self, lineno: int) -> None:
+        remaining: List[Tuple[int, int]] = []
+        for pending_lineno, end_offset in self._pending:
+            if pending_lineno <= lineno:
+                self._confirmed_lineno = pending_lineno
+                self._confirmed_offset = end_offset
+            else:
+                remaining.append((pending_lineno, end_offset))
+        self._pending = remaining
+
+    def checkpoint(self) -> ReadProgress:
+        return ReadProgress(
+            offset=self._confirmed_offset,
+            lineno=self._confirmed_lineno,
+            fingerprint=self._fingerprint,
+        )
+
+
+def _binary_progress_buffer(
+    fp: Optional[typing.IO[Any]],
+) -> Optional[typing.BinaryIO]:
+    """
+    Return a seekable binary stream suitable for offset tracking, or
+    ``None`` when the given file-like object does not support this.
+    """
+    if isinstance(fp, io.TextIOBase):
+        buffer = getattr(fp, "buffer", None)
+    elif isinstance(fp, io.IOBase):
+        buffer = fp
+    else:
+        return None
+    if isinstance(buffer, (io.BufferedIOBase, io.RawIOBase)) and buffer.seekable():
+        return buffer
+    return None
+
+
+def _make_file_fingerprint(buffer: typing.BinaryIO) -> FileFingerprint:
+    name = getattr(buffer, "name", None)
+    if not isinstance(name, (str, bytes, os.PathLike)):
+        raise ValueError(
+            "read progress tracking requires a file opened from a file name"
+        )
+    stat_result = os.stat(name)
+    path: Union[str, bytes] = os.path.realpath(name)
+    return FileFingerprint(
+        path=path,
+        device=stat_result.st_dev,
+        inode=stat_result.st_ino,
+        size=stat_result.st_size,
+    )
+
+
 @attr.s(auto_attribs=True, repr=False)
 class ReaderWriterBase:
     """
@@ -200,16 +474,43 @@ class Reader(ReaderWriterBase):
     decoder. If specified, it must be a callable that accepts a
     (unicode) string and returns the decoded object.
 
+    Read progress tracking is available for readers wrapping a
+    seekable file opened from a file name. Reading and confirmation
+    are separate steps:
+
+    - :py:meth:`read()` merely *delivers* records;
+    - :py:meth:`acknowledge()` marks delivered records as durably
+      processed (e.g. after a database transaction has been
+      committed);
+    - :py:meth:`checkpoint()` returns an immutable
+      :py:class:`ReadProgress` token for the acknowledged input span.
+
+    Pass a previous token as the `progress` argument when reopening
+    the same file to resume after the last acknowledged record.
+    Records delivered but not acknowledged are delivered again on
+    reopen. The token is bound to a specific file (path, device and
+    inode) and cannot be used with a different file, even if it has
+    the same name. Files that were only appended to can be resumed
+    without issues.
+
     :param file_or_iterable: file-like object or iterable yielding lines as
         strings
     :param loads: custom json decoder callable
+    :param progress: previously obtained :py:class:`ReadProgress` to
+        resume from; the file must be the same one the token was
+        created for
     """
 
     _file_or_iterable: Union[
         typing.IO[str], typing.IO[bytes], Iterable[Union[str, bytes]]
     ]
     _line_iter: Iterator[Tuple[int, Union[bytes, str]]] = attr.ib(init=False)
+    _last_lineno: int = attr.ib(default=0, init=False)
     _loads: LoadsCallable = attr.ib(default=default_loads, kw_only=True)
+    _progress: Optional[ReadProgress] = attr.ib(default=None, kw_only=True)
+    _progress_tracker: Optional[_ReadProgressTracker] = attr.ib(
+        default=None, init=False
+    )
 
     def __attrs_post_init__(self) -> None:
         if isinstance(self._file_or_iterable, io.IOBase):
@@ -219,6 +520,30 @@ class Reader(ReaderWriterBase):
             )
 
         self._line_iter = enumerate(self._file_or_iterable, 1)
+
+        buffer = _binary_progress_buffer(self._fp)
+        buffer_name = getattr(buffer, "name", None) if buffer is not None else None
+        if buffer is not None and isinstance(
+            buffer_name, (str, bytes, os.PathLike)
+        ):
+            fingerprint = _make_file_fingerprint(buffer)
+            if self._progress is not None:
+                if not _same_file(self._progress.fingerprint, fingerprint):
+                    raise ReadProgressMismatchError(self._progress, fingerprint)
+            else:
+                self._progress = ReadProgress(
+                    offset=0, lineno=0, fingerprint=fingerprint
+                )
+            self._progress_tracker = _ReadProgressTracker.start(
+                buffer=buffer,
+                fingerprint=fingerprint,
+                progress=self._progress,
+            )
+        elif self._progress is not None:
+            raise ValueError(
+                "resuming from read progress requires a seekable file "
+                "opened from a file name"
+            )
 
     # No type specified, None not allowed
     @overload
@@ -303,12 +628,21 @@ class Reader(ReaderWriterBase):
         if type is not None and type not in VALID_TYPES:
             raise ValueError("invalid type specified")
 
+        tracker = self._progress_tracker
         try:
-            lineno, line = next(self._line_iter)
-            while skip_empty and not line.rstrip():
+            if tracker is None:
                 lineno, line = next(self._line_iter)
+                while skip_empty and not line.rstrip():
+                    lineno, line = next(self._line_iter)
+            else:
+                result = tracker.read_line(skip_empty=skip_empty)
+                if result is None:
+                    raise EOFError
+                lineno, line = result
         except StopIteration:
             raise EOFError from None
+
+        self._last_lineno = lineno
 
         if isinstance(line, bytes):
             try:
@@ -332,6 +666,8 @@ class Reader(ReaderWriterBase):
 
         if value is None:
             if allow_none:
+                if tracker is not None:
+                    tracker.record_delivered()
                 return None
             raise InvalidLineError("line contains null value", line, lineno)
 
@@ -345,7 +681,88 @@ class Reader(ReaderWriterBase):
                     "line does not match requested type", line, lineno
                 )
 
+        if tracker is not None:
+            tracker.record_delivered()
         return value
+
+    @property
+    def lineno(self) -> int:
+        """
+        Physical line number of the most recently read line.
+
+        This is the line number of the last line consumed by
+        :py:meth:`read()`, including lines that failed to decode.
+        """
+        tracker = self._progress_tracker
+        if tracker is not None:
+            return tracker.lineno
+        return self._last_lineno
+
+    def checkpoint(self) -> "ReadProgress":
+        """
+        Return a :py:class:`ReadProgress` token for the confirmed input
+        span.
+
+        The token only covers records acknowledged via
+        :py:meth:`acknowledge()` or
+        :py:meth:`acknowledge_skipped_line()` (including invalid lines
+        skipped by :py:meth:`iter()` with ``skip_invalid=True``).
+        Records that have been delivered but not yet acknowledged are
+        not included; reopening the file with this token causes them to
+        be delivered again.
+
+        Only available for readers wrapping a seekable file opened
+        from a file name.
+        """
+        tracker = self._progress_tracker
+        if tracker is None:
+            raise RuntimeError(
+                "read progress tracking is unavailable for this reader"
+            )
+        return tracker.checkpoint()
+
+    def acknowledge(self, lineno: Optional[int] = None) -> "ReadProgress":
+        """
+        Acknowledge delivered records as durably processed.
+
+        Call this after the records returned by :py:meth:`read()` have
+        been committed elsewhere (e.g. inserted into a database and
+        committed). Without an argument, every record delivered so far
+        is acknowledged. With a `lineno` argument, only records up to
+        and including that physical line are acknowledged; later
+        delivered records remain unconfirmed.
+
+        :param lineno: physical line number to acknowledge through
+        :return: an updated :py:class:`ReadProgress` token
+        """
+        tracker = self._progress_tracker
+        if tracker is None:
+            raise RuntimeError(
+                "read progress tracking is unavailable for this reader"
+            )
+        return tracker.acknowledge(lineno)
+
+    def acknowledge_skipped_line(self, lineno: int) -> "ReadProgress":
+        """
+        Acknowledge a line that could not be decoded as processed.
+
+        Call this after catching :py:class:`InvalidLineError`, passing
+        the exception's :py:attr:`~InvalidLineError.lineno`, to include
+        the offending input span in the confirmed progress. Without
+        this, the line remains unconfirmed and will be encountered
+        again when reading is resumed. This also confirms every record
+        delivered before the skipped line.
+
+        :param lineno: :py:attr:`InvalidLineError.lineno` of the
+            skipped line
+        :return: an updated :py:class:`ReadProgress` token
+        """
+        tracker = self._progress_tracker
+        if tracker is None:
+            raise RuntimeError(
+                "read progress tracking is unavailable for this reader"
+            )
+        return tracker.acknowledge_skipped(lineno)
 
     # No type specified, None not allowed
     @overload
@@ -434,9 +851,12 @@ class Reader(ReaderWriterBase):
                     yield self.read(
                         type=type, allow_none=allow_none, skip_empty=skip_empty
                     )
-                except InvalidLineError:
+                except InvalidLineError as exc:
                     if not skip_invalid:
                         raise
+                    tracker = self._progress_tracker
+                    if tracker is not None:
+                        tracker.acknowledge_skipped(exc.lineno)
         except EOFError:
             pass
 
@@ -570,6 +990,7 @@ def open(
     mode: Literal["r"] = ...,
     *,
     loads: Optional[LoadsCallable] = ...,
+    progress: Optional["ReadProgress"] = ...,
 ) -> Reader:
     ...  # pragma: no cover
 
@@ -597,6 +1018,7 @@ def open(
     compact: Optional[bool] = ...,
     sort_keys: Optional[bool] = ...,
     flush: Optional[bool] = ...,
+    progress: Optional["ReadProgress"] = ...,
 ) -> Union[Reader, Writer]:
     ...  # pragma: no cover
 
@@ -610,6 +1032,7 @@ def open(
     compact: Optional[bool] = None,
     sort_keys: Optional[bool] = None,
     flush: Optional[bool] = None,
+    progress: Optional["ReadProgress"] = None,
 ) -> Union[Reader, Writer]:
     """
     Open a jsonlines file for reading or writing.
@@ -617,6 +1040,13 @@ def open(
     This is a convenience function to open a file and wrap it in either a
     :py:class:`Reader` or :py:class:`Writer` instance, depending on the
     specified `mode`.
+
+    When reading, a :py:class:`ReadProgress` token obtained from a
+    previous run can be passed as `progress` to resume reading after
+    the last confirmed record. Records that were delivered but not
+    confirmed will be delivered again. The token is bound to a specific
+    file and cannot be used with a different file, even if it has the
+    same name.
 
     Additional keyword arguments will be passed on to the reader and writer;
     see their documentation for available options.
@@ -634,6 +1064,7 @@ def open(
     :param file: name or ‘path-like object’ of the file to open
     :param mode: whether to open the file for reading (``r``),
         writing (``w``), appending (``a``), or exclusive creation (``x``).
+    :param progress: read progress token to resume from (reading only)
     """
     if mode not in {"r", "w", "a", "x"}:
         raise ValueError("'mode' must be either 'r', 'w', 'a', or 'x'")
@@ -647,9 +1078,14 @@ def open(
         compact=compact,
         sort_keys=sort_keys,
         flush=flush,
+        progress=progress,
     )
     kwargs = {key: value for key, value in kwargs.items() if value is not None}
-    instance: Union[Reader, Writer] = cls(fp, **kwargs)
+    try:
+        instance: Union[Reader, Writer] = cls(fp, **kwargs)
+    except BaseException:
+        fp.close()
+        raise
     instance._should_close_fp = True
     return instance
 

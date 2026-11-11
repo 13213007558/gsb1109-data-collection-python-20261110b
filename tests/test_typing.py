@@ -55,6 +55,19 @@ def something_with_reader() -> None:
     iter_dict: Iterable[Dict[str, Any]] = reader.iter(type=dict)
     iter_optional_str: Iterable[Optional[str]] = reader.iter(type=str, allow_none=True)
 
+    progress: jsonlines.ReadProgress = reader.checkpoint()
+    progress = reader.acknowledge()
+    progress = reader.acknowledge(reader.lineno)
+    progress = reader.acknowledge_skipped_line(reader.lineno)
+    fingerprint: jsonlines.FileFingerprint = progress.fingerprint
+    progress_offset: int = progress.offset
+    progress_lineno: int = progress.lineno
+    fingerprint_inode: int = fingerprint.inode
+
+    resumed: jsonlines.Reader = jsonlines.Reader(
+        io.StringIO(), progress=progress
+    )
+
     locals()  # Silence flake8 F841
 
 
@@ -78,6 +91,10 @@ def something_with_open() -> None:
         mode="r",
         loads=json.loads,
     )
+
+    saved_progress: Optional[jsonlines.ReadProgress] = None
+    if saved_progress is not None:
+        reader = jsonlines.open(name, progress=saved_progress)
 
     writer: jsonlines.Writer
     writer = jsonlines.open(name, "w")

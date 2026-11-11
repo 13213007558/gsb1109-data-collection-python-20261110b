@@ -6,14 +6,23 @@ import codecs
 import collections
 import io
 import json
+import os
+import pathlib
 import tempfile
 
+import attr
 import jsonlines
 import pytest
 
 
 SAMPLE_BYTES = b'{"a": 1}\n{"b": 2}\n'
 SAMPLE_TEXT = SAMPLE_BYTES.decode("utf-8")
+
+
+def write_jsonl(name: str, lines: str = "") -> str:
+    with open(name, "w") as fp:
+        fp.write(lines)
+    return name
 
 
 def is_json_decode_error(exc: object) -> bool:
@@ -311,3 +320,327 @@ def test_single_char_stripping() -> None:
     Sanity check that a helper constant actually contains single-char strings.
     """
     assert all(len(s) == 1 for s in jsonlines.jsonlines.SKIPPABLE_SINGLE_INITIAL_CHARS)
+
+
+def test_checkpoint_initially_zero(tmp_path: pathlib.Path) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n")
+    with jsonlines.open(path) as reader:
+        progress = reader.checkpoint()
+    assert progress.offset == 0
+    assert progress.lineno == 0
+    assert progress.fingerprint.path == os.path.realpath(path)
+    assert progress.fingerprint.inode == os.stat(path).st_ino
+
+
+def test_checkpoint_unavailable_for_plain_iterable() -> None:
+    reader = jsonlines.Reader(["1", "2"])
+    with pytest.raises(RuntimeError):
+        reader.checkpoint()
+    with pytest.raises(RuntimeError):
+        reader.acknowledge()
+
+
+def test_progress_requires_seekable_named_file(tmp_path: pathlib.Path) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n")
+    with jsonlines.open(path) as reader:
+        progress = reader.checkpoint()
+    with pytest.raises(ValueError):
+        jsonlines.Reader(io.StringIO("1\n"), progress=progress)
+
+
+def test_delivered_records_are_not_confirmed(tmp_path: pathlib.Path) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n3\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        reader.read()
+        assert reader.checkpoint().offset == 0
+
+
+def test_acknowledge_all_and_resume(tmp_path: pathlib.Path) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), '{"id": 1}\n{"id": 2}\n')
+    with jsonlines.open(path) as reader:
+        reader.read()
+        reader.read()
+        progress = reader.acknowledge()
+    assert progress.lineno == 2
+    with jsonlines.open(path, progress=progress) as reader:
+        with pytest.raises(EOFError):
+            reader.read()
+
+
+def test_unacknowledged_records_are_redelivered(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(
+        str(tmp_path / "a.jsonl"),
+        '{"id": 1}\n{"id": 2}\n{"id": 3}\n{"id": 4}\n',
+    )
+
+    # Simulate a crash after reading all four records while only the
+    # database transaction for the first two was committed.
+    with jsonlines.open(path) as reader:
+        for _ in range(4):
+            reader.read()
+        progress = reader.acknowledge(2)
+
+    assert progress.lineno == 2
+    with jsonlines.open(path, progress=progress) as reader:
+        assert [obj["id"] for obj in reader] == [3, 4]
+
+
+def test_acknowledge_by_lineno_keeps_later_records_pending(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n3\n4\n5\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        reader.read()
+        reader.read()
+        reader.acknowledge(2)
+        reader.read()
+        reader.read()
+        progress = reader.checkpoint()
+    assert progress.lineno == 2
+    with jsonlines.open(path, progress=progress) as reader:
+        assert list(reader) == [3, 4, 5]
+
+
+def test_acknowledge_is_idempotent(tmp_path: pathlib.Path) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        first = reader.acknowledge(1)
+        second = reader.acknowledge(1)
+        third = reader.acknowledge(0)
+    assert first == second == third
+
+
+def test_acknowledge_unknown_lineno_raises(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        with pytest.raises(ValueError):
+            reader.acknowledge(2)
+
+
+def test_read_progress_token_is_frozen(tmp_path: pathlib.Path) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n")
+    with jsonlines.open(path) as reader:
+        progress = reader.checkpoint()
+    with pytest.raises(attr.exceptions.FrozenInstanceError):
+        progress.offset = 123  # type: ignore[misc]
+    with pytest.raises(attr.exceptions.FrozenInstanceError):
+        progress.fingerprint.inode = 1  # type: ignore[misc]
+
+
+def test_resume_keeps_working_after_append(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        reader.read()
+        progress = reader.acknowledge()
+
+    with open(path, "a") as fp:
+        fp.write("3\n4\n")
+
+    with jsonlines.open(path, progress=progress) as reader:
+        assert list(reader) == [3, 4]
+
+
+def test_resume_after_append_without_trailing_newline(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), '{"a": 1}\n{"a": 2}')
+    with jsonlines.open(path) as reader:
+        reader.read()
+        reader.read()
+        progress = reader.acknowledge()
+
+    # The previously last line gets completed by the append, followed
+    # by a new record. The completed line must not be delivered again.
+    with open(path, "a") as fp:
+        fp.write('-suffix\n{"a": 3}\n')
+
+    with jsonlines.open(path, progress=progress) as reader:
+        assert list(reader) == [{"a": 3}]
+
+
+def test_resume_with_crlf_line_endings(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = str(tmp_path / "a.jsonl")
+    with open(path, "wb") as fp:
+        fp.write(b"1\r\n2\r\n3\r\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        reader.read()
+        progress = reader.acknowledge()
+    with jsonlines.open(path, progress=progress) as reader:
+        assert list(reader) == [3]
+
+
+def test_progress_rejected_for_different_file_with_same_name(
+    tmp_path: pathlib.Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first_path = write_jsonl(str(first_dir / "data.jsonl"), "1\n")
+    second_path = write_jsonl(str(second_dir / "data.jsonl"), "1\n")
+
+    with jsonlines.open(first_path) as reader:
+        progress = reader.acknowledge()
+
+    with pytest.raises(jsonlines.ReadProgressMismatchError) as excinfo:
+        jsonlines.open(second_path, progress=progress)
+    assert excinfo.value.progress is progress
+    assert excinfo.value.fingerprint.path == os.path.realpath(second_path)
+
+
+def test_progress_rejected_when_file_was_replaced(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        progress = reader.acknowledge()
+
+    os.unlink(path)
+    write_jsonl(path, "99\n")
+
+    with pytest.raises(jsonlines.ReadProgressMismatchError) as excinfo:
+        jsonlines.open(path, progress=progress)
+    assert "device/inode" in str(excinfo.value)
+
+
+def test_acknowledge_skipped_line_then_resume(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\nbroken\n3\n")
+    with jsonlines.open(path) as reader:
+        assert reader.read() == 1
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+        assert excinfo.value.lineno == 2
+        progress = reader.acknowledge_skipped_line(excinfo.value.lineno)
+
+    with jsonlines.open(path, progress=progress) as reader:
+        assert list(reader) == [3]
+
+
+def test_acknowledge_skipped_line_also_confirms_prior_records(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\nbroken\n3\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+        progress = reader.acknowledge_skipped_line(excinfo.value.lineno)
+    assert progress.lineno == 2
+    with jsonlines.open(path, progress=progress) as reader:
+        assert list(reader) == [3]
+
+
+def test_acknowledge_skipped_line_rejects_other_lineno(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\nbroken\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        with pytest.raises(jsonlines.InvalidLineError):
+            reader.read()
+        with pytest.raises(ValueError):
+            reader.acknowledge_skipped_line(1)
+
+
+def test_unacknowledged_invalid_line_is_hit_again_on_resume(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\nbroken\n3\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        with pytest.raises(jsonlines.InvalidLineError):
+            reader.read()
+        progress = reader.checkpoint()
+    with jsonlines.open(path, progress=progress) as reader:
+        assert reader.read() == 1
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            reader.read()
+        assert excinfo.value.lineno == 2
+
+
+def test_iter_skip_invalid_acknowledges_invalid_lines(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\nbad\n2\n")
+    with jsonlines.open(path) as reader:
+        assert list(reader.iter(skip_invalid=True)) == [1, 2]
+        progress = reader.checkpoint()
+    # The invalid line (and everything before it) is acknowledged; the
+    # valid records were never explicitly acknowledged by the caller.
+    assert progress.lineno == 2
+    with jsonlines.open(path, progress=progress) as reader:
+        assert list(reader) == [2]
+
+
+def test_skip_empty_keeps_physical_lineno_and_resumes(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n\n2\n\n3\n")
+    with jsonlines.open(path) as reader:
+        assert reader.read(skip_empty=True) == 1
+        assert reader.read(skip_empty=True) == 2
+        assert reader.lineno == 3
+        progress = reader.acknowledge()
+    with jsonlines.open(path, progress=progress) as reader:
+        assert list(reader.iter(skip_empty=True)) == [3]
+
+
+def test_progress_tracking_with_binary_reader(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = str(tmp_path / "a.jsonl")
+    with open(path, "wb") as fp:
+        fp.write(b'{"x": 1}\n{"x": 2}\n')
+    fp = open(path, "rb")
+    with fp, jsonlines.Reader(fp) as reader:
+        assert reader.read() == {"x": 1}
+        progress = reader.acknowledge()
+    fp = open(path, "rb")
+    with fp, jsonlines.Reader(fp, progress=progress) as reader:
+        assert list(reader) == [{"x": 2}]
+
+
+def test_read_progress_survives_serialization_roundtrip(
+    tmp_path: pathlib.Path,
+) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n3\n")
+    with jsonlines.open(path) as reader:
+        reader.read()
+        reader.read()
+        progress = reader.acknowledge()
+
+    payload = attr.asdict(progress)
+    restored = jsonlines.ReadProgress(
+        offset=payload["offset"],
+        lineno=payload["lineno"],
+        fingerprint=jsonlines.FileFingerprint(**payload["fingerprint"]),
+    )
+    with jsonlines.open(path, progress=restored) as reader:
+        assert list(reader) == [3]
+
+
+def test_lineno_reflects_physical_lines(tmp_path: pathlib.Path) -> None:
+    path = write_jsonl(str(tmp_path / "a.jsonl"), "1\n2\n")
+    with jsonlines.open(path) as reader:
+        assert reader.lineno == 0
+        reader.read()
+        assert reader.lineno == 1
+        reader.read()
+        assert reader.lineno == 2
