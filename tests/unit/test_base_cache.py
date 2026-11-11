@@ -4,6 +4,7 @@ import pickle
 from datetime import timedelta
 from logging import getLogger
 from pickle import PickleError
+from time import time
 from unittest.mock import patch
 
 import pytest
@@ -224,6 +225,98 @@ def test_delete__requests(verify, mock_session):
 
     for request in requests:
         assert not mock_session.cache.contains(request=request)
+
+
+def test_cache_tags__save_and_get(mock_session):
+    response = mock_session.get(MOCKED_URL, cache_tags=['product:1', 'catalog'])
+    assert mock_session.cache.get_tags(response.cache_key) == ['catalog', 'product:1']
+    assert mock_session.cache.get_keys_for_tags(['product:1']) == [response.cache_key]
+    assert mock_session.cache.get_keys_for_tags(['catalog', 'unknown']) == [response.cache_key]
+    assert mock_session.cache.get_keys_for_tags(['unknown']) == []
+
+
+def test_cache_tags__single_tag_string(mock_session):
+    response = mock_session.get(MOCKED_URL, cache_tags='product:1')
+    assert mock_session.cache.get_tags(response.cache_key) == ['product:1']
+
+
+def test_cache_tags__replace_on_overwrite(mock_session):
+    response = mock_session.get(MOCKED_URL, cache_tags=['product:1'])
+    mock_session.get(MOCKED_URL, cache_tags=['product:2'], force_refresh=True)
+    assert mock_session.cache.get_tags(response.cache_key) == ['product:2']
+    assert mock_session.cache.get_keys_for_tags(['product:1']) == []
+
+
+def test_delete__tags(mock_session):
+    """Responses with any invalidated tag should be deleted; unrelated responses should not"""
+    mock_session.get(MOCKED_URL, cache_tags=['product:1', 'catalog'])
+    mock_session.get(MOCKED_URL_JSON, cache_tags=['product:1'])
+    mock_session.get(MOCKED_URL_HTTPS, cache_tags=['product:2'])
+
+    mock_session.cache.delete(tags=['product:1'])
+
+    # Both responses tagged 'product:1' are gone, including the multi-tagged one
+    assert not mock_session.cache.contains(url=MOCKED_URL)
+    assert not mock_session.cache.contains(url=MOCKED_URL_JSON)
+    # The unrelated response is untouched
+    assert mock_session.cache.contains(url=MOCKED_URL_HTTPS)
+    # Tag associations for deleted responses are cleaned up
+    assert mock_session.cache.get_keys_for_tags(['catalog']) == []
+    assert mock_session.cache.get_keys_for_tags(['product:2']) != []
+
+
+def test_delete__tags__unknown_tag(mock_session):
+    mock_session.get(MOCKED_URL, cache_tags=['product:1'])
+    mock_session.cache.delete(tags=['unknown'])
+    assert mock_session.cache.contains(url=MOCKED_URL)
+
+
+def test_cache_tags__persist_across_sessions(mock_session):
+    """Tag associations and invalidation records should survive reopening the cache"""
+    response = mock_session.get(MOCKED_URL, cache_tags=['product:1'])
+    db_path = mock_session.cache.db_path
+    mock_session.close()
+
+    session_2 = CachedSession(cache_name=db_path, backend='sqlite')
+    assert session_2.cache.get_keys_for_tags(['product:1']) == [response.cache_key]
+
+    session_2.cache.delete(tags=['product:1'])
+    assert not session_2.cache.contains(url=MOCKED_URL)
+    session_2.close()
+
+    # The invalidation record also persists, and blocks writes from older in-flight requests
+    session_3 = CachedSession(cache_name=db_path, backend='sqlite')
+    assert session_3.cache.tags_invalidated_since(['product:1'], since=0) is True
+    session_3.close()
+
+
+def test_save_response__invalidated_tag_not_rewritten(mock_session):
+    """A response for a request started before a tag invalidation must not be written back"""
+    response = mock_session.get(MOCKED_URL, cache_tags=['product:1'])
+    request_started_at = time()
+    mock_session.cache.delete(tags=['product:1'])
+
+    mock_session.cache.save_response(
+        response,
+        cache_tags=['product:1'],
+        request_started_at=request_started_at,
+    )
+    assert not mock_session.cache.contains(url=MOCKED_URL)
+
+    # A request started after the invalidation is cached normally
+    mock_session.cache.save_response(
+        response,
+        cache_tags=['product:1'],
+        request_started_at=time(),
+    )
+    assert mock_session.cache.contains(url=MOCKED_URL)
+
+
+def test_clear__removes_cache_tags(mock_session):
+    response = mock_session.get(MOCKED_URL, cache_tags=['product:1'])
+    mock_session.cache.clear()
+    assert mock_session.cache.get_keys_for_tags(['product:1']) == []
+    assert mock_session.cache.get_tags(response.cache_key) == []
 
 
 def test_recreate_keys(mock_session):

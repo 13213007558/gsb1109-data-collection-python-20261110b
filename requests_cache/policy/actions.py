@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
+from json import JSONDecodeError, loads
 from logging import DEBUG, getLogger
+from time import time
 from typing import TYPE_CHECKING, Dict, List, Mapping, MutableMapping, Optional, Union
 
 from attrs import define, field
@@ -21,6 +23,7 @@ from . import (
     get_url_expiration,
     utcnow,
 )
+from .directives import CACHE_TAGS_HEADER
 from .settings import CacheSettings
 
 if TYPE_CHECKING:
@@ -49,6 +52,8 @@ class CacheActions(RichMixin):
 
     Args:
         cache_key: The cache key created based on the initial request
+        cache_tags: Business tags to associate with the response when it is written to the cache,
+            so it can later be invalidated by tag
         error_504: Indicates the request cannot be fulfilled based on cache settings
         expire_after: User or header-provided expiration value
         send_request: Send a new request
@@ -60,6 +65,7 @@ class CacheActions(RichMixin):
 
     # Outputs
     cache_key: str = field(default=None, repr=False)
+    cache_tags: Optional[List[str]] = field(default=None)
     error_504: bool = field(default=False)
     expire_after: ExpirationTime = field(default=None)
     send_request: bool = field(default=False)
@@ -77,6 +83,7 @@ class CacheActions(RichMixin):
     _only_if_cached: bool = field(default=False, repr=False)
     _refresh: bool = field(default=False, repr=False)
     _request: PreparedRequest = field(default=None, repr=False)
+    _request_started_at: float = field(default=None, repr=False)
     _stale_if_error: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _stale_while_revalidate: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _validation_headers: Dict[str, str] = field(factory=dict, repr=False)
@@ -109,6 +116,7 @@ class CacheActions(RichMixin):
         settings = settings or CacheSettings()
         directives = CacheDirectives.from_headers(request.headers)
         logger.debug(f'Cache directives from request headers: {directives}')
+        cache_tags = _pop_cache_tags(request.headers)
 
         # Check expiration values in order of precedence
         expire_after = coalesce(
@@ -138,11 +146,13 @@ class CacheActions(RichMixin):
 
         actions = cls(
             cache_key=cache_key,
+            cache_tags=cache_tags,
             directives=directives,
             expire_after=expire_after,
             only_if_cached=only_if_cached,
             refresh=refresh,
             request=request,
+            request_started_at=time(),
             settings=settings,
             skip_read=any(read_criteria.values()),
             skip_write=directives.no_store,
@@ -427,6 +437,20 @@ class CacheActions(RichMixin):
         if not user_headers:
             return vary_headers
         return sorted(set(vary_headers + [h.lower() for h in user_headers]))
+
+
+def _pop_cache_tags(headers: Optional[MutableMapping[str, str]]) -> Optional[List[str]]:
+    """Extract cache tags from request headers, and remove the header so it isn't sent to the
+    origin server
+    """
+    tags_header = headers.pop(CACHE_TAGS_HEADER, None) if headers else None
+    if not tags_header:
+        return None
+    try:
+        return loads(tags_header)
+    except JSONDecodeError:
+        logger.warning(f'Ignoring invalid cache tags header: {tags_header!r}')
+        return None
 
 
 def _validate_expires_header(expires: Optional[str]) -> ExpirationTime:

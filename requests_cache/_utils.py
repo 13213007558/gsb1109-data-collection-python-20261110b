@@ -41,6 +41,17 @@ def encode(value, encoding='utf-8') -> bytes:
     return value if isinstance(value, bytes) else str(value).encode(encoding)
 
 
+def normalize_cache_tags(tags) -> Optional[List[str]]:
+    """Normalize user-provided cache tags to a list of strings. Accepts either a single tag or
+    an iterable of tags; returns ``None`` if no tags were provided.
+    """
+    if tags is None:
+        return None
+    if isinstance(tags, str):
+        return [tags]
+    return list(tags)
+
+
 def get_placeholder_class(original_exception: Optional[Exception] = None):
     """Create a placeholder type for a class that does not have dependencies installed.
     This allows delaying ImportErrors until init time, rather than at import time.

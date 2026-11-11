@@ -1,12 +1,17 @@
 from datetime import timedelta
+from json import dumps
 from typing import Optional
 
 from attrs import define, field
 from requests.structures import CaseInsensitiveDict
 
-from .._utils import decode, get_valid_kwargs, try_int
+from .._utils import decode, get_valid_kwargs, normalize_cache_tags, try_int
 from ..models import RichMixin
 from . import DO_NOT_CACHE, HeaderDict, get_expiration_seconds
+
+# Nonstandard header used to pass cache tags from CachedSession.request() to CachedSession.send();
+# removed from the request before it is sent
+CACHE_TAGS_HEADER = 'X-Cache-Tags'
 
 
 @define(repr=False)
@@ -67,7 +72,12 @@ def _split_kv_directive(directive: str):
 
 
 def set_request_headers(
-    headers: Optional[HeaderDict], expire_after, only_if_cached, refresh, force_refresh
+    headers: Optional[HeaderDict],
+    expire_after,
+    only_if_cached,
+    refresh,
+    force_refresh,
+    cache_tags=None,
 ):
     """Translate keyword arguments into equivalent request headers"""
     headers = CaseInsensitiveDict(headers)
@@ -86,6 +96,11 @@ def set_request_headers(
         headers['X-ACTUAL-NO-CACHE'] = 'true'
     elif expire_after is not None:
         directives.append(f'max-age={get_expiration_seconds(expire_after)}')
+
+    # Same for cache tags; serialized as JSON to keep the header value ASCII-safe
+    cache_tags = normalize_cache_tags(cache_tags)
+    if cache_tags:
+        headers[CACHE_TAGS_HEADER] = dumps(cache_tags)
 
     if directives:
         headers['Cache-Control'] = ','.join(sorted(set(directives)))

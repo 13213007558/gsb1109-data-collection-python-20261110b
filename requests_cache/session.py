@@ -162,6 +162,7 @@ class CacheMixin(MIXIN_BASE):
         only_if_cached: bool = False,
         refresh: bool = False,
         force_refresh: bool = False,
+        cache_tags: Optional[Iterable[str]] = None,
         **kwargs,
     ) -> AnyResponse:
         """This method prepares and sends a request while automatically performing any necessary
@@ -180,11 +181,15 @@ class CacheMixin(MIXIN_BASE):
                 (e.g., a "soft refresh," like F5 in a browser)
             force_refresh: Always make a new request, and overwrite any previously cached response
                 (e.g., a "hard refresh", like Ctrl-F5 in a browser))
+            cache_tags: Business tags to associate with the response when it is written to the
+                cache, so it can later be invalidated with ``cache.delete(tags=...)``
 
         Returns:
             Either a new or cached response
         """
-        headers = set_request_headers(headers, expire_after, only_if_cached, refresh, force_refresh)
+        headers = set_request_headers(
+            headers, expire_after, only_if_cached, refresh, force_refresh, cache_tags
+        )
         with patch_form_boundary() if kwargs.get('files') else nullcontext():
             return super().request(method, url, *args, headers=headers, **kwargs)  # type: ignore
 
@@ -195,6 +200,7 @@ class CacheMixin(MIXIN_BASE):
         only_if_cached: bool = False,
         refresh: bool = False,
         force_refresh: bool = False,
+        cache_tags: Optional[Iterable[str]] = None,
         **kwargs,
     ) -> AnyResponse:
         """Send a prepared request, with caching. See :py:meth:`requests.Session.send` for base
@@ -212,7 +218,7 @@ class CacheMixin(MIXIN_BASE):
         """
         # Determine which actions to take based on settings and request info
         request.headers = set_request_headers(
-            request.headers, expire_after, only_if_cached, refresh, force_refresh
+            request.headers, expire_after, only_if_cached, refresh, force_refresh, cache_tags
         )
         actions = CacheActions.from_request(
             self.cache.create_key(request, **kwargs), request, self.settings
@@ -242,6 +248,12 @@ class CacheMixin(MIXIN_BASE):
                 # Re-evaluate freshness/expiry with the Vary-matched response
                 actions.update_from_cached_response(vary_cached, self.cache.create_key, **kwargs)
                 cached_response = vary_cached
+
+        # If the request didn't specify cache tags, inherit them from the existing cache entry,
+        # so a revalidation can't write back data for a tag that was invalidated while the
+        # request was in flight
+        if actions.cache_tags is None and cached_response is not None:
+            actions.cache_tags = self.cache.get_tags(actions.cache_key) or None
 
         # Handle missing and expired responses based on settings and headers
         if actions.error_504:
@@ -282,14 +294,26 @@ class CacheMixin(MIXIN_BASE):
         actions.update_from_response(response)
 
         if not actions.skip_write:
-            self.cache.save_response(response, actions.cache_key, actions.expires)
+            self.cache.save_response(
+                response,
+                actions.cache_key,
+                actions.expires,
+                cache_tags=actions.cache_tags,
+                request_started_at=actions._request_started_at,
+            )
         elif cached_response is not None and response.status_code == 304:
             cached_response = actions.update_revalidated_response(
                 response, CachedResponse.from_response(cached_response)
             )
             cached_response.cache_key = actions.cache_key
             if not actions.skip_write:
-                self.cache.save_response(cached_response, actions.cache_key, actions.expires)  # type: ignore[unreachable]
+                self.cache.save_response(  # type: ignore[unreachable]
+                    cached_response,
+                    actions.cache_key,
+                    actions.expires,
+                    cache_tags=actions.cache_tags,
+                    request_started_at=actions._request_started_at,
+                )
             return cached_response
         else:
             logger.debug(f'Skipping cache write for URL: {request.url}')

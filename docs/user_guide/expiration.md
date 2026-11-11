@@ -218,6 +218,34 @@ Finally, you can delete individual responses matching specific requests or
 >>> session.cache.delete('e25f7e6326966e82')
 ```
 
+(tag_invalidation)=
+### Tag-Based Invalidation
+
+For cases where a single upstream change affects multiple cached URLs (for example, a product
+page plus several search result pages), you can associate business tags with cached responses and
+later invalidate all of them at once. Pass `cache_tags` when making a request:
+```python
+>>> session.get('https://shop.example.com/product/42', cache_tags=['product:42'])
+>>> session.get('https://shop.example.com/search?q=shoes&page=1', cache_tags=['product:42', 'search:shoes'])
+```
+
+Then, once the change is confirmed, remove all responses associated with a tag:
+```python
+>>> session.cache.delete(tags=['product:42'])
+```
+
+Notes:
+* A response may have multiple tags; invalidating **any one** of them makes it unusable.
+  Responses without a matching tag are left untouched.
+* If a request doesn't specify tags, it inherits the tags of the existing cache entry, so tags
+  survive revalidation.
+* If a tag is invalidated while a request (e.g., a revalidation) is still in flight, its response
+  is not written back to the cache, even if it completes successfully afterwards.
+* With the SQLite backend, tags and invalidation records are stored in the cache database, so
+  they persist across processes.
+* Use {py:meth}`.BaseCache.get_tags` and {py:meth}`.BaseCache.get_keys_for_tags` to inspect
+  current tag associations.
+
 (ttl)=
 ### Automatic Removal
 The following backends have native TTL support, which can be used to automatically remove expired

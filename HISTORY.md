@@ -1,6 +1,11 @@
 # History
 
 ## Unreleased
+* Add tag-based cache invalidation: pass `cache_tags` to `CachedSession.request()` (or `send()`) to
+  associate business tags with a cached response, and remove all responses for a tag with
+  `cache.delete(tags=[...])`. A response with multiple tags is invalidated if any one of its tags
+  is invalidated. Tags are persisted by the SQLite backend, and a response for an in-flight request
+  started before a tag invalidation (e.g., a slow revalidation) is not written back to the cache.
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

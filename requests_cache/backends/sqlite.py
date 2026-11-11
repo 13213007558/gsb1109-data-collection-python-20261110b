@@ -14,11 +14,11 @@ from os.path import getsize, isfile
 from pathlib import Path
 from tempfile import gettempdir
 from time import sleep, time
-from typing import Collection, Iterator, List, Optional, Tuple, Type
+from typing import Collection, Iterable, Iterator, List, Optional, Set, Tuple, Type
 
 from platformdirs import user_cache_dir
 
-from .._utils import chunkify, get_valid_kwargs
+from .._utils import chunkify, get_valid_kwargs, normalize_cache_tags
 from ..models.response import CachedResponse
 from ..policy import ExpirationTime
 from ..serializers import SerializerType, pickle_serializer
@@ -66,10 +66,104 @@ class SQLiteCache(BaseCache):
             serializer=None,
             **kwargs,
         )
+        self._init_tag_tables()
+
+    def _init_tag_tables(self):
+        """Initialize tables used for tag-based invalidation, if they don't already exist"""
+        with self.responses.connection(commit=True) as con:
+            con.execute(
+                'CREATE TABLE IF NOT EXISTS response_tags ('
+                '    tag TEXT,'
+                '    cache_key TEXT,'
+                '    PRIMARY KEY (tag, cache_key)'
+                ')'
+            )
+            con.execute(
+                'CREATE INDEX IF NOT EXISTS response_tags_key_idx ON response_tags(cache_key)'
+            )
+            con.execute(
+                'CREATE TABLE IF NOT EXISTS tag_invalidations ('
+                '    tag TEXT PRIMARY KEY,'
+                '    invalidated_at REAL'
+                ')'
+            )
 
     @property
     def db_path(self) -> StrOrPath:
         return self.responses.db_path
+
+    # Tag operations persisted in SQLite, so tag associations and invalidation records survive
+    # across processes; see BaseCache for method details
+
+    def get_tags(self, cache_key: str) -> List[str]:
+        with self.responses.connection() as con:
+            rows = con.execute(
+                'SELECT tag FROM response_tags WHERE cache_key = ?', (cache_key,)
+            ).fetchall()
+        return sorted(row[0] for row in rows)
+
+    def get_keys_for_tags(self, tags: Iterable[str]) -> List[str]:
+        tags = normalize_cache_tags(tags) or []
+        keys: Set[str] = set()
+        with self.responses.connection() as con:
+            for chunk in chunkify(tags, max_size=SQLITE_MAX_VARIABLE_NUMBER):
+                marks, args = _format_sequence(chunk)
+                rows = con.execute(
+                    f'SELECT DISTINCT cache_key FROM response_tags WHERE tag IN ({marks})', args
+                ).fetchall()
+                keys.update(row[0] for row in rows)
+        return sorted(keys)
+
+    def set_response_tags(self, cache_key: str, tags: Iterable[str]):
+        tags = normalize_cache_tags(tags) or []
+        with self.responses.connection(commit=True) as con:
+            con.execute('DELETE FROM response_tags WHERE cache_key = ?', (cache_key,))
+            con.executemany(
+                'INSERT INTO response_tags (tag, cache_key) VALUES (?, ?)',
+                [(tag, cache_key) for tag in tags],
+            )
+
+    def tags_invalidated_since(
+        self, tags: Iterable[str], since: Optional[float] = None
+    ) -> bool:
+        tags = normalize_cache_tags(tags) or []
+        if since is None or not tags:
+            return False
+        with self.responses.connection() as con:
+            for chunk in chunkify(tags, max_size=SQLITE_MAX_VARIABLE_NUMBER):
+                marks, args = _format_sequence(chunk)
+                row = con.execute(
+                    f'SELECT MAX(invalidated_at) FROM tag_invalidations WHERE tag IN ({marks})',
+                    args,
+                ).fetchone()
+                if row and row[0] is not None and row[0] >= since:
+                    return True
+        return False
+
+    def _invalidate_tags(self, tags: Iterable[str]):
+        invalidated_at = time()
+        with self.responses.connection(commit=True) as con:
+            con.executemany(
+                'INSERT OR REPLACE INTO tag_invalidations (tag, invalidated_at) VALUES (?, ?)',
+                [(tag, invalidated_at) for tag in tags],
+            )
+            for chunk in chunkify(tags, max_size=SQLITE_MAX_VARIABLE_NUMBER):
+                marks, args = _format_sequence(chunk)
+                con.execute(f'DELETE FROM response_tags WHERE tag IN ({marks})', args)
+
+    def _prune_response_tags(self, cache_keys: Iterable[str]):
+        cache_keys = list(cache_keys)
+        if not cache_keys:
+            return
+        with self.responses.connection(commit=True) as con:
+            for chunk in chunkify(cache_keys, max_size=SQLITE_MAX_VARIABLE_NUMBER):
+                marks, args = _format_sequence(chunk)
+                con.execute(f'DELETE FROM response_tags WHERE cache_key IN ({marks})', args)
+
+    def _clear_tags(self):
+        with self.responses.connection(commit=True) as con:
+            con.execute('DELETE FROM response_tags')
+            con.execute('DELETE FROM tag_invalidations')
 
     def clear(self):
         """Delete all items from the cache. If this fails due to a corrupted cache or other I/O
@@ -83,6 +177,7 @@ class SQLiteCache(BaseCache):
                 unlink(self.responses.db_path)
             self.responses.init_db()
             self.redirects.init_db()
+            self._init_tag_tables()
 
     # A more efficient SQLite implementation of BaseCache.delete
     def delete(
@@ -109,6 +204,8 @@ class SQLiteCache(BaseCache):
         # Bulk delete multiple keys and/or all expired responses in SQL
         elif keys:
             self.responses.bulk_delete(keys)
+        if keys:
+            self._prune_response_tags(keys)
         if expired:
             self._delete_expired()
 
@@ -129,6 +226,11 @@ class SQLiteCache(BaseCache):
             con.execute(
                 f'DELETE FROM {self.responses.table_name} WHERE expires <= ?',
                 (round(time()),),
+            )
+            # Also drop any tag associations that no longer point to a cached response
+            con.execute(
+                'DELETE FROM response_tags WHERE cache_key NOT IN '
+                f'(SELECT key FROM {self.responses.table_name})'
             )
 
     def _prune_redirects(self):

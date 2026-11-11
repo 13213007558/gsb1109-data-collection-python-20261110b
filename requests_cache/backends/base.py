@@ -12,13 +12,26 @@ from collections import UserDict
 from datetime import datetime
 from logging import getLogger
 from pickle import PickleError
-from typing import TYPE_CHECKING, Iterable, Iterator, List, MutableMapping, Optional, TypeVar, Union
+from time import time
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    MutableMapping,
+    Optional,
+    Set,
+    TypeVar,
+    Union,
+)
 from warnings import warn
 
 from pathlib import Path
 
 from requests import Request, Response
 
+from .._utils import normalize_cache_tags
 from ..cache_keys import create_key, redact_response
 from ..models import AnyRequest, CachedResponse
 from ..policy import DEFAULT_CACHE_NAME, CacheSettings, ExpirationTime
@@ -55,6 +68,10 @@ class BaseCache:
         self.cache_name = cache_name
         self.responses: BaseStorage[str, CachedResponse] = DictStorage()
         self.redirects: BaseStorage[str, str] = DictStorage()
+        # Tag index: tag -> cache keys, and tag -> last invalidation time. Backends with native
+        # persistence (e.g., SQLite) override the tag methods below to store this on disk.
+        self._tags: Dict[str, Set[str]] = {}
+        self._tag_invalidations: Dict[str, float] = {}
         self._settings = CacheSettings()  # Init and public access is done in CachedSession
 
     @property
@@ -89,6 +106,8 @@ class BaseCache:
         response: Response,
         cache_key: Optional[str] = None,
         expires: Optional[datetime] = None,
+        cache_tags: Optional[Iterable[str]] = None,
+        request_started_at: Optional[float] = None,
     ):
         """Save a response to the cache
 
@@ -96,22 +115,92 @@ class BaseCache:
             cache_key: Cache key for this response; will otherwise be generated based on request
             response: Response to save
             expires: Absolute expiration time for this response
+            cache_tags: Business tags to associate with this response, so it can later be
+                invalidated with ``delete(tags=...)``
+            request_started_at: Time the request was initiated. If any of the given tags has been
+                invalidated since then, the response is not saved, so a slow revalidation cannot
+                put invalidated data back into the cache.
         """
         cache_key = cache_key or self.create_key(response.request)
+        cache_tags = normalize_cache_tags(cache_tags)
+        if cache_tags and self.tags_invalidated_since(cache_tags, request_started_at):
+            logger.debug(
+                f'Skipping cache write for URL {response.url}: '
+                'a cache tag was invalidated while the request was in flight'
+            )
+            return
+
         cached_response = CachedResponse.from_response(response, expires=expires)
         cached_response = redact_response(cached_response, self._settings.ignored_parameters)
         self.responses[cache_key] = cached_response
+        if cache_tags is not None:
+            self.set_response_tags(cache_key, cache_tags)
 
         # Save redirect aliases, unless this is a revalidation (i.e., it was saved previously)
         if response.history and not cached_response.revalidated:
             for r in response.history:
                 self.redirects[self.create_key(r.request)] = cache_key
 
+    # Cache tag operations
+    # --------------------
+
+    def get_tags(self, cache_key: str) -> List[str]:
+        """Get all cache tags associated with a cached response"""
+        return sorted(tag for tag, keys in self._tags.items() if cache_key in keys)
+
+    def get_keys_for_tags(self, tags: Iterable[str]) -> List[str]:
+        """Get cache keys for all responses associated with any of the given tags"""
+        tags = normalize_cache_tags(tags) or []
+        keys: Set[str] = set()
+        for tag in tags:
+            keys.update(self._tags.get(tag, set()))
+        return sorted(keys)
+
+    def set_response_tags(self, cache_key: str, tags: Iterable[str]):
+        """Associate cache tags with a cached response, replacing any previous tags"""
+        self._prune_response_tags([cache_key])
+        for tag in tags:
+            self._tags.setdefault(tag, set()).add(cache_key)
+
+    def tags_invalidated_since(
+        self, tags: Iterable[str], since: Optional[float] = None
+    ) -> bool:
+        """Check if any of the given tags have been invalidated at or after the given time.
+        Always returns ``False`` if ``since`` is not provided.
+        """
+        if since is None:
+            return False
+        return any(
+            invalidated_at is not None and invalidated_at >= since
+            for invalidated_at in (self._tag_invalidations.get(tag) for tag in tags)
+        )
+
+    def _invalidate_tags(self, tags: Iterable[str]):
+        """Record an invalidation timestamp for each tag, and drop its tag associations"""
+        invalidated_at = time()
+        for tag in tags:
+            self._tag_invalidations[tag] = invalidated_at
+            self._tags.pop(tag, None)
+
+    def _prune_response_tags(self, cache_keys: Iterable[str]):
+        """Remove tag associations for the given cache keys"""
+        cache_keys = set(cache_keys)
+        for tag in list(self._tags):
+            self._tags[tag] -= cache_keys
+            if not self._tags[tag]:
+                del self._tags[tag]
+
+    def _clear_tags(self):
+        """Remove all tag associations and invalidation records"""
+        self._tags.clear()
+        self._tag_invalidations.clear()
+
     def clear(self):
         """Delete all items from the cache"""
         logger.info('Clearing all items from the cache')
         self.responses.clear()
         self.redirects.clear()
+        self._clear_tags()
 
     def close(self):
         """Close any open backend connections"""
@@ -168,6 +257,7 @@ class BaseCache:
         older_than: ExpirationTime = None,
         requests: Optional[Iterable[AnyRequest]] = None,
         urls: Optional[Iterable[str]] = None,
+        tags: Optional[Iterable[str]] = None,
         verify: bool = True,
     ):
         """Remove responses from the cache according one or more conditions.
@@ -179,9 +269,18 @@ class BaseCache:
             older_than: Remove responses older than this value, relative to ``response.created_at``
             requests: Remove matching responses, according to current request matching settings
             urls: Remove matching GET requests for the specified URL(s)
+            tags: Remove responses associated with any of these cache tags. A response with
+                multiple tags is removed if any one of them is invalidated; responses without
+                matching tags are left untouched.
             verify: Set to ``False`` to remove responses without SSL verification
         """
         delete_keys: List[str] = list(keys) if keys else []
+        tags = normalize_cache_tags(tags)
+        if tags:
+            delete_keys += [k for k in self.get_keys_for_tags(tags) if k not in delete_keys]
+            # Record the invalidation before deleting, so a response for an in-flight request
+            # started before this point can't be written back to the cache afterwards
+            self._invalidate_tags(tags)
         if urls:
             requests = list(requests or []) + [Request('GET', url).prepare() for url in urls]
         if requests:
@@ -201,6 +300,7 @@ class BaseCache:
                 pass
         else:
             self.responses.bulk_delete(delete_keys)
+        self._prune_response_tags(delete_keys)
         self._prune_redirects()
 
     def _prune_redirects(self):
@@ -255,6 +355,11 @@ class BaseCache:
             if new_cache_key != old_cache_key:
                 self.responses[new_cache_key] = response
                 del self.responses[old_cache_key]
+                # Keep any cache tags pointing at the updated key
+                tags = self.get_tags(old_cache_key)
+                if tags:
+                    self.set_response_tags(new_cache_key, tags)
+                    self._prune_response_tags([old_cache_key])
 
     # This is deprecated, but still appears in various examples online, so I'll postpone removing it
     # for awhile longer.

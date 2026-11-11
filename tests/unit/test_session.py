@@ -1224,6 +1224,38 @@ def test_response_stale_while_revalidate_respects_only_if_cached(mock_session):
     assert mock_session.mock_adapter.call_count == request_count
 
 
+def test_cache_tags__invalidated_during_revalidation(mock_session):
+    """A tag invalidated while a revalidation request is in flight must not be written back to
+    the cache, even if the revalidation succeeds afterwards"""
+    mock_session.get(MOCKED_URL_ETAG, cache_tags=['product:1'], expire_after=timedelta(seconds=-2))
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL_ETAG, status_code=200, text='new response'
+    )
+    original_send_and_cache = mock_session._send_and_cache
+
+    def invalidate_mid_request(*args, **kwargs):
+        mock_session.cache.delete(tags=['product:1'])
+        return original_send_and_cache(*args, **kwargs)
+
+    with patch.object(CachedSession, '_send_and_cache', side_effect=invalidate_mid_request):
+        response = mock_session.get(MOCKED_URL_ETAG)
+
+    # The fresh response is returned to the caller, but not written back to the cache
+    assert response.status_code == 200
+    assert not mock_session.cache.contains(url=MOCKED_URL_ETAG)
+
+    # A subsequent request started after the invalidation is cached normally
+    mock_session.get(MOCKED_URL_ETAG, cache_tags=['product:1'])
+    assert mock_session.cache.contains(url=MOCKED_URL_ETAG)
+
+
+def test_cache_tags__header_not_sent_to_server(mock_session):
+    """The internal cache tags header should be removed before sending the request"""
+    mock_session.get(MOCKED_URL, cache_tags=['product:1'])
+    request_headers = mock_session.mock_adapter.request_history[0].headers
+    assert 'X-Cache-Tags' not in request_headers
+
+
 # Additional request() and send() options
 # -----------------------------------------------------
 
