@@ -1,5 +1,6 @@
 import contextlib
 import http.client as httplib
+from email.message import Message
 from io import BytesIO
 from tempfile import NamedTemporaryFile
 from unittest import mock
@@ -8,7 +9,82 @@ from pytest import mark, raises
 
 from vcr import mode, use_cassette
 from vcr.cassette import Cassette
-from vcr.stubs import VCRFakeSocket, VCRHTTPSConnection
+from vcr.stubs import VCRFakeSocket, VCRHTTPConnection, VCRHTTPSConnection
+
+
+def _recording_connection():
+    cassette = Cassette("test")
+    connection = VCRHTTPConnection("example.invalid")
+    connection.cassette = cassette
+    connection.request("GET", "/broken")
+    # Never touch a real socket.
+    connection.real_connection.request = mock.Mock()
+    return cassette, connection
+
+
+def test_getresponse_records_a_before_response_failure():
+    cassette, connection = _recording_connection()
+    connection.real_connection.getresponse = mock.Mock(
+        side_effect=httplib.RemoteDisconnected("closed without response"),
+    )
+
+    with raises(httplib.RemoteDisconnected):
+        connection.getresponse()
+
+    assert len(cassette) == 1
+    recorded = cassette.responses[0]
+    assert recorded["body"]["string"] == b""
+    assert recorded["failure"]["phase"] == "before_response"
+    assert recorded["failure"]["type"] == "http.client.RemoteDisconnected"
+
+
+def test_getresponse_records_a_during_body_failure_with_partial_bytes():
+    cassette, connection = _recording_connection()
+    fake_response = mock.Mock(spec=httplib.HTTPResponse)
+    fake_response.status = 200
+    fake_response.reason = "OK"
+    fake_response.msg = None
+    fake_response.headers = Message()
+    fake_response.read = mock.Mock(side_effect=httplib.IncompleteRead(b"partial"))
+    connection.real_connection.getresponse = mock.Mock(return_value=fake_response)
+
+    with raises(httplib.IncompleteRead):
+        connection.getresponse()
+
+    assert len(cassette) == 1
+    recorded = cassette.responses[0]
+    assert recorded["status"]["code"] == 200
+    assert recorded["body"]["string"] == b"partial"
+    assert recorded["failure"]["phase"] == "during_body"
+    assert recorded["failure"]["type"] == "http.client.IncompleteRead"
+
+
+def test_getresponse_replays_a_before_response_failure_without_a_response_object():
+    from vcr.request import Request
+
+    cassette = Cassette("test")
+    cassette.append(
+        Request("GET", "http://example.invalid/broken", None, {}),
+        {
+            "status": {"code": None, "message": None},
+            "headers": {},
+            "body": {"string": b""},
+            "failure": {
+                "type": "http.client.RemoteDisconnected",
+                "message": "no response",
+                "phase": "before_response",
+            },
+        },
+    )
+    cassette.rewound = True
+    connection = VCRHTTPConnection("example.invalid")
+    connection.cassette = cassette
+    connection.request("GET", "/broken")
+
+    with raises(httplib.RemoteDisconnected, match="no response"):
+        connection.getresponse()
+    # Nothing was read from a socket.
+    assert isinstance(connection.sock, VCRFakeSocket)
 
 
 def test_fake_socket_has_nothing_to_read():

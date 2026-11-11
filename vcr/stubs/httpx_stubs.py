@@ -14,10 +14,52 @@ from contextlib import suppress
 
 from vcr.errors import CannotOverwriteExistingCassetteException
 from vcr.filters import decode_response
+from vcr.failures import (
+    BEFORE_RESPONSE,
+    DURING_BODY,
+    is_before_response_failure,
+    make_failure,
+    playback_exception,
+)
 from vcr.request import Request as VcrRequest
 from vcr.serializers.compat import convert_body_to_bytes
 
 _logger = logging.getLogger(__name__)
+
+
+def _failing_stream_class(httpx):
+    """Build a failing stream class for an httpx (or httpx2) module.
+
+    Like httpx's own ``ByteStream`` it is both a sync and an async stream, so a
+    single replayed ``Response`` works on ``Client`` and ``AsyncClient``.
+    Subclassing the module's bases keeps ``Response.close()``/``aclose()``
+    working. The class is cached per module so its identity stays stable.
+    """
+    cache = getattr(_failing_stream_class, "_cache", {})
+    if httpx not in cache:
+
+        class _FailingByteStream(httpx.SyncByteStream, httpx.AsyncByteStream):
+            def __init__(self, body, failure):
+                self._body = body
+                self._failure = failure
+
+            def __iter__(self):
+                yield self._body
+                raise playback_exception(self._failure)
+
+            async def __aiter__(self):
+                yield self._body
+                raise playback_exception(self._failure)
+
+            def close(self):
+                pass
+
+            async def aclose(self):
+                pass
+
+        cache[httpx] = _FailingByteStream
+        _failing_stream_class._cache = cache
+    return cache[httpx]
 
 
 def _serialize_headers(real_response):
@@ -51,6 +93,10 @@ def _deserialize_headers(headers):
 
 
 def _deserialize_response(vcr_response, httpx):
+    # A response that failed while its body was delivered replays the partial
+    # body and then raises the recorded read error at the end of it.
+    failure = vcr_response.get("failure")
+    failing_stream = bool(failure)
     # Cassette format generated for HTTPX requests by older versions of
     # vcrpy. We restructure the content to resemble what a regular
     # cassette looks like.
@@ -72,12 +118,18 @@ def _deserialize_response(vcr_response, httpx):
         message = vcr_response["status"]["message"]
         extensions = {"reason_phrase": message.encode("ascii")} if message else None
 
+    body = vcr_response["body"]["string"]
+    if failing_stream:
+        stream = _failing_stream_class(httpx)(body, failure)
+    else:
+        # Don't use content, because that closes the response,
+        # which we do not want as the real response is unclosed
+        stream = httpx.ByteStream(body)
+
     return httpx.Response(
         vcr_response["status"]["code"],
         headers=_deserialize_headers(vcr_response["headers"]),
-        # Don't use content, because that closes the response,
-        # which we do not want as the real response is unclosed
-        stream=httpx.ByteStream(vcr_response["body"]["string"]),
+        stream=stream,
         extensions=extensions,
     )
 
@@ -106,9 +158,30 @@ def _record_responses(cassette, vcr_request, real_response, real_response_conten
 
 def _play_responses(cassette, vcr_request, httpx):
     vcr_response = cassette.play_response(vcr_request)
-    real_response = _deserialize_response(vcr_response, httpx)
+    # A failure recorded before any response raises instead of returning one.
+    if is_before_response_failure(vcr_response):
+        raise playback_exception(vcr_response["failure"])
+    return _deserialize_response(vcr_response, httpx)
 
-    return real_response
+
+def _before_response_failure(exc):
+    """A cassette interaction for a request that failed before any response."""
+    return {
+        "status": {"code": None, "message": None},
+        "headers": {},
+        "body": {"string": b""},
+        "failure": make_failure(exc, BEFORE_RESPONSE),
+    }
+
+
+def _during_body_failure(real_response, chunks, exc):
+    """A cassette interaction for a response cut off while its body was read."""
+    return {
+        "status": {"code": real_response.status_code, "message": real_response.reason_phrase},
+        "headers": _serialize_headers(real_response),
+        "body": {"string": b"".join(chunks)},
+        "failure": make_failure(exc, DURING_BODY),
+    }
 
 
 async def _vcr_handle_async_request(cassette, real_handle_async_request, self, real_request, httpx):
@@ -121,14 +194,26 @@ async def _vcr_handle_async_request(cassette, real_handle_async_request, self, r
     if vcr_response:
         return vcr_response
 
-    real_response = await real_handle_async_request(self, real_request)
     try:
-        real_response_content = b"".join([part async for part in real_response.stream])
-    except BaseException:
+        real_response = await real_handle_async_request(self, real_request)
+    except Exception as exc:
+        # The request failed before any response was returned.
+        cassette.append(vcr_request, _before_response_failure(exc))
+        raise
+
+    chunks = []
+    try:
+        async for part in real_response.stream:
+            chunks.append(part)
+    except BaseException as exc:
         # The client has not received this response and cannot close its stream yet.
         with suppress(Exception):
             await real_response.stream.aclose()
+        # Cancellation (a BaseException, not Exception) is not recorded.
+        if isinstance(exc, Exception):
+            cassette.append(vcr_request, _during_body_failure(real_response, chunks, exc))
         raise
+    real_response_content = b"".join(chunks)
 
     # Close the original stream so that the connection is released back to the connection pool
     with httpx._exceptions.request_context(request=real_response._request):
@@ -160,14 +245,26 @@ def _vcr_handle_request(cassette, real_handle_request, self, real_request, httpx
     if vcr_response:
         return vcr_response
 
-    real_response = real_handle_request(self, real_request)
     try:
-        real_response_content = b"".join(real_response.stream)
-    except BaseException:
+        real_response = real_handle_request(self, real_request)
+    except Exception as exc:
+        # The request failed before any response was returned.
+        cassette.append(vcr_request, _before_response_failure(exc))
+        raise
+
+    chunks = []
+    try:
+        for part in real_response.stream:
+            chunks.append(part)
+    except BaseException as exc:
         # The client has not received this response and cannot close its stream yet.
         with suppress(Exception):
             real_response.stream.close()
+        # Cancellation (a BaseException, not Exception) is not recorded.
+        if isinstance(exc, Exception):
+            cassette.append(vcr_request, _during_body_failure(real_response, chunks, exc))
         raise
+    real_response_content = b"".join(chunks)
 
     # Close the original stream so that the connection is released back to the connection pool
     with httpx._exceptions.request_context(request=real_response._request):

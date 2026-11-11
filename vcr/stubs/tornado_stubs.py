@@ -7,7 +7,10 @@ from tornado import httputil
 from tornado.httpclient import HTTPResponse
 
 from vcr.errors import CannotOverwriteExistingCassetteException
+from vcr.failures import is_before_response_failure, playback_exception
 from vcr.request import Request
+
+from . import _FailingBytesIO
 
 
 def vcr_fetch_impl(cassette, real_fetch_impl):
@@ -42,6 +45,8 @@ def vcr_fetch_impl(cassette, real_fetch_impl):
 
         if cassette.can_play_response_for(vcr_request):
             vcr_response = cassette.play_response(vcr_request)
+            if is_before_response_failure(vcr_response):
+                raise playback_exception(vcr_response["failure"])
             headers = httputil.HTTPHeaders()
 
             recorded_headers = vcr_response["headers"]
@@ -50,12 +55,18 @@ def vcr_fetch_impl(cassette, real_fetch_impl):
             for k, vs in recorded_headers:
                 for v in vs:
                     headers.add(k, v)
+            failure = vcr_response.get("failure")
+            if failure:
+                # Deliver the partial body, then raise the recorded read error.
+                buffer = _FailingBytesIO(vcr_response["body"]["string"], failure)
+            else:
+                buffer = BytesIO(vcr_response["body"]["string"])
             response = HTTPResponse(
                 request,
                 code=vcr_response["status"]["code"],
                 reason=vcr_response["status"]["message"],
                 headers=headers,
-                buffer=BytesIO(vcr_response["body"]["string"]),
+                buffer=buffer,
                 effective_url=vcr_response.get("url"),
                 request_time=self.io_loop.time() - request.start_time,
             )

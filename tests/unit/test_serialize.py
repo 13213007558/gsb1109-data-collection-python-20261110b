@@ -250,3 +250,30 @@ def test_deserialize_no_body_string():
     data = {"body": {"string": None}}
     output = compat.convert_to_bytes(data)
     assert data == output
+
+
+@pytest.mark.parametrize("serializer", [yamlserializer, jsonserializer])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"type": "http.client.IncompleteRead", "message": "cut off", "phase": "during_body"},
+        {"type": "http.client.RemoteDisconnected", "message": "no response", "phase": "before_response"},
+    ],
+)
+def test_failure_round_trips_through_the_serializer(serializer, failure):
+    request = Request(method="GET", uri="http://example.invalid/broken", body="", headers={})
+    response = {
+        "status": {"code": 200 if failure["phase"] == "during_body" else None, "message": "OK"},
+        "headers": {},
+        "body": {"string": b"partial" if failure["phase"] == "during_body" else b""},
+        "failure": failure,
+    }
+
+    cassette = serialize({"requests": [request], "responses": [response]}, serializer)
+    requests, responses = deserialize(cassette, serializer)
+
+    assert requests[0].uri == "http://example.invalid/broken"
+    replayed = responses[0]
+    assert replayed["failure"] == failure
+    expected_body = b"partial" if failure["phase"] == "during_body" else b""
+    assert replayed["body"]["string"] == expected_body

@@ -10,7 +10,6 @@ from http.cookies import CookieError, Morsel, SimpleCookie
 from types import SimpleNamespace
 
 from aiohttp import (
-    ClientConnectionError,
     ClientResponse,
     ClientSession,
     CookieJar,
@@ -23,6 +22,13 @@ from multidict import CIMultiDict, CIMultiDictProxy, MultiDict
 from yarl import URL
 
 from vcr.errors import CannotOverwriteExistingCassetteException
+from vcr.failures import (
+    BEFORE_RESPONSE,
+    DURING_BODY,
+    is_before_response_failure,
+    make_failure,
+    playback_exception,
+)
 from vcr.request import Request
 from vcr.util import _is_async_iterator, _join_body_chunks
 
@@ -64,6 +70,29 @@ class MockStream(streams.StreamReader):
         self.feed_eof()
 
 
+class _FailingMockStream(streams.StreamReader):
+    """Replays a partial body, then the recorded read failure.
+
+    The recorded bytes are fed without EOF, so they can be read in chunks of
+    any size. Once they are exhausted, the next read waits for more data and
+    hits the recorded failure: the failure point is a position in the body,
+    not the number of read calls.
+    """
+
+    def __init__(self, body, failure):
+        body = body or b""
+        limit = max(len(body), 2**16)
+        super().__init__(_NoConnection(), limit, loop=asyncio.get_running_loop())
+        self.feed_data(body)
+        self._vcr_failure = failure
+
+    async def _wait(self, func_name):
+        # All StreamReader reads wait here once their buffer is empty. Don't
+        # feed EOF: raise the recorded failure instead, like a connection that
+        # stopped delivering the rest of the body.
+        raise playback_exception(self._vcr_failure)
+
+
 class MockClientResponse(ClientResponse):
     def __init__(self, method, url, request_info=None):
         extra = {}
@@ -93,6 +122,10 @@ class MockClientResponse(ClientResponse):
         return self._body.decode(encoding, errors=errors)
 
     async def read(self):
+        # A truncated response raises at the end of its partial body instead of
+        # handing back the partial bytes, like aiohttp does for a real cut-off.
+        if isinstance(self.content, _FailingMockStream):
+            return await self.content.read()
         return self._body
 
     def release(self):
@@ -136,7 +169,12 @@ def build_response(vcr_request, vcr_response, history):
     # Like aiohttp, give the response a single stream, so successive reads (e.g. a
     # ``readline()`` loop) advance through the body. Set it after ``close()``: the first
     # ``close()`` marks the response's stream as closed, and later ones leave it alone.
-    response.content = MockStream(response._body)
+    failure = vcr_response.get("failure")
+    if failure:
+        # A truncated body is delivered, then the recorded read error is raised.
+        response.content = _FailingMockStream(response._body, failure)
+    else:
+        response.content = MockStream(response._body)
     return response
 
 
@@ -171,6 +209,8 @@ def play_responses(cassette, vcr_request, kwargs):
     history = []
     allow_redirects = kwargs.get("allow_redirects", True)
     vcr_response = cassette.play_response(vcr_request)
+    if is_before_response_failure(vcr_response):
+        raise playback_exception(vcr_response["failure"])
     response = build_response(vcr_request, vcr_response, history)
 
     # If we're following redirects, continue playing until we reach
@@ -195,6 +235,8 @@ def play_responses(cassette, vcr_request, kwargs):
         # list that is added on to the final response.
         history.append(response)
         vcr_response = cassette.play_response(vcr_request)
+        if is_before_response_failure(vcr_response):
+            raise playback_exception(vcr_response["failure"])
         response = build_response(vcr_request, vcr_response, history)
 
     return response
@@ -203,23 +245,52 @@ def play_responses(cassette, vcr_request, kwargs):
 async def record_response(cassette, vcr_request, response):
     """Record a VCR request-response chain to the cassette."""
 
+    if response._body is not None:
+        # A followed redirect's body has already been read and cached by
+        # aiohttp, so its stream is drained. Record the cached body directly;
+        # a read failure here is no longer possible.
+        body = response._body
+        if body:
+            response.content = MockStream(body)
+        cassette.append(
+            vcr_request,
+            {
+                "status": {"code": response.status, "message": response.reason},
+                "headers": _serialize_headers(response.headers),
+                "body": {"string": body},
+            },
+        )
+        return
+
+    chunks = []
     try:
-        body = {"string": (await response.read())}
-    # aiohttp raises a ClientConnectionError on reads when
-    # there is no body. We can use this to know to not write one.
-    except ClientConnectionError:
-        body = {}
-    else:
-        # Reading the body for the cassette drained the response's stream, so give
-        # the caller a fresh one to stream from. An empty body leaves aiohttp's own
-        # stream in place: it is already at EOF, and behaves as it would without vcr.
-        if body["string"]:
-            response.content = MockStream(body["string"])
+        # Read chunk by chunk so a body cut off part way still records the
+        # bytes that did arrive, together with the read failure.
+        async for chunk in response.content.iter_any():
+            chunks.append(chunk)
+    except Exception as exc:
+        cassette.append(
+            vcr_request,
+            {
+                "status": {"code": response.status, "message": response.reason},
+                "headers": _serialize_headers(response.headers),
+                "body": {"string": b"".join(chunks)},
+                "failure": make_failure(exc, DURING_BODY),
+            },
+        )
+        raise
+
+    body = b"".join(chunks)
+    # Reading the body for the cassette drained the response's stream, so give
+    # the caller a fresh one to stream from. An empty body leaves aiohttp's own
+    # stream in place: it is already at EOF, and behaves as it would without vcr.
+    if body:
+        response.content = MockStream(body)
 
     vcr_response = {
         "status": {"code": response.status, "message": response.reason},
         "headers": _serialize_headers(response.headers),
-        "body": body,
+        "body": {"string": body},
     }
 
     cassette.append(vcr_request, vcr_response)
@@ -405,13 +476,26 @@ def vcr_request(cassette, real_request):
 
             # Override the raise_for_status parameter to avoid raising an exception before we can record the
             # response.
-            response = await real_request(
-                self,
-                method,
-                url,
-                **kwargs,
-                raise_for_status=_raise_for_status_stub,
-            )
+            try:
+                response = await real_request(
+                    self,
+                    method,
+                    url,
+                    **kwargs,
+                    raise_for_status=_raise_for_status_stub,
+                )
+            except Exception as exc:
+                # The request failed before any response was returned.
+                cassette.append(
+                    vcr_request,
+                    {
+                        "status": {"code": None, "message": None},
+                        "headers": {},
+                        "body": {"string": b""},
+                        "failure": make_failure(exc, BEFORE_RESPONSE),
+                    },
+                )
+                raise
             if cassette.filter_request(vcr_request):
                 await record_responses(cassette, vcr_request, response)
 

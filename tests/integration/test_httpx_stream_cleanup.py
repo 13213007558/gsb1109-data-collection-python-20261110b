@@ -38,7 +38,12 @@ def test_recording_closes_failed_sync_stream(tmp_path, httpx_module, close_fails
             response.read()
         assert caught.value is read_error
         assert closed == [True]
-        assert len(cassette) == 0
+        # The interrupted body is now recorded as a during-body failure.
+        assert len(cassette) == 1
+        recorded = cassette.responses[0]
+        assert recorded["body"]["string"] == b"partial"
+        assert recorded["failure"]["phase"] == "during_body"
+        assert recorded["failure"]["type"] == "httpx.ReadError"
 
 
 def test_recording_closes_failed_wsgi_iterable(tmp_path, httpx_module):
@@ -67,7 +72,10 @@ def test_recording_closes_failed_wsgi_iterable(tmp_path, httpx_module):
         ):
             response.read()
         assert closed == [True]
-        assert len(cassette) == 0
+        assert len(cassette) == 1
+        recorded = cassette.responses[0]
+        assert recorded["body"]["string"] == b"partial"
+        assert recorded["failure"]["phase"] == "during_body"
 
 
 @pytest.mark.parametrize("close_fails", [False, True])
@@ -96,7 +104,12 @@ def test_recording_closes_failed_async_stream(tmp_path, httpx_module, close_fail
                         await response.aread()
                 assert caught.value is read_error
                 assert closed == [True]
-                assert len(cassette) == 0
+                # The interrupted body is recorded as a during-body failure.
+                assert len(cassette) == 1
+                recorded = cassette.responses[0]
+                assert recorded["body"]["string"] == b"partial"
+                assert recorded["failure"]["phase"] == "during_body"
+                assert recorded["failure"]["type"] == "httpx.ReadError"
 
     asyncio.run(run())
 

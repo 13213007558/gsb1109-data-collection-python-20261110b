@@ -4,6 +4,7 @@ Changelog
 All help in providing PRs to close out bug issues is appreciated. Even if that is providing a repo that fully replicates issues. We have very generous contributors that have added these to bug issues which meant another contributor picked up the bug and closed it out.
 
 -  Unreleased
+    - Record and play back interrupted responses. An interaction can now hold a ``failure`` describing an exception that interrupted the request, either ``before_response`` (replayed by raising instead of returning a response) or ``during_body`` (the recorded partial body is delivered, then the recorded read error is raised at that body position, regardless of read size). Works with the http.client/urllib3/requests, httpx (sync and async), aiohttp and tornado stubs; ordinary complete responses and existing cassettes are unchanged, and replay still never contacts the real address. Unimportable exception types fall back to ``vcr.failures.PlaybackError``, with ``register_playback_exception_factory`` for custom reconstruction
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
 
 -  9.4.2

@@ -8,11 +8,62 @@ from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
 from io import BytesIO
 
 from vcr.errors import CannotOverwriteExistingCassetteException
+from vcr.failures import (
+    BEFORE_RESPONSE,
+    DURING_BODY,
+    is_before_response_failure,
+    make_failure,
+    playback_exception,
+)
 from vcr.request import Request
 
 from . import compat
 
 log = logging.getLogger(__name__)
+
+
+class _FailingBytesIO(BytesIO):
+    """A body buffer that raises after its (partial) content is exhausted.
+
+    Replays a response whose body was cut off mid-stream: the recorded
+    partial body is delivered normally, and the recorded read failure is
+    raised once the client reads past it. The failure point is a position in
+    the body, not a read-call count, so reads of any size fail at the same
+    byte offset.
+    """
+
+    def __init__(self, initial_bytes, failure):
+        super().__init__(initial_bytes)
+        self._failure = failure
+
+    def _at_end(self):
+        return super().tell() == len(self.getvalue())
+
+    def _raise_if_at_end(self, data, requested):
+        if requested and not data and self._at_end():
+            raise playback_exception(self._failure)
+        return data
+
+    def read(self, *args, **kwargs):
+        size = args[0] if args else -1
+        return self._raise_if_at_end(super().read(*args, **kwargs), size != 0)
+
+    def read1(self, *args, **kwargs):
+        size = args[0] if args else -1
+        return self._raise_if_at_end(super().read1(*args, **kwargs), size != 0)
+
+    def readall(self):
+        # BytesIO has no readall(); reading with no size reads the rest of the buffer.
+        return self._raise_if_at_end(super().read(), True)
+
+    def readinto(self, buffer):
+        count = super().readinto(buffer)
+        if len(buffer) and count == 0 and self._at_end():
+            raise playback_exception(self._failure)
+        return count
+
+    def readline(self, *args, **kwargs):
+        return self._raise_if_at_end(super().readline(*args, **kwargs), True)
 
 
 class VCRFakeSocket:
@@ -80,7 +131,14 @@ class VCRHTTPResponse(HTTPResponse):
         self.status = self.code = recorded_response["status"]["code"]
         self.version = None
         self.version_string = None
-        self._content = BytesIO(self.recorded_response["body"]["string"])
+        body = self.recorded_response["body"]["string"]
+        # A during-body failure replays the partial bytes, then the recorded
+        # read error once the client reads past them.
+        self.failure = self.recorded_response.get("failure")
+        if self.failure:
+            self._content = _FailingBytesIO(body, self.failure)
+        else:
+            self._content = BytesIO(body)
         self._closed = False
 
         headers = self.recorded_response["headers"]
@@ -307,6 +365,9 @@ class VCRConnection:
         if self.cassette.can_play_response_for(self._vcr_request):
             log.info(f"Playing response for {self._vcr_request} from cassette")
             response = self.cassette.play_response(self._vcr_request)
+            # A failure recorded before any response raises instead of returning one.
+            if is_before_response_failure(response):
+                raise playback_exception(response["failure"])
             return VCRHTTPResponse(response, self._vcr_request.uri)
         else:
             if self.cassette.write_protected and self.cassette.filter_request(self._vcr_request):
@@ -336,8 +397,36 @@ class VCRConnection:
                 )
 
             # get the response
-            response = self.real_connection.getresponse()
-            response_data = response.data if hasattr(response, "data") else response.read()
+            try:
+                response = self.real_connection.getresponse()
+            except Exception as exc:
+                # The connection failed before any response (status line or
+                # headers) arrived, e.g. a reset or closed socket.
+                failure = make_failure(exc, BEFORE_RESPONSE)
+                recorded = {
+                    "status": {"code": None, "message": None},
+                    "headers": {},
+                    "body": {"string": b""},
+                    "failure": failure,
+                }
+                self.cassette.append(self._vcr_request, recorded)
+                raise
+            try:
+                response_data = response.data if hasattr(response, "data") else response.read()
+            except Exception as exc:
+                # The response started (status line and headers arrived) but its
+                # body was cut off, so record the partial body plus the failure.
+                # http.client's IncompleteRead carries the bytes read so far.
+                partial = getattr(exc, "partial", None)
+                partial = partial if isinstance(partial, bytes) else b""
+                recorded = {
+                    "status": {"code": response.status, "message": response.reason},
+                    "headers": serialize_headers(response),
+                    "body": {"string": partial},
+                    "failure": make_failure(exc, DURING_BODY),
+                }
+                self.cassette.append(self._vcr_request, recorded)
+                raise
 
             # put the response into the cassette
             response = {

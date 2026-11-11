@@ -747,3 +747,55 @@ to be serializable, e.g. strings, numbers, lists and dicts. If the cassette
 has no value for ``key`` and the record mode doesn't allow changing it, e.g.
 ``once`` with an existing cassette, ``get_metadata`` raises
 ``vcr.errors.MissingMetadataError``, a ``CannotOverwriteExistingCassetteException``.
+
+Recording interrupted and never-started responses
+--------------------------------------------------
+
+An ordinary interaction holds one complete response. A cassette can also hold
+a *failure*: an exception that interrupted an HTTP interaction. Recording such
+an interaction lets you reproduce, offline, a download whose connection drops
+half way through, or a request that fails before any response is returned.
+
+A failure is stored on the response as a plain, JSON/YAML-safe ``failure``
+mapping with the exception's dotted import path, its message, and a phase:
+
+- ``before_response``: the request failed before the response started. On
+  replay the recorded exception is raised instead of returning a response, so
+  it stays distinct from a response that simply had an empty body.
+- ``during_body``: the status line and headers arrived, part of the body was
+  delivered, and then reading failed. The partial body is stored normally; on
+  replay it is delivered up to the recorded byte, and the recorded exception is
+  raised when a read goes past it. The break point is a position in the body,
+  not a read-call count, so reads of any size fail after the same bytes.
+
+.. code:: yaml
+
+    interactions:
+    - request: {method: GET, uri: http://example.invalid/large, body: '', headers: {}}
+      response:
+        status: {code: 200, message: OK}
+        headers: {content-length: ['100']}
+        body: {string: partial-bytes}
+        failure:
+          type: http.client.IncompleteRead
+          message: 'IncompleteRead(13 bytes read)'
+          phase: during_body
+
+Replay reconstructs the exception from ``type`` and ``message``. If the type
+isn't importable at replay time (the library that raised it isn't installed)
+or can't be built from the message alone, a ``vcr.failures.PlaybackError`` is
+raised instead, carrying the recorded failure. Register a factory for such
+types with ``vcr.failures.register_playback_exception_factory``:
+
+.. code:: python
+
+    from vcr.failures import register_playback_exception_factory, unregister_playback_exception_factory
+
+    register_playback_exception_factory(
+        "some.library.CustomError",
+        lambda failure: RuntimeError(failure["message"]),
+    )
+
+Cancelled requests (for example an ``asyncio.CancelledError``) are not recorded:
+they are control flow, not an interaction to replay. Cassettes without a
+``failure`` entry keep behaving exactly as before.
