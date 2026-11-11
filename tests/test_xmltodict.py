@@ -1,4 +1,4 @@
-from xmltodict import parse, ParsingInterrupted
+from xmltodict import parse, ParsingInterrupted, RecordLimitExceeded
 import collections
 import pytest
 from io import BytesIO
@@ -272,6 +272,97 @@ def test_streaming_random_docs_match_nonstreaming():
         if not isinstance(expected, list):
             expected = [expected]
         assert _stream(xml, 2) == expected, xml
+
+
+def test_streaming_max_record_depth():
+    delivered = []
+
+    def cb(path, item):
+        delivered.append(item)
+        return True
+
+    xml = '<r><item><a><b>deep</b></a></item><item>ok</item></r>'
+    with pytest.raises(RecordLimitExceeded) as excinfo:
+        parse(xml, item_depth=2, item_callback=cb, max_record_depth=1)
+    exc = excinfo.value
+    assert exc.limit_kind == 'depth'
+    assert exc.limit == 1
+    assert exc.actual == 2
+    # the offending record is identified and was not delivered
+    assert exc.path == [('r', None), ('item', None)]
+    assert exc.items_delivered == 0
+    assert delivered == []
+
+
+def test_streaming_max_record_depth_ok():
+    xml = '<r><item><a>x</a></item><item><a>y</a></item></r>'
+    assert _stream(xml, 2, max_record_depth=1) == [{'a': 'x'}, {'a': 'y'}]
+    xml = '<r><item>flat</item></r>'
+    assert _stream(xml, 2, max_record_depth=0) == ['flat']
+
+
+def test_streaming_max_record_chars():
+    delivered = []
+
+    def cb(path, item):
+        delivered.append(item)
+        return True
+
+    xml = '<r><item>ok</item><item>' + 'x' * 50 + '</item></r>'
+    with pytest.raises(RecordLimitExceeded) as excinfo:
+        parse(xml, item_depth=2, item_callback=cb, max_record_chars=10)
+    exc = excinfo.value
+    assert exc.limit_kind == 'chars'
+    assert exc.limit == 10
+    assert exc.actual > 10
+    # the first record was delivered and still counts; the second did not
+    assert exc.items_delivered == 1
+    assert exc.path == [('r', None), ('item', None)]
+    assert delivered == ['ok']
+
+
+def test_streaming_max_record_chars_ok():
+    xml = '<r><item>abc</item><item>de</item></r>'
+    assert _stream(xml, 2, max_record_chars=3) == ['abc', 'de']
+
+
+def test_streaming_interrupt_reports_progress():
+    delivered = []
+
+    def cb(path, item):
+        delivered.append(item)
+        return len(delivered) < 2
+
+    xml = '<r><item>1</item><item>2</item><item>3</item></r>'
+    with pytest.raises(ParsingInterrupted) as excinfo:
+        parse(xml, item_depth=2, item_callback=cb)
+    # both records handed to the callback count, including the stopping one
+    assert excinfo.value.items_delivered == 2
+    assert excinfo.value.path == [('r', None), ('item', None)]
+    assert delivered == ['1', '2']
+
+
+def test_streaming_truncated_input_reports_progress():
+    delivered = []
+
+    def cb(path, item):
+        delivered.append(item)
+        return True
+
+    xml = '<r><item>1</item><item>2</item><item>3'
+    with pytest.raises(expat.ExpatError) as excinfo:
+        parse(xml, item_depth=2, item_callback=cb)
+    # truncated input is an ExpatError (not ParsingInterrupted) and the
+    # records already delivered are not lost track of
+    assert not isinstance(excinfo.value, ParsingInterrupted)
+    assert excinfo.value.items_delivered == 2
+    assert delivered == ['1', '2']
+
+
+def test_record_limits_ignored_without_streaming():
+    xml = '<a><b><c>deep</c></b></a>'
+    assert parse(xml, max_record_depth=0, max_record_chars=1) == \
+        {'a': {'b': {'c': 'deep'}}}
 
 
 def test_postprocessor():

@@ -8,8 +8,41 @@ from io import StringIO
 from inspect import isgenerator
 import codecs
 
+_EXPAT_ERROR = expat.ExpatError
+
+
 class ParsingInterrupted(Exception):
-    pass
+    """Raised when `item_callback` returns a false-ish value to stop parsing.
+
+    Attributes:
+        items_delivered: number of records handed to `item_callback`,
+            including the one whose callback returned a false-ish value.
+        path: path of the record whose callback stopped the parsing.
+    """
+    items_delivered = 0
+    path = None
+
+
+class RecordLimitExceeded(Exception):
+    """A streamed record exceeded a configured record-level limit.
+
+    Attributes:
+        path: path of the record that tripped the limit. This record was
+            not delivered to `item_callback`.
+        items_delivered: number of records already handed to
+            `item_callback` before this one.
+        limit_kind: which limit was tripped, ``'depth'`` or ``'chars'``.
+        limit: the configured limit value.
+        actual: the actual value that exceeded the limit.
+    """
+    def __init__(self, message, path=None, items_delivered=0,
+                 limit_kind=None, limit=None, actual=None):
+        super().__init__(message)
+        self.path = path
+        self.items_delivered = items_delivered
+        self.limit_kind = limit_kind
+        self.limit = limit
+        self.actual = actual
 
 
 class _DictSAXHandler:
@@ -29,12 +62,16 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        max_record_depth=None,
+        max_record_chars=None,
     ):
         self.path = []
         self.stack = []
         self.data = []
         self.item = None
         self.item_depth = item_depth
+        self.items_delivered = 0
+        self._record_chars = 0
         self.xml_attribs = xml_attribs
         self.item_callback = item_callback
         self.attr_prefix = attr_prefix
@@ -49,6 +86,23 @@ class _DictSAXHandler:
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        self.max_record_depth = max_record_depth
+        self.max_record_chars = max_record_chars
+
+    def _record_limit_error(self, limit_kind, actual):
+        limit = (self.max_record_depth if limit_kind == 'depth'
+                 else self.max_record_chars)
+        record_path = list(self.path[:self.item_depth])
+        rendered = '/'.join(name for name, _ in record_path)
+        return RecordLimitExceeded(
+            'record at <%s> exceeds max_record_%s=%r (got %r)'
+            % (rendered, limit_kind, limit, actual),
+            path=record_path,
+            items_delivered=self.items_delivered,
+            limit_kind=limit_kind,
+            limit=limit,
+            actual=actual,
+        )
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -83,6 +137,11 @@ class _DictSAXHandler:
             attrs['xmlns'] = self.namespace_declarations
             self.namespace_declarations = self.dict_constructor()
         self.path.append((name, attrs or None))
+        if (self.item_depth and self.max_record_depth is not None
+                and len(self.path) > self.item_depth):
+            record_depth = len(self.path) - self.item_depth
+            if record_depth > self.max_record_depth:
+                raise self._record_limit_error('depth', record_depth)
         if len(self.path) >= self.item_depth:
             self.stack.append((self.item, self.data))
             if self.xml_attribs:
@@ -121,8 +180,13 @@ class _DictSAXHandler:
                 item = data
 
             should_continue = self.item_callback(self.path, item)
+            self.items_delivered += 1
+            self._record_chars = 0
             if not should_continue:
-                raise ParsingInterrupted
+                exc = ParsingInterrupted()
+                exc.items_delivered = self.items_delivered
+                exc.path = list(self.path)
+                raise exc
             # Reset state for the parent context without keeping a reference to
             # the emitted item.
             if self.stack:
@@ -153,6 +217,11 @@ class _DictSAXHandler:
         self.path.pop()
 
     def characters(self, data):
+        if (self.item_depth and self.max_record_chars is not None
+                and len(self.path) >= self.item_depth):
+            self._record_chars += len(data)
+            if self._record_chars > self.max_record_chars:
+                raise self._record_limit_error('chars', self._record_chars)
         if not self.data:
             self.data = [data]
         else:
@@ -238,6 +307,24 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
     root to the item (name-attribs pairs), and the `item` (dict). If the
     callback's return value is false-ish, parsing will be stopped with the
     :class:`ParsingInterrupted` exception.
+
+    In streaming mode, two optional record-level limits reject oversized
+    records before they reach the callback:
+
+    `max_record_depth` is the maximum nesting depth allowed inside a single
+    record (the record's root element is depth 0), and `max_record_chars` is
+    the maximum total number of characters of character data accumulated
+    inside a single record. When a record exceeds either limit, parsing stops
+    with :class:`RecordLimitExceeded`, which carries the `path` of the
+    offending record (which was not delivered) and `items_delivered`, the
+    number of records already handed to `item_callback`.
+
+    Progress is reported consistently on every early exit, so records already
+    delivered are never lost track of when a later record fails:
+    :class:`ParsingInterrupted` (the callback asked to stop) exposes
+    `items_delivered` and `path`, and the `expat.ExpatError` raised for
+    truncated or malformed input gets an `items_delivered` attribute. The two
+    failure modes stay distinguishable by exception type.
 
     Streaming example::
 
@@ -367,14 +454,21 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
             raise ValueError("entities are disabled")
 
         parser.EntityDeclHandler = _forbid_entities
-    if hasattr(xml_input, 'read'):
-        parser.ParseFile(xml_input)
-    elif isgenerator(xml_input):
-        for chunk in xml_input:
-            parser.Parse(chunk, False)
-        parser.Parse(b'', True)
-    else:
-        parser.Parse(xml_input, True)
+    expat_error = getattr(expat, 'ExpatError', None) or _EXPAT_ERROR
+    try:
+        if hasattr(xml_input, 'read'):
+            parser.ParseFile(xml_input)
+        elif isgenerator(xml_input):
+            for chunk in xml_input:
+                parser.Parse(chunk, False)
+            parser.Parse(b'', True)
+        else:
+            parser.Parse(xml_input, True)
+    except expat_error as exc:
+        # Truncated or malformed input: attach the streaming progress so
+        # records already delivered are not mistaken for undelivered ones.
+        exc.items_delivered = handler.items_delivered
+        raise
     return handler.item
 
 

@@ -113,6 +113,26 @@ Autism
 ...
 ```
 
+### Record limits and progress in streaming mode
+
+Suppliers sometimes nest very deep or very large structures into a single record. Use `max_record_depth` and `max_record_chars` to reject such records before they reach your callback:
+
+```python
+>>> import xmltodict
+>>> try:
+...     xmltodict.parse('big_dump.xml',
+...         item_depth=2, item_callback=handle_artist,
+...         max_record_depth=8, max_record_chars=100_000)
+... except xmltodict.RecordLimitExceeded as exc:
+...     print(exc.path, exc.items_delivered)  # offending record, already-delivered count
+```
+
+Every early exit reports how many records were already handed to `item_callback`, so delivered records are never mistaken for undelivered ones:
+
+- `RecordLimitExceeded`: a record tripped `max_record_depth`/`max_record_chars`. Carries `path` (the offending, not-yet-delivered record), `items_delivered`, `limit_kind`, `limit` and `actual`.
+- `ParsingInterrupted`: your callback returned a false-ish value. Carries `items_delivered` (including the record whose callback stopped the parse) and `path`.
+- `xml.parsers.expat.ExpatError`: the input was truncated or malformed. Gets an `items_delivered` attribute with the count so far.
+
 Or just cache the dicts so you don't have to parse that big XML file again. You do this only once:
 
 ```sh
@@ -219,6 +239,8 @@ Parse XML input into a Python dictionary.
 - `force_list=None`: Force list values for specific elements. Can be a boolean (True/False), a tuple of element names to force lists for, or a callable function that receives (path, key, value) and returns True/False. Useful for elements that may appear once or multiple times to ensure consistent list output.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
+- `max_record_depth=None`: Streaming mode only. Maximum nesting depth allowed inside a single record (the record's root element is depth 0). Records exceeding it raise `RecordLimitExceeded`.
+- `max_record_chars=None`: Streaming mode only. Maximum total characters of character data accumulated inside a single record. Records exceeding it raise `RecordLimitExceeded`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
 
 ### xmltodict.unparse()
