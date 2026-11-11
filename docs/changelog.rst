@@ -5,6 +5,7 @@ All help in providing PRs to close out bug issues is appreciated. Even if that i
 
 -  Unreleased
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
+    - Add ``python3 -m vcr.diff OLD NEW`` (and ``vcr.diff.compare_cassettes``) to review a re-recorded cassette offline: interactions are paired with VCR's own request matchers and responses compared semantically, reporting added, removed, changed and ambiguously-paired interactions with their positions in both files, without modifying either file
 
 -  9.4.2
     - Fix urllib3 pools with ``block=True``, e.g. a requests session with ``HTTPAdapter(pool_block=True)``, waiting forever for a free connection in a cassette, or when used before, after or across cassettes. A response now returns its connection to the pool once its body has been read, as in urllib3, and vcrpy keeps a pool's free slots when it takes connections out of it as a cassette starts or stops using the pool. A response finished after its cassette has exited gives back only the slot, not the cassette's connection (#949) - thanks @nk-batman21

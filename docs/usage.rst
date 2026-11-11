@@ -173,3 +173,39 @@ recording cassettes and also supports network access blocking.
 
 An older plugin, `pytest-vcr <https://github.com/ktosiek/pytest-vcr>`__, is no
 longer actively maintained and is kept here only for reference.
+
+Comparing Cassettes
+-------------------
+
+When an upstream service changes and you re-record a cassette, a line-level
+diff of the cassette files counts reordered query parameters and
+serialization formatting as changes. To review a re-recording offline
+instead, compare the two files with VCR's own request matchers:
+
+.. code:: bash
+
+    python3 -m vcr.diff old.yaml new.yaml
+    python3 -m vcr.diff old.yaml new.yaml --match-on method uri
+    python3 -m vcr.diff old.yaml new.yaml --json
+
+The report lists which interactions were added, removed, or kept, and for
+kept interactions whether the response changed (status, headers, or body,
+compared semantically - JSON bodies are compared structurally). Each entry
+references the interaction's position (0-based index) in both files, so you
+can jump back to it in either file. If the same request was recorded twice,
+both occurrences are kept and paired in order; pairings that can't be made
+reliably (e.g. duplicates that could pair with several counterparts) are
+flagged as ambiguous. The command never modifies either file - accepting the
+new recording is up to you. It exits 0 when the cassettes are equivalent and
+1 when they differ, so it can gate a review step in a script.
+
+The same comparison is available as a library, with matcher names or custom
+matcher callables:
+
+.. code:: python
+
+    from vcr.diff import compare_cassettes
+
+    diff = compare_cassettes("old.yaml", "new.yaml", match_on=["method", "uri"])
+    for pair in diff.changed:
+        print(pair.old_index, pair.new_index, pair.differences)
