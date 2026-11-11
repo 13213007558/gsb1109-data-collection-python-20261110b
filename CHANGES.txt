@@ -1,3 +1,12 @@
+Version 4.3.0 (unreleased)
+
+* Add ``strict`` mode to ``JSONEncoderForHTML`` for embedding JSON in
+  ``<script type="application/json">`` elements: the output is
+  guaranteed to be a single valid JSON document that re-parses to the
+  original data node, and ``RawJSON`` fragments whose safety cannot be
+  confirmed are rejected with ``ValueError`` instead of being silently
+  rewritten
+
 Version 4.2.0 released 2026-10-02
 
 * Start building wheels for Python 3.15 and drop Python 3.8 support

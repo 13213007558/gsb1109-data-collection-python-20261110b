@@ -769,7 +769,7 @@ Encoders and decoders
                               tuple_as_array=True, \
                               bigint_as_string=False, item_sort_key=None, \
                               for_json=True, ignore_nan=False, \
-                              int_as_string_bitcount=None)
+                              int_as_string_bitcount=None, strict=False)
 
    Subclass of :class:`JSONEncoder` that escapes &, <, and > for embedding in HTML.
 
@@ -777,6 +777,26 @@ Encoders and decoders
    U+2029 (PARAGRAPH SEPARATOR), irrespective of the *ensure_ascii* setting,
    as these characters are not valid in JavaScript strings (see
    http://timelessrepo.com/json-isnt-a-javascript-subset).
+
+   If *strict* is true (not the default), the output is additionally
+   guaranteed to be a single valid JSON document that is safe to serve as
+   the text content of a ``<script type="application/json">`` element:
+   re-parsing the surrounding HTML still yields exactly the original data
+   node, and parsing that node's text as JSON produces a value equivalent
+   to the input. Strict mode imposes two extra rules:
+
+   - *allow_nan* and *ignore_nan* must be false, so the output is always
+     valid JSON (``NaN`` and ``Infinity`` are not). Combining them with
+     *strict* raises :exc:`ValueError`.
+   - :class:`RawJSON` fragments are verified before embedding instead of
+     being rewritten after the fact: a fragment is emitted verbatim only
+     if it is itself valid, self-contained JSON and contains none of the
+     characters &, <, >, U+2028 or U+2029. Any fragment whose safety
+     cannot be confirmed raises :exc:`ValueError`.
+
+   Strict mode always uses the pure Python encoder, because the C
+   encoder emits :class:`RawJSON` fragments verbatim and cannot validate
+   them.
 
 Exceptions
 ----------

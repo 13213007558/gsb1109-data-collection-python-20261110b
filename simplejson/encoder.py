@@ -32,7 +32,7 @@ def _import_speedups():
 c_encode_basestring_ascii, c_encode_basestring, c_make_encoder = (
     _import_speedups())
 
-from .decoder import PosInf
+from .decoder import PosInf, JSONDecoder
 from .raw_json import RawJSON
 
 ESCAPE = re.compile(r'[\x00-\x1f\\"]')
@@ -192,6 +192,12 @@ class JSONEncoder(object):
     """
     item_separator = ', '
     key_separator = ': '
+
+    # If not None, a callable that validates each RawJSON fragment before
+    # it is embedded in the output (see JSONEncoderForHTML strict mode).
+    # The C encoder emits RawJSON verbatim and cannot enforce this, so a
+    # non-None validator also forces the pure Python encoder.
+    _raw_json_validator = None
 
     def __init__(self, skipkeys=False, ensure_ascii=True,
                  check_circular=True, allow_nan=False, sort_keys=False,
@@ -412,7 +418,7 @@ class JSONEncoder(object):
         key_memo = {}
         int_as_string_bitcount = (
             53 if self.bigint_as_string else self.int_as_string_bitcount)
-        if c_make_encoder is not None:
+        if c_make_encoder is not None and self._raw_json_validator is None:
             _iterencode = c_make_encoder(
                 markers, self.default, _encoder, self.indent,
                 self.key_separator, self.item_separator, self.sort_keys,
@@ -429,11 +435,59 @@ class JSONEncoder(object):
                 self.namedtuple_as_object, self.tuple_as_array,
                 int_as_string_bitcount,
                 self.item_sort_key, self.encoding, self.for_json,
-                self.iterable_as_array, Decimal=decimal.Decimal)
+                self.iterable_as_array, Decimal=decimal.Decimal,
+                _raw_json_validator=self._raw_json_validator)
         try:
             return _iterencode(o, 0)
         finally:
             key_memo.clear()
+
+
+# Characters that must never appear literally in JSON text embedded in
+# an HTML <script> element: & < > can terminate or confuse the HTML
+# parser's script data state, and U+2028/U+2029 are not valid in
+# JavaScript string literals.
+_HTML_UNSAFE_CHARS = re.compile(u'[<>&\u2028\u2029]')
+
+# A strictly conforming decoder (the defaults reject NaN, Infinity and
+# -Infinity) used to confirm that a RawJSON fragment is valid,
+# self-contained JSON before it is embedded verbatim.
+_strict_json_decoder = JSONDecoder()
+
+
+def _validate_raw_json_for_html(encoded):
+    """Return a RawJSON fragment confirmably safe for verbatim embedding
+    in an HTML ``<script type="application/json">`` element, or raise.
+
+    A fragment is safe only if it is valid, self-contained JSON (so the
+    text extracted from the script node parses to a value equivalent to
+    the input) and contains no character that could interfere with the
+    HTML parser (so re-parsing the document still yields exactly the
+    original data node). Anything that cannot be confirmed safe is
+    rejected with ``ValueError`` rather than silently rewritten.
+    """
+    if isinstance(encoded, binary_type):
+        try:
+            encoded = text_type(encoded, 'ascii')
+        except UnicodeDecodeError:
+            raise ValueError(
+                'RawJSON fragment is not ASCII-decodable, cannot confirm '
+                'it is safe to embed in HTML')
+    elif not isinstance(encoded, text_type):
+        raise TypeError(
+            'RawJSON.encoded_json must be a string, not %s'
+            % (type(encoded).__name__,))
+    if _HTML_UNSAFE_CHARS.search(encoded) is not None:
+        raise ValueError(
+            'RawJSON fragment contains characters that are not safe to '
+            'embed in HTML: %r' % (encoded,))
+    try:
+        _strict_json_decoder.decode(encoded)
+    except ValueError as exc:
+        raise ValueError(
+            'RawJSON fragment is not valid, self-contained JSON: %s'
+            % (exc,))
+    return encoded
 
 
 class JSONEncoderForHTML(JSONEncoder):
@@ -448,7 +502,36 @@ class JSONEncoderForHTML(JSONEncoder):
     characters U+2028 and U+2029, irrespective of the ensure_ascii setting,
     as these characters are not valid in JavaScript strings (see
     http://timelessrepo.com/json-isnt-a-javascript-subset).
+
+    If *strict* is true (not the default), the output is additionally
+    guaranteed to be a single valid JSON document that is safe to serve
+    as the text content of a ``<script type="application/json">``
+    element: re-parsing the surrounding HTML still yields exactly the
+    original data node, and parsing that node's text as JSON produces a
+    value equivalent to the input. Strict mode imposes two extra rules:
+
+    - *allow_nan* and *ignore_nan* must be false, so the output is
+      always valid JSON (``NaN`` and ``Infinity`` are not).
+    - :class:`RawJSON` fragments are verified before embedding instead
+      of being rewritten after the fact: a fragment is emitted verbatim
+      only if it is itself valid, self-contained JSON and contains none
+      of the characters &, <, >, U+2028 or U+2029. Any fragment whose
+      safety cannot be confirmed raises ``ValueError``.
+
+    Strict mode always uses the pure Python encoder, because the C
+    encoder emits RawJSON fragments verbatim and cannot validate them.
     """
+
+    def __init__(self, *args, **kwargs):
+        strict = kwargs.pop('strict', False)
+        super(JSONEncoderForHTML, self).__init__(*args, **kwargs)
+        if strict and (self.allow_nan or self.ignore_nan):
+            raise ValueError(
+                'allow_nan and ignore_nan are not compatible with '
+                'strict=True')
+        self.strict = strict
+        if strict:
+            self._raw_json_validator = _validate_raw_json_for_html
 
     def encode(self, o):
         # Override JSONEncoder.encode because it has hacks for
@@ -484,6 +567,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         ValueError=ValueError,
         string_types=string_types,
         Decimal=None,
+        _raw_json_validator=None,
         dict=dict,
         _dict_types=_dict_types,
         float=float,
@@ -515,6 +599,12 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
             except TypeError:
                 pass
         return None
+
+    def _emit_raw_json(o):
+        encoded = o.encoded_json
+        if _raw_json_validator is not None:
+            encoded = _raw_json_validator(encoded)
+        return encoded
 
     def _encode_int(value):
         skip_quoting = (
@@ -591,7 +681,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                     elif _PY3 and isinstance(value, bytes) and _encoding is not None:
                         yield buf + _encoder(value)
                     elif isinstance(value, RawJSON):
-                        yield buf + value.encoded_json
+                        yield buf + _emit_raw_json(value)
                     elif value is None:
                         yield buf + 'null'
                     elif value is True:
@@ -729,7 +819,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
                     elif _PY3 and isinstance(value, bytes) and _encoding is not None:
                         yield _encoder(value)
                     elif isinstance(value, RawJSON):
-                        yield value.encoded_json
+                        yield _emit_raw_json(value)
                     elif value is None:
                         yield 'null'
                     elif value is True:
@@ -792,7 +882,7 @@ def _make_iterencode(markers, _default, _encoder, _indent, _floatstr,
         elif _PY3 and isinstance(o, bytes) and _encoding is not None:
             yield _encoder(o)
         elif isinstance(o, RawJSON):
-            yield o.encoded_json
+            yield _emit_raw_json(o)
         elif o is None:
             yield 'null'
         elif o is True:
