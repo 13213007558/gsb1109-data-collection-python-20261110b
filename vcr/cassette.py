@@ -9,6 +9,7 @@ from inspect import iscoroutinefunction
 import wrapt
 
 from ._handle_coroutine import handle_coroutine
+from .audit import UnusedInteraction, UnusedInteractionReason
 from .errors import MissingMetadataError, UnhandledHTTPRequestError
 from .filters import sensitive_data_hooks
 from .matchers import get_matchers_results, method, requests_match, uri
@@ -364,6 +365,90 @@ class Cassette:
             final_best_matches.append(best_match[1:])
 
         return final_best_matches
+
+    def unused_interactions(self):
+        """Interactions loaded from the cassette that playback never consumed.
+
+        Read-only audit for tidying up old recordings: unlike
+        ``drop_unused_requests`` it doesn't save or rewrite the cassette, it
+        only reports what was unused, keeping each item's position in the
+        recording. Returns a list of :class:`~vcr.audit.UnusedInteraction` in
+        cassette order, each with an :class:`~vcr.audit.UnusedInteractionReason`:
+
+        - ``NEVER_PLAYED``: nothing consumed the interaction. Either no request
+          with the same method and URI was made at all (the code branch that
+          performs it never ran), or the address was requested fewer times than
+          it was recorded, leaving a duplicate interaction unplayed.
+        - ``BODY_CHANGED``: a request with the same method and URI was made, but
+          it no longer matches the interaction under this cassette's matchers
+          (e.g. the request body changed since it was recorded).
+
+        Interactions recorded during the current session are not included.
+        """
+        unused = []
+        for index in range(self._loaded_count):
+            if self.play_counts.get(index, 0) > 0:
+                continue
+            request, response = self.data[index]
+            reason, detail = self._unused_interaction_reason(index)
+            unused.append(
+                UnusedInteraction(
+                    index=index,
+                    request=request,
+                    response=response,
+                    reason=reason,
+                    detail=detail,
+                ),
+            )
+        return unused
+
+    def _unused_interaction_reason(self, index):
+        """Classify an unplayed loaded interaction at ``index``."""
+        # "Same address" is always method + URI, regardless of what the cassette
+        # matches on: a body or header change still goes to the same endpoint.
+        request, _ = self.data[index]
+        loaded_peers, new_peers = [], []
+        for other, (other_request, _) in enumerate(self.data):
+            if other == index or not requests_match(request, other_request, (method, uri)):
+                continue
+            (new_peers if other >= self._loaded_count else loaded_peers).append(other)
+
+        played_peers = [other for other in loaded_peers if self.play_counts.get(other, 0) > 0]
+        if not played_peers and not new_peers:
+            if not loaded_peers:
+                detail = (
+                    f"No request was made to {request.method} {request.uri}: the code branch that "
+                    "performs it never ran."
+                )
+            else:
+                detail = (
+                    f"{request.method} {request.uri} was recorded {len(loaded_peers) + 1} times but "
+                    "never requested during playback, so all of its interactions are unplayed."
+                )
+            return UnusedInteractionReason.NEVER_PLAYED, detail
+
+        # A consumed interaction that still matches fully means this one is an
+        # extra duplicate (the address was recorded more times than it was requested).
+        if any(requests_match(self.data[other][0], request, self._match_on) for other in played_peers):
+            recorded = len(loaded_peers) + 1
+            consumed = len(played_peers)
+            verb = "was" if consumed == 1 else "were"
+            detail = (
+                f"{request.method} {request.uri} was recorded {recorded} times, but only "
+                f"{consumed} of them {verb} ever consumed, so this duplicate interaction "
+                "was never played."
+            )
+            return UnusedInteractionReason.NEVER_PLAYED, detail
+
+        evidence_peer = played_peers[0] if played_peers else new_peers[0]
+        _, failures = get_matchers_results(self.data[evidence_peer][0], request, self._match_on)
+        failed_names = ", ".join(name for name, _ in failures) or "the request"
+        detail = (
+            f"The request body (or another matched part) changed: a request to "
+            f"{request.method} {request.uri} was made, but it no longer matches this "
+            f"interaction ({failed_names} differs)."
+        )
+        return UnusedInteractionReason.BODY_CHANGED, detail
 
     def get_metadata(self, key, default):
         """Return the value stored in the cassette under key.

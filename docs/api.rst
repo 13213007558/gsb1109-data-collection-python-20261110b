@@ -15,6 +15,13 @@ API
    :members:
    :special-members: __init__
 
+:mod:`~vcr.audit`
+-----------------
+
+.. automodule:: vcr.audit
+   :members:
+   :special-members: __init__
+
 :mod:`~vcr.matchers`
 --------------------
 

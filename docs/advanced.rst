@@ -720,6 +720,39 @@ option to ``True``, VCR will not save old HTTP interactions if they are not used
     with my_vcr.use_cassette('fixtures/vcr_cassettes/synopsis.yaml'):
         ...  # your HTTP interactions here
 
+Audit unused interactions
+-------------------------
+
+The ``all_played`` boolean only says whether every interaction was consumed,
+not *why* some weren't. ``Cassette.unused_interactions()`` is a read-only
+audit that reports each interaction playback never consumed, keeping its
+position in the recording (the zero-based index in the cassette). It never
+plays, saves or rewrites the cassette, so you can decide what to delete
+yourself.
+
+Each finding is an ``UnusedInteraction`` with an ``index``, the recorded
+``request`` and ``response``, and a ``reason``:
+
+-  ``UnusedInteractionReason.NEVER_PLAYED``: no playback request consumed it.
+   Either no request with the same method and URI was made at all (the code
+   branch that performs it never ran), or the address was recorded more times
+   than it was requested, leaving a duplicate unplayed.
+-  ``UnusedInteractionReason.BODY_CHANGED``: a request with the same method
+   and URI was made, but it no longer matches the interaction under the
+   cassette's matchers, e.g. its request body changed since recording.
+
+.. code:: python
+
+    from vcr.audit import UnusedInteractionReason
+
+    with vcr.use_cassette('fixtures/vcr_cassettes/synopsis.yaml') as cass:
+        ...  # your HTTP interactions here
+        for finding in cass.unused_interactions():
+            if finding.reason is UnusedInteractionReason.BODY_CHANGED:
+                print(f"re-record interaction #{finding.index}: {finding.detail}")
+            else:
+                print(f"candidate for deletion #{finding.index}: {finding.detail}")
+
 Cassette Metadata
 -----------------
 

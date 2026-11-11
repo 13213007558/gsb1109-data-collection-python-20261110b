@@ -4,6 +4,7 @@ Changelog
 All help in providing PRs to close out bug issues is appreciated. Even if that is providing a repo that fully replicates issues. We have very generous contributors that have added these to bug issues which meant another contributor picked up the bug and closed it out.
 
 -  Unreleased
+    - New read-only ``Cassette.unused_interactions()`` audit for tidying up old recordings: it reports each loaded interaction playback never consumed, with its position in the cassette and a reason that distinguishes a code branch that never ran (or an address recorded more times than it was requested) from a request whose body or other matched part changed. It never rewrites the cassette, unlike ``drop_unused_requests``
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
 
 -  9.4.2
