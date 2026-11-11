@@ -1,5 +1,5 @@
 from __future__ import absolute_import, division, unicode_literals
-from six import viewkeys
+from six import string_types, viewkeys
 
 from . import _inputstream
 from . import _tokenizer
@@ -17,6 +17,7 @@ from .constants import (
     adjustForeignAttributes as adjustForeignAttributesMap,
     adjustMathMLAttributes, adjustSVGAttributes,
     E,
+    parseErrorCategories,
     _ReparseException
 )
 
@@ -76,7 +77,8 @@ class HTMLParser(object):
 
     """
 
-    def __init__(self, tree=None, strict=False, namespaceHTMLElements=True, debug=False):
+    def __init__(self, tree=None, strict=False, namespaceHTMLElements=True,
+                 debug=False, errorPolicy=None):
         """
         :arg tree: a treebuilder class controlling the type of tree that will be
             returned. Built in treebuilders can be accessed through
@@ -88,17 +90,37 @@ class HTMLParser(object):
 
         :arg debug: whether or not to enable debug mode which logs things
 
+        :arg errorPolicy: select which parse errors are fatal. When omitted (or
+            :obj:`None`) the parser keeps its historical behaviour, governed by
+            ``strict`` alone: every parse error is fatal when ``strict`` is true
+            and ignored otherwise.
+
+            A string names a predefined category from
+            :data:`html5lib.constants.parseErrorCategories` (for example
+            ``"table"``). An iterable of error code strings (see
+            :data:`html5lib.constants.E`) is treated as the explicit set of
+            fatal error codes. Parse errors whose code is not selected are
+            recorded in :attr:`errors` but parsing continues.
+
         Example:
 
         >>> from html5lib.html5parser import HTMLParser
         >>> parser = HTMLParser()                     # generates parser with etree builder
         >>> parser = HTMLParser('lxml', strict=True)  # generates parser with lxml builder which is strict
+        >>> parser = HTMLParser(errorPolicy="table")  # fail only on malformed tables
 
         """
+
+        if strict and errorPolicy is not None:
+            raise TypeError(
+                "strict and errorPolicy are mutually exclusive; use strict=True "
+                "to fail on every parse error or errorPolicy to select the "
+                "fatal error codes")
 
         # Raise an exception on the first error encountered
         self.strict = strict
         self.debug = debug
+        self.blockingParseErrors = self._parseErrorPolicy(errorPolicy)
 
         if tree is None:
             tree = treebuilders.getTreeBuilder("etree")
@@ -110,6 +132,24 @@ class HTMLParser(object):
 
         self.phases = {name: cls(self, self.tree) for name, cls in
                        _phases.items()}
+
+    @staticmethod
+    def _parseErrorPolicy(errorPolicy):
+        """Normalise the errorPolicy argument into a set of fatal error codes.
+
+        Returns :obj:`None` when no policy is enabled, preserving the legacy
+        strict/non-strict behaviour.
+        """
+        if errorPolicy is None:
+            return None
+        if isinstance(errorPolicy, string_types):
+            try:
+                return frozenset(parseErrorCategories[errorPolicy])
+            except KeyError:
+                raise ValueError(
+                    "unknown parse error category %r; available categories: %s"
+                    % (errorPolicy, ", ".join(sorted(parseErrorCategories))))
+        return frozenset(errorPolicy)
 
     def _parse(self, stream, innerHTML=False, container="div", scripting=False, **kwargs):
 
@@ -320,9 +360,16 @@ class HTMLParser(object):
         # XXX The idea is to make errorcode mandatory.
         if datavars is None:
             datavars = {}
-        self.errors.append((self.tokenizer.stream.position(), errorcode, datavars))
-        if self.strict:
-            raise ParseError(E[errorcode] % datavars)
+        position = self.tokenizer.stream.position()
+        self.errors.append((position, errorcode, datavars))
+        if self._isBlockingError(errorcode):
+            raise ParseError(errorcode, position, datavars)
+
+    def _isBlockingError(self, errorcode):
+        """Whether a parse error must abort the current parse."""
+        if self.blockingParseErrors is not None:
+            return errorcode in self.blockingParseErrors
+        return self.strict
 
     def adjustMathMLAttributes(self, token):
         adjust_attributes(token, adjustMathMLAttributes)
@@ -2789,5 +2836,34 @@ def impliedTagToken(name, type="EndTag", attributes=None,
 
 
 class ParseError(Exception):
-    """Error in parsed document"""
-    pass
+    """A fatal parse error selected by the parser's error policy.
+
+    :arg errorcode: the parse error code (see
+        :data:`html5lib.constants.E`)
+    :arg position: ``(line, column)`` of the error in the input stream,
+        1-based line and 0-based column
+    :arg datavars: variables interpolated into the error message
+    """
+
+    def __init__(self, errorcode="XXX-undefined-error", position=None,
+                 datavars=None):
+        if datavars is None:
+            datavars = {}
+        self.errorcode = errorcode
+        self.position = position
+        self.datavars = datavars
+        super(ParseError, self).__init__(self._formatMessage())
+
+    def _formatMessage(self):
+        template = E.get(self.errorcode)
+        if template is None:
+            message = self.errorcode
+        else:
+            try:
+                message = template % self.datavars
+            except (KeyError, TypeError, ValueError):
+                message = template
+        if self.position is not None:
+            line, column = self.position
+            message = "%s (line %d, column %d)" % (message, line, column)
+        return message

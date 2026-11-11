@@ -293,6 +293,56 @@ E = {
         "Undefined error (this sucks and should be fixed)",
 }
 
+#: Parse error codes raised while parsing a ``DOCTYPE`` declaration or because
+#: the document is missing one. These are common on legacy pages and usually do
+#: not affect the structure of the body content.
+doctypeParseErrorCodes = frozenset([
+    "eof-in-doctype",
+    "eof-in-doctype-name",
+    "expected-dashes-or-doctype",
+    "expected-doctype-but-got-chars",
+    "expected-doctype-but-got-end-tag",
+    "expected-doctype-but-got-eof",
+    "expected-doctype-but-got-start-tag",
+    "expected-doctype-name-but-got-eof",
+    "expected-doctype-name-but-got-right-bracket",
+    "expected-space-or-right-bracket-in-doctype",
+    "need-space-after-doctype",
+    "unexpected-char-in-doctype",
+    "unexpected-doctype",
+    "unexpected-end-of-doctype",
+    "unknown-doctype",
+])
+
+#: Parse error codes raised by the table insertion phases. They indicate that
+#: the table structure was repaired (implied end tags, foster parenting, closed
+#: cells or rows), which can silently relocate table data such as amounts.
+#: Only codes that are emitted exclusively by table-related phases are listed
+#: here; generic codes shared with other phases are intentionally excluded.
+tableParseErrorCodes = frozenset([
+    "eof-in-table",
+    "end-tag-too-early-named",
+    "no-end-tag",
+    "unexpected-cell-end-tag",
+    "unexpected-cell-in-table-body",
+    "unexpected-end-tag-in-table-body",
+    "unexpected-end-tag-in-table-row",
+    "unexpected-end-tag-implies-table-voodoo",
+    "unexpected-form-in-table",
+    "unexpected-hidden-input-in-table",
+    "unexpected-implied-end-tag-in-table-row",
+    "unexpected-start-tag-implies-table-voodoo",
+    "unexpected-table-element-end-tag-in-select-in-table",
+    "unexpected-table-element-start-tag-in-select-in-table",
+])
+
+#: Named groups of parse error codes, usable as values of the ``errorPolicy``
+#: argument of :class:`~html5lib.html5parser.HTMLParser`.
+parseErrorCategories = {
+    "doctype": doctypeParseErrorCodes,
+    "table": tableParseErrorCodes,
+}
+
 namespaces = {
     "html": "http://www.w3.org/1999/xhtml",
     "mathml": "http://www.w3.org/1998/Math/MathML",

@@ -49,6 +49,47 @@ The implementation of builders can be found in `html5lib/treebuilders/
 <https://github.com/html5lib/html5lib-python/tree/master/html5lib/treebuilders>`_.
 
 
+Parse errors
+------------
+
+Every parse error encountered is appended to
+:attr:`~html5lib.html5parser.HTMLParser.errors` as a
+``((line, column), errorcode, datavars)`` tuple. By default parsing then
+continues, using the error recovery rules from the HTML specification.
+
+Passing ``strict=True`` makes the first parse error fatal by raising
+:class:`~html5lib.html5parser.ParseError`.
+
+For finer control, pass ``errorPolicy`` instead to choose which error codes
+are fatal:
+
+* a category name from
+  :data:`html5lib.constants.parseErrorCategories`, such as ``"doctype"``
+  (missing or malformed ``DOCTYPE``) or ``"table"`` (repaired table structure,
+  for example a cell closed by an early ``</table>``);
+* any iterable of explicit error codes (the keys of
+  :data:`html5lib.constants.E`).
+
+Errors outside the selected set are still recorded in ``errors`` but do not
+stop the parse. A raised :class:`~html5lib.html5parser.ParseError` exposes the
+offending ``errorcode`` and its stream ``position`` (1-based line, 0-based
+column):
+
+.. code-block:: python
+
+  import html5lib
+  from html5lib.html5parser import ParseError
+
+  parser = html5lib.HTMLParser(errorPolicy="table")
+  try:
+      parser.parse(bulletin_page)
+  except ParseError as exc:
+      reject(exc.errorcode, exc.position)  # e.g. ("unexpected-cell-end-tag", (12, 7))
+
+``strict`` and ``errorPolicy`` are mutually exclusive; omitting both preserves
+the historical behaviour.
+
+
 Tree walkers
 ------------
 

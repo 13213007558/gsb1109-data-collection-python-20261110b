@@ -15,6 +15,12 @@ Features:
   you, Tom Most!) (#396)
 * The ``<ol reversed>`` and ``<ol start>`` attributes are now permitted by the
   sanitizer. (#321) (Thank you, Tom Most!)
+* ``HTMLParser`` accepts an ``errorPolicy`` argument selecting which parse
+  errors are fatal, either by predefined category (``"doctype"`` or
+  ``"table"``) or by an iterable of explicit error codes. The raised
+  ``ParseError`` now carries the offending ``errorcode`` and stream
+  ``position``. Parsers without an ``errorPolicy`` keep the previous
+  ``strict`` on/off behaviour.
 
 Bug fixes:
 
