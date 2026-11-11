@@ -115,6 +115,24 @@ In that case one can use the ``kvitems`` function instead:
     for name in names:
         do_something_with(name)
 
+When keys themselves contain dots,
+or when a literal ``item`` key must be told apart from array membership,
+string prefixes become ambiguous.
+In that case use the ``items_at_path`` function,
+which takes the selection as a sequence of path segments instead.
+Each segment is either an object key (matched verbatim, empty keys included)
+or the ``ijson.ARRAY_ITEM`` singleton matching every element of an array:
+
+.. code-block::  python
+
+    import ijson
+
+    f = urlopen('http://.../')
+    # selects {"earth.europe": [...]} elements, not {"earth": {"europe": ...}}
+    places = ijson.items_at_path(f, ('earth.europe', ijson.ARRAY_ITEM))
+    for place in places:
+        do_something_with(place)
+
 
 Lower-level interfaces
 ----------------------
@@ -411,7 +429,8 @@ to give users more fine-grained control over certain operations:
   an additional ``buf_size`` option (defaults to ``65536`` or 64KB)
   specifies the amount of bytes the library
   should attempt to read each time.
-- The ``items`` and ``kvitems`` functions, and all their variants,
+- The ``items``, ``kvitems`` and ``items_at_path`` functions,
+  and all their variants,
   have an optional ``map_type`` argument (defaults to ``dict``)
   used to construct objects from the JSON stream.
   This should be a dict-like type supporting item assignment.
@@ -456,6 +475,13 @@ It works as follows:
 When using the ``ijson.items`` function,
 the prefix works as the selection
 for which objects should be automatically built and returned by ijson.
+
+Note that string prefixes cannot distinguish
+a key containing a literal ``.`` from nested objects,
+nor a literal ``item`` key from array membership,
+and empty keys collapse into their surroundings.
+Use ``ijson.items_at_path`` with a sequence of path segments
+when any of these cases can occur.
 
 
 Backends

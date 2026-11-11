@@ -90,3 +90,10 @@ def _make_kvitems_async(backend):
             *common._kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_async
+
+def _make_items_at_path_async(backend):
+    def items_at_path_async(f, path, map_type=None, buf_size=64*1024, **config):
+        return async_iterable(f, buf_size,
+            *common._items_at_path_pipeline(backend, path, map_type, config)
+        )
+    return items_at_path_async
