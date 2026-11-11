@@ -53,6 +53,7 @@ def _parse_data(
     escapechar: str,
     strict: bool,
     return_quoted: bool = False,
+    comment: Optional[str] = None,
 ) -> Iterator[Union[List[str], List[Tuple[str, bool]]]]:
     parser = Parser(
         data,
@@ -62,6 +63,7 @@ def _parse_data(
         field_limit=field_size_limit(),
         strict=strict,
         return_quoted=return_quoted,
+        comment=comment,
     )
     try:
         for row in parser:
@@ -78,6 +80,7 @@ def parse_data(
     escapechar: Optional[str] = None,
     strict: Optional[bool] = None,
     return_quoted: bool = False,
+    comment: Optional[str] = None,
 ) -> Iterator[Union[List[str], List[Tuple[str, bool]]]]:
     """Parse the data given a dialect using the C parser
 
@@ -110,6 +113,12 @@ def parse_data(
         For each cell, return a tuple "(field, is_quoted)" where the second
         element indicates whether the cell was a quoted cell or not.
 
+    comment : str
+        The comment character to use. If not None, physical lines that start
+        with this character at the beginning of a record are skipped. A line
+        inside a (possibly multi-line) quoted field is never treated as a
+        comment. If None, no lines are skipped.
+
     Yields
     ------
     rows : list
@@ -136,6 +145,7 @@ def parse_data(
         escapechar_,
         strict_,
         return_quoted=return_quoted,
+        comment=comment,
     )
 
 
@@ -143,10 +153,12 @@ def parse_string(
     data: str,
     dialect: SimpleDialect,
     return_quoted: bool = False,
+    comment: Optional[str] = None,
 ) -> Iterator[Union[List[str], List[Tuple[str, bool]]]]:
     """Utility for when the CSV file is encoded as a single string"""
     return parse_data(
         iter(io.StringIO(data, newline="")),
         dialect=dialect,
         return_quoted=return_quoted,
+        comment=comment,
     )

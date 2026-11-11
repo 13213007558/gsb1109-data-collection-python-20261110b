@@ -29,13 +29,27 @@ class reader:
         self,
         csvfile: Iterable[str],
         dialect: _DialectLike = "excel",
+        *,
+        comment: Optional[str] = None,
         **fmtparams: Any,
     ):
         self.csvfile = csvfile
         self.original_dialect = dialect
+        self.comment = comment
         self._dialect = self._make_simple_dialect(dialect, **fmtparams)
+        self._validate_comment(comment)
         self.line_num: int = 0
         self.parser_gen: Optional[Parser] = None
+
+    @staticmethod
+    def _validate_comment(comment: Optional[str]) -> None:
+        if comment is not None and (
+            not isinstance(comment, str) or len(comment) > 1
+        ):
+            raise ValueError(
+                "Comment should be None or a one-character string, got: %r"
+                % comment
+            )
 
     @property
     def dialect(self) -> csv.Dialect:
@@ -66,6 +80,7 @@ class reader:
             escapechar=self._dialect.escapechar,
             field_limit=field_size_limit(),
             strict=self._dialect.strict,
+            comment=self.comment,
         )
         return self
 

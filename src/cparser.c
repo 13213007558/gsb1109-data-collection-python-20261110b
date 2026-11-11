@@ -76,6 +76,7 @@ typedef struct {
 	Py_UCS4 delimiter;
 	Py_UCS4 quotechar;
 	Py_UCS4 escapechar;
+	Py_UCS4 comment;
 	int doublequote;
 	int strict;
 	int return_quoted;
@@ -460,7 +461,7 @@ static PyObject *Parser_iternext(ParserObj *self)
 
 	if (parse_reset(self) < 0)
 		return NULL;
-	do {
+	for (;;) {
 		lineobj = PyIter_Next(self->input_iter);
 		if (lineobj == NULL) {
 			/* End of input OR exception */
@@ -494,8 +495,20 @@ static PyObject *Parser_iternext(ParserObj *self)
 		}
 		kind = PyUnicode_KIND(lineobj);
 		data = PyUnicode_DATA(lineobj);
-		pos = 0;
 		linelen = PyUnicode_GET_LENGTH(lineobj);
+
+		/* Skip comment lines. A line is only treated as a comment when a
+		 * new record starts on this line. Lines read while parsing a
+		 * (possibly multi-line) quoted field are never comments, so a '#'
+		 * inside a quoted field is always part of the data. */
+		if (self->comment != '\0' && self->state == START_RECORD &&
+				linelen > 0 &&
+				PyUnicode_READ(kind, data, 0) == self->comment) {
+			Py_DECREF(lineobj);
+			continue;
+		}
+
+		pos = 0;
 		v = '\0';
 		while (linelen--) {
 			if (v != '\0')
@@ -522,7 +535,9 @@ static PyObject *Parser_iternext(ParserObj *self)
 		Py_DECREF(lineobj);
 		if (parse_process_char(self, 0, 0) < 0)
 			goto err;
-	} while (self->state != START_RECORD);
+		if (self->state == START_RECORD)
+			break;
+	}
 
 	fields = self->fields;
 	self->fields = NULL;
@@ -619,6 +634,7 @@ static PyObject *cparser_parser(PyObject *module, PyObject *args, PyObject *keyw
 		 *field_limit = NULL,
 		 *strict = NULL,
 		 *return_quoted = NULL,
+		 *comment = NULL,
 		 *iterator = NULL;
 
 	if (!self)
@@ -631,6 +647,7 @@ static PyObject *cparser_parser(PyObject *module, PyObject *args, PyObject *keyw
 	self->field_size = 0;
 	self->doublequote = 0;
 	self->return_quoted = 0;
+	self->comment = '\0';
 
 	if (parse_reset(self) < 0) {
 		Py_DECREF(self);
@@ -645,12 +662,14 @@ static PyObject *cparser_parser(PyObject *module, PyObject *args, PyObject *keyw
 	       	"field_limit",
 	       	"strict",
 		"return_quoted",
+		"comment",
 	       	NULL
 	};
 
-	if (!PyArg_ParseTupleAndKeywords(args, keyword_args, "O|$OOOOOO", kwlist,
-				&iterator, &delimiter, &quotechar, &escapechar, 
-				&field_limit, &strict, &return_quoted)) {
+	if (!PyArg_ParseTupleAndKeywords(args, keyword_args, "O|$OOOOOOO", kwlist,
+				&iterator, &delimiter, &quotechar, &escapechar,
+				&field_limit, &strict, &return_quoted,
+				&comment)) {
 		Py_DECREF(self);
 		return NULL;
 	}
@@ -661,6 +680,7 @@ static PyObject *cparser_parser(PyObject *module, PyObject *args, PyObject *keyw
 	Py_XINCREF(field_limit);
 	Py_XINCREF(strict);
 	Py_XINCREF(return_quoted);
+	Py_XINCREF(comment);
 
 #define ATTRSET(meth, name, target, src, dflt) \
 	if (meth(name, target, src, dflt)) \
@@ -672,6 +692,7 @@ static PyObject *cparser_parser(PyObject *module, PyObject *args, PyObject *keyw
 	ATTRSET(_set_long, "field_limit", &self->field_limit, field_limit, 128 * 1024);
 	ATTRSET(_set_bool, "strict", &self->strict, strict, 0);
 	ATTRSET(_set_bool, "return_quoted", &self->return_quoted, return_quoted, 0);
+	ATTRSET(_set_char, "comment", &self->comment, comment, 0);
 
 	self->input_iter = PyObject_GetIter(iterator);
 	if (self->input_iter == NULL) {
@@ -693,6 +714,7 @@ err:
 	Py_XDECREF(field_limit);
 	Py_XDECREF(strict);
 	Py_XDECREF(return_quoted);
+	Py_XDECREF(comment);
 
 	return ret;
 }
@@ -706,7 +728,8 @@ PyDoc_STRVAR(cparser_module_doc,
 
 PyDoc_STRVAR(cparser_parser_doc,
 		"    cparser.Parser = Parser(iterable, delimiter='', quotechar='', \n"
-		"                            escapechar='', field_limit=128*1024)\n");
+		"                            escapechar='', field_limit=128*1024,\n"
+		"                            comment='')\n");
 
 static struct PyMethodDef cparser_methods[] = {
 	{ "Parser", (PyCFunction)cparser_parser,

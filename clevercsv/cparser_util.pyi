@@ -21,6 +21,7 @@ def _parse_data(
     escapechar: str,
     strict: bool,
     return_quoted: Literal[False] = ...,
+    comment: Optional[str] = ...,
 ) -> Iterator[List[str]]: ...
 @overload
 def _parse_data(
@@ -30,6 +31,7 @@ def _parse_data(
     escapechar: str,
     strict: bool,
     return_quoted: Literal[True],
+    comment: Optional[str] = ...,
 ) -> Iterator[List[Tuple[str, bool]]]: ...
 @overload
 def _parse_data(
@@ -39,6 +41,7 @@ def _parse_data(
     escapechar: str,
     strict: bool,
     return_quoted: bool = ...,
+    comment: Optional[str] = ...,
 ) -> Iterator[Union[List[str], List[Tuple[str, bool]]]]: ...
 def parse_data(
     data: Iterable[str],
@@ -48,22 +51,26 @@ def parse_data(
     escapechar: Optional[str] = None,
     strict: Optional[bool] = None,
     return_quoted: bool = False,
+    comment: Optional[str] = None,
 ) -> Iterator[Union[List[str], List[Tuple[str, bool]]]]: ...
 @overload
 def parse_string(
     data: str,
     dialect: SimpleDialect,
     return_quoted: Literal[False] = ...,
+    comment: Optional[str] = ...,
 ) -> Iterator[List[str]]: ...
 @overload
 def parse_string(
     data: str,
     dialect: SimpleDialect,
     return_quoted: Literal[True],
+    comment: Optional[str] = ...,
 ) -> Iterator[List[Tuple[str, bool]]]: ...
 @overload
 def parse_string(
     data: str,
     dialect: SimpleDialect,
     return_quoted: bool = ...,
+    comment: Optional[str] = ...,
 ) -> Iterator[Union[List[str], List[Tuple[str, bool]]]]: ...

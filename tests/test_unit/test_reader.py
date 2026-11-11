@@ -176,6 +176,83 @@ class ReaderTestCase(unittest.TestCase):
             quotechar='"',
         )
 
+    def test_read_comment(self) -> None:
+        self._read_test(
+            ["# maintenance note", "a,b", "# another note", "c,d"],
+            [["a", "b"], ["c", "d"]],
+            comment="#",
+        )
+
+    def test_read_comment_leading_and_trailing(self) -> None:
+        self._read_test(
+            ["# first", "a,b", "# last"],
+            [["a", "b"]],
+            comment="#",
+        )
+
+    def test_read_comment_custom_character(self) -> None:
+        self._read_test(
+            ["% note", "a,b"],
+            [["a", "b"]],
+            comment="%",
+        )
+
+    def test_read_comment_disabled(self) -> None:
+        lines = ["# note", "a,b"]
+        self._read_test(lines, [["# note"], ["a", "b"]])
+        self._read_test(lines, [["# note"], ["a", "b"]], comment=None)
+        self._read_test(lines, [["# note"], ["a", "b"]], comment="")
+
+    def test_read_comment_quoted_field(self) -> None:
+        # a '#' inside a (possibly multi-line) quoted field is always data
+        data = StringIO(
+            'a,"line1\n# not a comment\nline2",z\n# real comment\nx,y',
+            newline="",
+        )
+        result = list(clevercsv.reader(data, quotechar='"', comment="#"))
+        self.assertEqual(
+            result,
+            [
+                ["a", "line1\n# not a comment\nline2", "z"],
+                ["x", "y"],
+            ],
+        )
+        # a quoted field whose content begins with '#' is data too
+        self._read_test(
+            ['"#note",x', "a,b"],
+            [["#note", "x"], ["a", "b"]],
+            quotechar='"',
+            comment="#",
+        )
+
+    def test_read_comment_delimiter_irrelevant(self) -> None:
+        # delimiters in a comment line must not influence comment detection
+        self._read_test(
+            ["# a,b,c", "1,2,3"],
+            [["1", "2", "3"]],
+            comment="#",
+        )
+
+    def test_read_comment_leading_whitespace(self) -> None:
+        # only a line that starts exactly with the comment char is a comment
+        self._read_test(
+            [" # note", "a,b"],
+            [[" # note"], ["a", "b"]],
+            comment="#",
+        )
+
+    def test_read_comment_linenum(self) -> None:
+        r = clevercsv.reader(["# note", "a,b"], comment="#")
+        next(r)
+        self.assertEqual(r.line_num, 1)
+
+    def test_read_comment_invalid(self) -> None:
+        for bad in ["##", 1, b"#"]:
+            with self.subTest(bad=bad):
+                self.assertRaises(
+                    ValueError, clevercsv.reader, [], comment=bad
+                )
+
     def test_github_issue_130(self) -> None:
         # fmt: off
         data = """sku,features,attributes

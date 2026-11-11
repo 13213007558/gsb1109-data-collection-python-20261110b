@@ -26,6 +26,7 @@ class Parser(Generic[_T]):
         field_limit: Optional[int] = 128 * 1024,
         strict: Optional[bool] = False,
         return_quoted: Literal[True] = ...,
+        comment: Optional[str] = "",
     ) -> None: ...
     @overload
     def __init__(
@@ -36,6 +37,7 @@ class Parser(Generic[_T]):
         field_limit: Optional[int] = 128 * 1024,
         strict: Optional[bool] = False,
         return_quoted: Literal[False] = ...,
+        comment: Optional[str] = "",
     ) -> None: ...
     @overload
     def __init__(
@@ -47,6 +49,7 @@ class Parser(Generic[_T]):
         field_limit: Optional[int] = 128 * 1024,
         strict: Optional[bool] = False,
         return_quoted: bool = ...,
+        comment: Optional[str] = "",
     ) -> None: ...
     def __iter__(self) -> "Parser": ...
     def __next__(self) -> _T: ...

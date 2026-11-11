@@ -392,6 +392,112 @@ class ParserTestCase(unittest.TestCase):
             return_quoted=True,
         )
 
+    def test_parse_comment_1(self) -> None:
+        self._parse_test(
+            "# comment\na,b\n# another\nc,d\n",
+            [["a", "b"], ["c", "d"]],
+            delimiter=",",
+            quotechar='"',
+            comment="#",
+        )
+
+    def test_parse_comment_2(self) -> None:
+        # comments at the start and end of the file
+        self._parse_test(
+            "# first\na,b\n# last",
+            [["a", "b"]],
+            delimiter=",",
+            quotechar='"',
+            comment="#",
+        )
+
+    def test_parse_comment_3(self) -> None:
+        # consecutive comment lines are all skipped
+        self._parse_test(
+            "# one\n# two\n# three\na,b",
+            [["a", "b"]],
+            delimiter=",",
+            quotechar='"',
+            comment="#",
+        )
+
+    def test_parse_comment_4(self) -> None:
+        # a line starting with a quoted field is data, even if the field
+        # itself starts with the comment character
+        self._parse_test(
+            '"#note",x\na,b',
+            [["#note", "x"], ["a", "b"]],
+            delimiter=",",
+            quotechar='"',
+            comment="#",
+        )
+
+    def test_parse_comment_5(self) -> None:
+        # delimiters inside a comment line don't affect comment detection
+        self._parse_test(
+            "# a,b,c\n1,2,3",
+            [["1", "2", "3"]],
+            delimiter=",",
+            quotechar='"',
+            comment="#",
+        )
+
+    def test_parse_comment_6(self) -> None:
+        # a '#' line inside a multi-line quoted field stays part of the data
+        self._parse_test(
+            'a,"line1\n# not a comment\nline2",z\n# real comment\nx,y',
+            [
+                ["a", "line1\n# not a comment\nline2", "z"],
+                ["x", "y"],
+            ],
+            delimiter=",",
+            quotechar='"',
+            comment="#",
+        )
+
+    def test_parse_comment_7(self) -> None:
+        # a '#' after leading whitespace is not a comment
+        self._parse_test(
+            " # note\na,b",
+            [[" # note"], ["a", "b"]],
+            delimiter=",",
+            quotechar='"',
+            comment="#",
+        )
+
+    def test_parse_comment_8(self) -> None:
+        # a custom comment character works
+        self._parse_test(
+            "% note\na,b\n% more",
+            [["a", "b"]],
+            delimiter=",",
+            quotechar='"',
+            comment="%",
+        )
+
+    def test_parse_comment_9(self) -> None:
+        # no comment configured: every line is passed to the parser
+        self._parse_test(
+            "# note\na,b",
+            [["# note"], ["a", "b"]],
+            delimiter=",",
+            quotechar='"',
+        )
+        self._parse_test(
+            "# note\na,b",
+            [["# note"], ["a", "b"]],
+            delimiter=",",
+            quotechar='"',
+            comment=None,
+        )
+        self._parse_test(
+            "# note\na,b",
+            [["# note"], ["a", "b"]],
+            delimiter=",",
+            quotechar='"',
+            comment="",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

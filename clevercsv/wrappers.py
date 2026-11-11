@@ -46,6 +46,7 @@ def stream_dicts(
     encoding: Optional[str] = None,
     num_chars: Optional[int] = None,
     verbose: bool = False,
+    comment: Optional[str] = None,
 ) -> Iterator["_DictReadMapping"]:
     """Read a CSV file as a generator over dictionaries
 
@@ -77,6 +78,11 @@ def stream_dicts(
     verbose: bool
         Whether or not to show detection progress.
 
+    comment : str
+        Comment character of the file. If not None, physical lines that start
+        with this character at the beginning of a record are skipped. Lines
+        inside quoted fields are never skipped. If None, no lines are skipped.
+
     Returns
     -------
     rows: generator
@@ -99,7 +105,7 @@ def stream_dicts(
         if dialect is None:
             raise NoDetectionResult
 
-        reader: DictReader = DictReader(fid, dialect=dialect)
+        reader: DictReader = DictReader(fid, dialect=dialect, comment=comment)
         for row in reader:
             yield row
 
@@ -110,6 +116,7 @@ def read_dicts(
     encoding: Optional[str] = None,
     num_chars: Optional[int] = None,
     verbose: bool = False,
+    comment: Optional[str] = None,
 ) -> List["_DictReadMapping"]:
     """Read a CSV file as a list of dictionaries
 
@@ -141,6 +148,11 @@ def read_dicts(
     verbose: bool
         Whether or not to show detection progress.
 
+    comment : str
+        Comment character of the file. If not None, physical lines that start
+        with this character at the beginning of a record are skipped. Lines
+        inside quoted fields are never skipped. If None, no lines are skipped.
+
     Returns
     -------
     rows: list
@@ -159,6 +171,7 @@ def read_dicts(
             encoding=encoding,
             num_chars=num_chars,
             verbose=verbose,
+            comment=comment,
         )
     )
 
@@ -169,6 +182,7 @@ def read_table(
     encoding: Optional[str] = None,
     num_chars: Optional[int] = None,
     verbose: bool = False,
+    comment: Optional[str] = None,
 ) -> List[List[str]]:
     """Read a CSV file as a table (a list of lists)
 
@@ -200,6 +214,11 @@ def read_table(
     verbose: bool
         Whether or not to show detection progress.
 
+    comment : str
+        Comment character of the file. If not None, physical lines that start
+        with this character at the beginning of a record are skipped. Lines
+        inside quoted fields are never skipped. If None, no lines are skipped.
+
     Returns
     -------
     rows: list
@@ -218,6 +237,7 @@ def read_table(
             encoding=encoding,
             num_chars=num_chars,
             verbose=verbose,
+            comment=comment,
         )
     )
 
@@ -228,6 +248,7 @@ def stream_table(
     encoding: Optional[str] = None,
     num_chars: Optional[int] = None,
     verbose: bool = False,
+    comment: Optional[str] = None,
 ) -> Iterator[List[str]]:
     """Read a CSV file as a generator over rows of a table
 
@@ -259,6 +280,11 @@ def stream_table(
     verbose: bool
         Whether or not to show detection progress.
 
+    comment : str
+        Comment character of the file. If not None, physical lines that start
+        with this character at the beginning of a record are skipped. Lines
+        inside quoted fields are never skipped. If None, no lines are skipped.
+
     Returns
     -------
     rows: generator
@@ -279,7 +305,7 @@ def stream_table(
             if dialect is None:
                 raise NoDetectionResult()
             fid.seek(0)
-        r = reader(fid, dialect)
+        r = reader(fid, dialect, comment=comment)
         yield from r
 
 

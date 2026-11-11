@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+* Add a ``comment`` option to ``clevercsv.reader``, ``parse_data``,
+  ``parse_string``, and the ``read_table``/``stream_table``/``read_dicts``/
+  ``stream_dicts`` wrappers. When set to a one-character string, physical
+  lines that start with that character at the beginning of a record are
+  skipped. A line inside a (possibly multi-line) quoted field is never
+  treated as a comment, and delimiters inside a comment line are ignored.
+  The default (``None``) preserves the old behavior of passing every line
+  to the parser.
+
 ## Version 0.8.5
 
 * Fix reference counting bug in C extension 

@@ -299,3 +299,60 @@ class WrappersTestCase(unittest.TestCase):
 
         with self.subTest(name="encoding_2"):
             self._write_test_dicts(items, exp, encoding="cp1252")
+
+    def _write_tmpfile_rows(self, rows: List[str]) -> str:
+        tmpfd, tmpfname = tempfile.mkstemp(prefix="ccsv_", suffix=".csv")
+        tmpid = os.fdopen(tmpfd, "w")
+        tmpid.write("\n".join(rows))
+        tmpid.close()
+        return tmpfname
+
+    def test_read_table_comment(self) -> None:
+        dialect = SimpleDialect(delimiter=",", quotechar='"', escapechar="")
+        rows = [
+            "# maintenance note",
+            "A,B",
+            'a,"multi\n# not a comment\nline"',
+            "# another note",
+            "c,d",
+        ]
+        expected = [
+            ["A", "B"],
+            ["a", "multi\n# not a comment\nline"],
+            ["c", "d"],
+        ]
+        tmpfname = self._write_tmpfile_rows(rows)
+        try:
+            with self.subTest(name="read_table"):
+                result = wrappers.read_table(
+                    tmpfname, dialect=dialect, comment="#"
+                )
+                self.assertEqual(result, expected)
+            with self.subTest(name="stream_table"):
+                result = list(
+                    wrappers.stream_table(
+                        tmpfname, dialect=dialect, comment="#"
+                    )
+                )
+                self.assertEqual(result, expected)
+            with self.subTest(name="disabled"):
+                result = wrappers.read_table(tmpfname, dialect=dialect)
+                self.assertEqual(result[0], ["# maintenance note"])
+        finally:
+            os.unlink(tmpfname)
+
+    def test_read_dicts_comment(self) -> None:
+        dialect = SimpleDialect(delimiter=",", quotechar="", escapechar="")
+        rows = ["# note", "A,B", "1,2", "# note", "3,4"]
+        expected = [
+            {"A": "1", "B": "2"},
+            {"A": "3", "B": "4"},
+        ]
+        tmpfname = self._write_tmpfile_rows(rows)
+        try:
+            result = wrappers.read_dicts(
+                tmpfname, dialect=dialect, comment="#"
+            )
+            self.assertEqual(result, expected)
+        finally:
+            os.unlink(tmpfname)
