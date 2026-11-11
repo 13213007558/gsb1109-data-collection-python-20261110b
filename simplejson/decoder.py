@@ -40,6 +40,19 @@ BACKSLASH = {
 
 DEFAULT_ENCODING = "utf-8"
 
+#: Valid values for the *lone_surrogates* option
+LONE_SURROGATES_MODES = ('pass', 'reject', 'replace')
+
+#: Replacement character substituted for lone surrogates in 'replace' mode
+REPLACEMENT_CHARACTER = 0xfffd
+
+
+def _check_lone_surrogates(lone_surrogates):
+    if lone_surrogates not in LONE_SURROGATES_MODES:
+        raise ValueError(
+            "lone_surrogates must be one of 'pass', 'reject', or 'replace'")
+    return lone_surrogates
+
 if hasattr(sys, 'get_int_max_str_digits'):
     bounded_int = int
 else:
@@ -66,6 +79,7 @@ def scan_four_digit_hex(s, end, _m=re.compile(r'^[0-9a-fA-F]{4}$').match):
         raise JSONDecodeError(msg, s, end - 2)
 
 def py_scanstring(s, end, encoding=None, strict=True,
+        lone_surrogates='pass', lone_surrogate_hook=None,
         _b=BACKSLASH, _m=STRINGCHUNK.match, _join=u''.join,
         _PY3=PY3, _maxunicode=sys.maxunicode,
         _scan_four_digit_hex=scan_four_digit_hex):
@@ -75,10 +89,19 @@ def py_scanstring(s, end, encoding=None, strict=True,
     on attempt to decode an invalid string. If strict is False then literal
     control characters are allowed in the string.
 
+    lone_surrogates controls how unpaired surrogate \\uXXXX escapes are
+    handled: 'pass' (the default) emits them as-is, 'reject' raises
+    JSONDecodeError, and 'replace' substitutes U+FFFD, calling
+    lone_surrogate_hook(pos, codepoint) for each replacement if a hook
+    is given.
+
     Returns a tuple of the decoded string and the index of the character in s
     after the end quote."""
     if encoding is None:
         encoding = DEFAULT_ENCODING
+    if lone_surrogates is None:
+        lone_surrogates = 'pass'
+    _check_lone_surrogates(lone_surrogates)
     chunks = []
     _append = chunks.append
     begin = end - 1
@@ -121,18 +144,41 @@ def py_scanstring(s, end, encoding=None, strict=True,
             end += 1
         else:
             # Unicode escape sequence
+            esc_pos = end - 1
             uni, end = _scan_four_digit_hex(s, end + 1)
-            # Check for surrogate pair on UCS-4 systems
-            # Note that this will join high/low surrogate pairs
-            # but will also pass unpaired surrogates through
-            if (_maxunicode > 65535 and
-                uni & 0xfc00 == 0xd800 and
-                s[end:end + 2] == '\\u'):
-                uni2, end2 = _scan_four_digit_hex(s, end + 2)
-                if uni2 & 0xfc00 == 0xdc00:
-                    uni = 0x10000 + (((uni - 0xd800) << 10) |
-                                        (uni2 - 0xdc00))
-                    end = end2
+            if uni & 0xf800 == 0xd800:
+                # Surrogate escape: only well-formed as a high+low pair.
+                # In 'pass' mode the pair check preserves its historical
+                # (loose) behavior; otherwise only a high surrogate may
+                # begin a pair.
+                if lone_surrogates == 'pass':
+                    pair_candidate = uni & 0xfc00 == 0xd800
+                else:
+                    pair_candidate = 0xd800 <= uni <= 0xdbff
+                paired = False
+                if (pair_candidate and s[end:end + 2] == '\\u' and
+                        (_maxunicode > 65535 or lone_surrogates != 'pass')):
+                    uni2, end2 = _scan_four_digit_hex(s, end + 2)
+                    if uni2 & 0xfc00 == 0xdc00:
+                        paired = True
+                        end = end2
+                        if _maxunicode > 65535:
+                            uni = 0x10000 + (((uni - 0xd800) << 10) |
+                                                (uni2 - 0xdc00))
+                if paired and _maxunicode <= 65535:
+                    # Narrow builds cannot combine the pair; emit both
+                    # halves exactly as they appeared.
+                    _append(unichr(uni))
+                    _append(unichr(uni2))
+                    continue
+                if not paired and lone_surrogates != 'pass':
+                    if lone_surrogates == 'reject':
+                        raise JSONDecodeError(
+                            "Lone surrogate \\u%04X escape" % (uni,),
+                            s, esc_pos)
+                    if lone_surrogate_hook is not None:
+                        lone_surrogate_hook(esc_pos, uni)
+                    uni = REPLACEMENT_CHARACTER
             char = unichr(uni)
         # Append the unescaped character
         _append(char)
@@ -146,7 +192,8 @@ WHITESPACE = re.compile(r'[ \t\n\r]*', FLAGS)
 WHITESPACE_STR = ' \t\n\r'
 
 def JSONObject(state, encoding, strict, scan_once, object_hook,
-        object_pairs_hook, memo=None,
+        object_pairs_hook, memo=None, lone_surrogates='pass',
+        lone_surrogate_hook=None,
         _w=WHITESPACE.match, _ws=WHITESPACE_STR):
     (s, end) = state
     # Backwards compatibility
@@ -154,6 +201,19 @@ def JSONObject(state, encoding, strict, scan_once, object_hook,
         memo = {}
     memo_get = memo.setdefault
     pairs = []
+    # In 'replace' mode without an object_pairs_hook, object keys are
+    # collected into a dict as they are parsed so that a key repaired by
+    # lone surrogate replacement cannot silently overwrite another key.
+    check_key_collisions = (lone_surrogates == 'replace' and
+                            object_pairs_hook is None)
+    if check_key_collisions:
+        result = {}
+        repaired_keys = set()
+        key_repairs = []
+        def key_hook(pos, codepoint):
+            key_repairs.append(pos)
+            if lone_surrogate_hook is not None:
+                lone_surrogate_hook(pos, codepoint)
     # Use a slice to prevent IndexError from being raised, the following
     # check will raise a more specific ValueError if the string is empty
     nextchar = s[end:end + 1]
@@ -177,7 +237,14 @@ def JSONObject(state, encoding, strict, scan_once, object_hook,
                 s, end)
     end += 1
     while True:
-        key, end = scanstring(s, end, encoding, strict)
+        key_pos = end - 1
+        if check_key_collisions:
+            del key_repairs[:]
+            key, end = scanstring(s, end, encoding, strict,
+                                  lone_surrogates, key_hook)
+        else:
+            key, end = scanstring(s, end, encoding, strict,
+                                  lone_surrogates, lone_surrogate_hook)
         key = memo_get(key, key)
 
         # To skip some function call overhead we optimize the fast paths where
@@ -198,7 +265,16 @@ def JSONObject(state, encoding, strict, scan_once, object_hook,
             pass
 
         value, end = scan_once(s, end)
-        pairs.append((key, value))
+        if check_key_collisions:
+            if key in result and (key_repairs or key in repaired_keys):
+                raise JSONDecodeError(
+                    "Duplicate object key after lone surrogate replacement",
+                    s, key_pos)
+            result[key] = value
+            if key_repairs:
+                repaired_keys.add(key)
+        else:
+            pairs.append((key, value))
 
         try:
             nextchar = s[end]
@@ -239,7 +315,10 @@ def JSONObject(state, encoding, strict, scan_once, object_hook,
     if object_pairs_hook is not None:
         result = object_pairs_hook(pairs)
         return result, end
-    pairs = dict(pairs)
+    if check_key_collisions:
+        pairs = result
+    else:
+        pairs = dict(pairs)
     if object_hook is not None:
         pairs = object_hook(pairs)
     return pairs, end
@@ -325,7 +404,8 @@ class JSONDecoder(object):
     def __init__(self, encoding=None, object_hook=None, parse_float=None,
             parse_int=None, parse_constant=None, strict=True,
             object_pairs_hook=None, allow_nan=False,
-            array_hook=None):
+            array_hook=None, lone_surrogates='pass',
+            lone_surrogate_hook=None):
         """
         *encoding* determines the encoding used to interpret any
         :class:`str` objects decoded by this instance (``'utf-8'`` by
@@ -371,7 +451,28 @@ class JSONDecoder(object):
         ``True`` means that unescaped control characters are parse errors, if
         ``False`` then control characters will be allowed in strings.
 
+        *lone_surrogates* controls how unpaired surrogate ``\\uXXXX``
+        escapes in JSON strings are handled. The default ``'pass'``
+        preserves historical behavior and emits them as-is. ``'reject'``
+        raises :class:`JSONDecodeError` at the offending escape.
+        ``'replace'`` substitutes U+FFFD for each lone surrogate, in both
+        object keys and string values; if two object keys compare equal
+        after replacement and at least one of them was repaired, a
+        :class:`JSONDecodeError` is raised instead of silently keeping
+        only the last value. Well-formed surrogate pairs are combined
+        normally in every mode, and U+FFFD characters already present in
+        the input are never treated as repairs.
+
+        *lone_surrogate_hook*, if specified, is called as
+        ``hook(pos, codepoint)`` for each lone surrogate replaced in
+        ``'replace'`` mode, where *pos* is the index of the ``\\uXXXX``
+        escape in the input document and *codepoint* is the original
+        surrogate value. It has no effect in other modes.
+
         """
+        _check_lone_surrogates(lone_surrogates)
+        if lone_surrogate_hook is not None and not callable(lone_surrogate_hook):
+            raise TypeError("lone_surrogate_hook must be callable or None")
         if encoding is None:
             encoding = DEFAULT_ENCODING
         self.encoding = encoding
@@ -384,6 +485,8 @@ class JSONDecoder(object):
         self.parse_constant = parse_constant
         self.strict = strict
         self.array_hook = array_hook
+        self.lone_surrogates = lone_surrogates
+        self.lone_surrogate_hook = lone_surrogate_hook
         self.parse_object = JSONObject
         self.parse_array = JSONArray
         self.parse_string = scanstring

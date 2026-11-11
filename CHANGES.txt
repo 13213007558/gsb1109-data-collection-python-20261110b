@@ -1,3 +1,14 @@
+Version 4.3.0 (unreleased)
+
+* Add ``lone_surrogates`` decode option to ``JSONDecoder``, ``loads``,
+  and ``load``: ``'pass'`` (default, historical behavior), ``'reject'``
+  (raise ``JSONDecodeError`` on unpaired surrogate ``\uXXXX`` escapes),
+  or ``'replace'`` (substitute U+FFFD). The optional
+  ``lone_surrogate_hook`` is called as ``hook(pos, codepoint)`` for each
+  replacement. In ``'replace'`` mode, object keys that collide after
+  replacement raise ``JSONDecodeError`` instead of silently keeping only
+  the last value
+
 Version 4.2.0 released 2026-10-02
 
 * Start building wheels for Python 3.15 and drop Python 3.8 support

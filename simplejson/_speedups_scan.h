@@ -183,7 +183,13 @@ JSON_SCAN_FN(_parse_object)(PyScannerObject *s, PyObject *pystr,
     PyObject *item;
     PyObject *key = NULL;
     PyObject *val = NULL;
+    PyObject *repaired_keys = NULL;
     int has_pairs_hook = (s->pairs_hook != Py_None);
+    /* In 'replace' mode without an object_pairs_hook, a key repaired by
+     * lone surrogate replacement must not silently overwrite another key:
+     * track repaired keys and raise on collision instead. */
+    int check_key_collisions =
+        (s->lone_surrogates == JSON_SURROGATES_REPLACE && !has_pairs_hook);
     int did_parse = 0;
     Py_ssize_t next_idx;
 
@@ -205,6 +211,8 @@ JSON_SCAN_FN(_parse_object)(PyScannerObject *s, PyObject *pystr,
     if (idx <= end_idx && JSON_SCAN_READ(idx) != '}') {
         int trailing_delimiter = 0;
         Py_ssize_t comma_idx = 0;
+        Py_ssize_t key_idx = 0;
+        int key_repaired = 0;
         while (idx <= end_idx) {
             trailing_delimiter = 0;
 
@@ -217,7 +225,10 @@ JSON_SCAN_FN(_parse_object)(PyScannerObject *s, PyObject *pystr,
                              pystr, idx);
                 goto bail;
             }
-            key = JSON_SCAN_SCANSTRING_CALL(idx + 1, &next_idx);
+            key_idx = idx;
+            key_repaired = 0;
+            key = JSON_SCAN_SCANSTRING_CALL(idx + 1, &next_idx,
+                check_key_collisions ? &key_repaired : NULL);
             if (key == NULL)
                 goto bail;
             /* Intern the key through s->memo so repeated key strings
@@ -256,6 +267,34 @@ JSON_SCAN_FN(_parse_object)(PyScannerObject *s, PyObject *pystr,
                 Py_DECREF(item);
             }
             else {
+                if (check_key_collisions) {
+                    int existing = PyDict_Contains(rval, key);
+                    if (existing < 0)
+                        goto bail;
+                    if (existing) {
+                        int was_repaired = key_repaired;
+                        if (!was_repaired && repaired_keys != NULL) {
+                            was_repaired =
+                                PySet_Contains(repaired_keys, key);
+                            if (was_repaired < 0)
+                                goto bail;
+                        }
+                        if (was_repaired) {
+                            raise_errmsg(state, ERR_OBJECT_KEY_CONFLICT,
+                                         pystr, key_idx);
+                            goto bail;
+                        }
+                    }
+                    if (key_repaired) {
+                        if (repaired_keys == NULL) {
+                            repaired_keys = PySet_New(NULL);
+                            if (repaired_keys == NULL)
+                                goto bail;
+                        }
+                        if (PySet_Add(repaired_keys, key) < 0)
+                            goto bail;
+                    }
+                }
                 if (PyDict_SetItem(rval, key, val) < 0)
                     goto bail;
                 Py_CLEAR(key);
@@ -306,6 +345,8 @@ JSON_SCAN_FN(_parse_object)(PyScannerObject *s, PyObject *pystr,
         goto bail;
     }
 
+    Py_CLEAR(repaired_keys);
+
     /* if pairs_hook is not None: rval = object_pairs_hook(pairs) */
     if (s->pairs_hook != Py_None) {
         val = PyObject_CallOneArg(s->pairs_hook, pairs);
@@ -332,6 +373,7 @@ bail:
     Py_XDECREF(key);
     Py_XDECREF(val);
     Py_XDECREF(pairs);
+    Py_XDECREF(repaired_keys);
     return NULL;
 }
 
@@ -450,7 +492,7 @@ JSON_SCAN_FN(scan_once)(PyScannerObject *s, PyObject *pystr,
     switch (JSON_SCAN_READ(idx)) {
         case '"':
             /* string */
-            rval = JSON_SCAN_SCANSTRING_CALL(idx + 1, next_idx_ptr);
+            rval = JSON_SCAN_SCANSTRING_CALL(idx + 1, next_idx_ptr, NULL);
             break;
         case '{':
             /* object */

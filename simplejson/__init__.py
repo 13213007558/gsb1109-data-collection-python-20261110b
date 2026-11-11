@@ -402,7 +402,8 @@ _default_decoder = JSONDecoder()
 
 def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_int=None, parse_constant=None, object_pairs_hook=None,
-        use_decimal=False, allow_nan=False, array_hook=None, **kw):
+        use_decimal=False, allow_nan=False, array_hook=None,
+        lone_surrogates=None, lone_surrogate_hook=None, **kw):
     """Deserialize ``fp`` (a ``.read()``-supporting file-like object containing
     a JSON document as `str` or `bytes`) to a Python object.
 
@@ -446,6 +447,15 @@ def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
 
+    *lone_surrogates* controls how unpaired surrogate ``\\uXXXX`` escapes
+    in JSON strings are handled: ``'pass'`` (the default) emits them
+    as-is, ``'reject'`` raises :class:`JSONDecodeError`, and ``'replace'``
+    substitutes U+FFFD. See :class:`JSONDecoder` for details.
+
+    *lone_surrogate_hook*, if specified, is called as
+    ``hook(pos, codepoint)`` for each lone surrogate replaced in
+    ``'replace'`` mode.
+
     To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
     kwarg. NOTE: You should use *object_hook* or *object_pairs_hook* instead
     of subclassing whenever possible.
@@ -456,12 +466,14 @@ def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_float=parse_float, parse_int=parse_int,
         parse_constant=parse_constant, object_pairs_hook=object_pairs_hook,
         use_decimal=use_decimal, allow_nan=allow_nan,
-        array_hook=array_hook, **kw)
+        array_hook=array_hook, lone_surrogates=lone_surrogates,
+        lone_surrogate_hook=lone_surrogate_hook, **kw)
 
 
 def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_int=None, parse_constant=None, object_pairs_hook=None,
-        use_decimal=False, allow_nan=False, array_hook=None, **kw):
+        use_decimal=False, allow_nan=False, array_hook=None,
+        lone_surrogates=None, lone_surrogate_hook=None, **kw):
     """Deserialize ``s`` (a ``str`` or ``unicode`` instance containing a JSON
     document) to a Python object.
 
@@ -505,6 +517,15 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
 
+    *lone_surrogates* controls how unpaired surrogate ``\\uXXXX`` escapes
+    in JSON strings are handled: ``'pass'`` (the default) emits them
+    as-is, ``'reject'`` raises :class:`JSONDecodeError`, and ``'replace'``
+    substitutes U+FFFD. See :class:`JSONDecoder` for details.
+
+    *lone_surrogate_hook*, if specified, is called as
+    ``hook(pos, codepoint)`` for each lone surrogate replaced in
+    ``'replace'`` mode.
+
     To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
     kwarg. NOTE: You should use *object_hook* or *object_pairs_hook* instead
     of subclassing whenever possible.
@@ -514,6 +535,7 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
             parse_int is None and parse_float is None and
             parse_constant is None and object_pairs_hook is None
             and array_hook is None
+            and lone_surrogates is None and lone_surrogate_hook is None
             and not use_decimal and not allow_nan and not kw):
         return _default_decoder.decode(s)
     if cls is None:
@@ -536,6 +558,10 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
         kw['parse_float'] = Decimal
     if allow_nan:
         kw['allow_nan'] = True
+    if lone_surrogates is not None:
+        kw['lone_surrogates'] = lone_surrogates
+    if lone_surrogate_hook is not None:
+        kw['lone_surrogate_hook'] = lone_surrogate_hook
     return cls(encoding=encoding, **kw).decode(s)
 
 

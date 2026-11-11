@@ -32,6 +32,10 @@ def py_make_scanner(context):
     object_pairs_hook = context.object_pairs_hook
     array_hook = context.array_hook
     memo = context.memo
+    # Optional newer context attributes: default to the historical
+    # behavior when the context does not provide them.
+    lone_surrogates = getattr(context, 'lone_surrogates', 'pass')
+    lone_surrogate_hook = getattr(context, 'lone_surrogate_hook', None)
 
     def _scan_once(string, idx):
         errmsg = 'Expecting value'
@@ -41,10 +45,17 @@ def py_make_scanner(context):
             raise JSONDecodeError(errmsg, string, idx)
 
         if nextchar == '"':
-            return parse_string(string, idx + 1, encoding, strict)
+            if lone_surrogates == 'pass':
+                return parse_string(string, idx + 1, encoding, strict)
+            return parse_string(string, idx + 1, encoding, strict,
+                                lone_surrogates, lone_surrogate_hook)
         elif nextchar == '{':
+            if lone_surrogates == 'pass':
+                return parse_object((string, idx + 1), encoding, strict,
+                    _scan_once, object_hook, object_pairs_hook, memo)
             return parse_object((string, idx + 1), encoding, strict,
-                _scan_once, object_hook, object_pairs_hook, memo)
+                _scan_once, object_hook, object_pairs_hook, memo,
+                lone_surrogates, lone_surrogate_hook)
         elif nextchar == '[':
             return parse_array((string, idx + 1), _scan_once, array_hook)
         elif nextchar == 'n' and string[idx:idx + 4] == 'null':

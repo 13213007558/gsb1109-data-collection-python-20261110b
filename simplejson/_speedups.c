@@ -193,6 +193,25 @@ get_speedups_state(PyObject *module)
 #define JSON_ALLOW_NAN 1
 #define JSON_IGNORE_NAN 2
 
+/* lone_surrogates option values (mirrors decoder.LONE_SURROGATES_MODES) */
+#define JSON_SURROGATES_PASS 0
+#define JSON_SURROGATES_REJECT 1
+#define JSON_SURROGATES_REPLACE 2
+
+/* Whether scanstring_* may combine a surrogate pair into one character.
+ * scanstring_str is Py2-only, where this depends on Py_UNICODE_WIDE;
+ * scanstring_unicode also joins on every Python 3 build. */
+#if defined(Py_UNICODE_WIDE)
+#define JSON_JOIN_SURROGATES_STR 1
+#else
+#define JSON_JOIN_SURROGATES_STR 0
+#endif
+#if PY_MAJOR_VERSION >= 3 || defined(Py_UNICODE_WIDE)
+#define JSON_JOIN_SURROGATES_UNICODE 1
+#else
+#define JSON_JOIN_SURROGATES_UNICODE 0
+#endif
+
 #if PY_VERSION_HEX >= 0x030E0000
 /* Python 3.14+: JSON_Accu is backed by a PyUnicodeWriter, building the
  * entire output in one contiguous buffer.  The FinishAsList wrapper
@@ -228,6 +247,9 @@ JSON_Accu_Destroy(JSON_Accu *acc);
 #define ERR_STRING_CONTROL "Invalid control character %r at"
 #define ERR_STRING_ESC1 "Invalid \\X escape sequence %r"
 #define ERR_STRING_ESC4 "Invalid \\uXXXX escape sequence"
+#define ERR_STRING_LONE_SURROGATE "Lone surrogate \\u%04X escape"
+#define ERR_OBJECT_KEY_CONFLICT \
+    "Duplicate object key after lone surrogate replacement"
 #define ERR_TRAILING_COMMA_OBJECT "Illegal trailing comma before end of object"
 #define ERR_TRAILING_COMMA_ARRAY "Illegal trailing comma before end of array"
 
@@ -238,6 +260,9 @@ typedef struct _PyScannerObject {
     PyObject *encoding;
     PyObject *strict_bool;
     int strict;
+    int lone_surrogates;
+    PyObject *lone_surrogates_obj;
+    PyObject *lone_surrogate_hook;
     PyObject *object_hook;
     PyObject *pairs_hook;
     PyObject *array_hook;
@@ -257,6 +282,8 @@ typedef struct _PyScannerObject {
     X(module_ref)                     \
     X(encoding)                       \
     X(strict_bool)                    \
+    X(lone_surrogates_obj)            \
+    X(lone_surrogate_hook)            \
     X(object_hook)                    \
     X(pairs_hook)                     \
     X(array_hook)                     \
@@ -268,6 +295,8 @@ typedef struct _PyScannerObject {
 static PyMemberDef scanner_members[] = {
     {"encoding", Py_T_OBJECT_EX, offsetof(PyScannerObject, encoding), READONLY, "encoding"},
     {"strict", Py_T_OBJECT_EX, offsetof(PyScannerObject, strict_bool), READONLY, "strict"},
+    {"lone_surrogates", Py_T_OBJECT_EX, offsetof(PyScannerObject, lone_surrogates_obj), READONLY, "lone_surrogates"},
+    {"lone_surrogate_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, lone_surrogate_hook), READONLY, "lone_surrogate_hook"},
     {"object_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, object_hook), READONLY, "object_hook"},
     {"object_pairs_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, pairs_hook), READONLY, "object_pairs_hook"},
     {"array_hook", Py_T_OBJECT_EX, offsetof(PyScannerObject, array_hook), READONLY, "array_hook"},
@@ -378,13 +407,17 @@ static PyObject *
 scan_once_str(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx, Py_ssize_t *next_idx_ptr);
 static PyObject *
 scanstring_str(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
-               const char *encoding, int strict, Py_ssize_t *next_end_ptr);
+               const char *encoding, int strict, int lone_surrogates,
+               PyObject *lone_surrogate_hook, int *repaired,
+               Py_ssize_t *next_end_ptr);
 static PyObject *
 _parse_object_str(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx, Py_ssize_t *next_idx_ptr);
 #endif
 static PyObject *
 scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
-                   int strict, Py_ssize_t *next_end_ptr);
+                   int strict, int lone_surrogates,
+                   PyObject *lone_surrogate_hook, int *repaired,
+                   Py_ssize_t *next_end_ptr);
 static PyObject *
 scan_once_unicode(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx, Py_ssize_t *next_idx_ptr);
 static PyObject *
@@ -1300,6 +1333,85 @@ raise_errmsg(_speedups_state *state, const char *msg, PyObject *s, Py_ssize_t en
     }
 }
 
+/* Map a lone_surrogates option value to one of the JSON_SURROGATES_*
+ * constants. NULL and None both select the default 'pass' behavior.
+ * Returns -1 with an exception set for invalid values. */
+static int
+json_lone_surrogates_mode(PyObject *obj)
+{
+    const char *str = NULL;
+    PyObject *tmp = NULL;
+    int mode = -1;
+    if (obj == NULL || obj == Py_None) {
+        return JSON_SURROGATES_PASS;
+    }
+#if PY_MAJOR_VERSION >= 3
+    if (PyUnicode_Check(obj)) {
+        str = PyUnicode_AsUTF8(obj);
+    }
+#else
+    if (PyString_Check(obj)) {
+        str = PyString_AS_STRING(obj);
+    }
+    else if (PyUnicode_Check(obj)) {
+        tmp = PyUnicode_AsEncodedString(obj, NULL, NULL);
+        if (tmp != NULL) {
+            str = PyString_AS_STRING(tmp);
+        }
+    }
+#endif
+    if (str != NULL) {
+        if (strcmp(str, "pass") == 0) {
+            mode = JSON_SURROGATES_PASS;
+        }
+        else if (strcmp(str, "reject") == 0) {
+            mode = JSON_SURROGATES_REJECT;
+        }
+        else if (strcmp(str, "replace") == 0) {
+            mode = JSON_SURROGATES_REPLACE;
+        }
+    }
+    Py_XDECREF(tmp);
+    if (mode < 0 && !PyErr_Occurred()) {
+        PyErr_SetString(PyExc_ValueError,
+            "lone_surrogates must be one of 'pass', 'reject', or 'replace'");
+    }
+    return mode;
+}
+
+/* Handle an unpaired surrogate escape according to the lone_surrogates
+ * mode: REJECT raises a JSONDecodeError at esc_pos; REPLACE substitutes
+ * U+FFFD for *c, sets *repaired (when non-NULL), and invokes the user
+ * hook as hook(esc_pos, codepoint) when one was given. Returns 0 on
+ * success, -1 with an exception set on error. */
+static int
+json_handle_lone_surrogate(_speedups_state *state, int lone_surrogates,
+                           PyObject *hook, PyObject *pystr,
+                           Py_ssize_t esc_pos, JSON_UNICHR *c, int *repaired)
+{
+    JSON_UNICHR orig = *c;
+    if (lone_surrogates == JSON_SURROGATES_REJECT) {
+        char msg[48];
+        PyOS_snprintf(msg, sizeof(msg), ERR_STRING_LONE_SURROGATE,
+                      (unsigned int)orig);
+        raise_errmsg(state, msg, pystr, esc_pos);
+        return -1;
+    }
+    *c = 0xfffd;
+    if (repaired != NULL) {
+        *repaired = 1;
+    }
+    if (hook != NULL && hook != Py_None) {
+        PyObject *hr = PyObject_CallFunction(hook, "nn", esc_pos,
+                                             (Py_ssize_t)orig);
+        if (hr == NULL) {
+            return -1;
+        }
+        Py_DECREF(hr);
+    }
+    return 0;
+}
+
 #if PY_VERSION_HEX < 0x030E0000
 static PyObject *
 join_list_unicode(_speedups_state *state, PyObject *lst)
@@ -1335,12 +1447,17 @@ join_list_string(_speedups_state *state, PyObject *lst)
 #if PY_MAJOR_VERSION < 3
 static PyObject *
 scanstring_str(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
-               const char *encoding, int strict, Py_ssize_t *next_end_ptr)
+               const char *encoding, int strict, int lone_surrogates,
+               PyObject *lone_surrogate_hook, int *repaired,
+               Py_ssize_t *next_end_ptr)
 {
     /* Read the JSON string from PyString pystr.
     end is the index of the first character after the quote.
     encoding is the encoding of pystr (must be an ASCII superset)
     if strict is zero then literal control characters are allowed
+    lone_surrogates is a JSON_SURROGATES_* mode for unpaired surrogates
+    lone_surrogate_hook is called as hook(pos, codepoint) per replacement
+    *repaired (when non-NULL) is set to 1 if a replacement was made
     *next_end_ptr is a return-by-reference index of the character
         after the end quote
 
@@ -1436,6 +1553,7 @@ scanstring_str(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
             }
         }
         else {
+            Py_ssize_t esc_pos;
             c = 0;
             next++;
             end = next + 4;
@@ -1443,6 +1561,7 @@ scanstring_str(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                 raise_errmsg(state, ERR_STRING_ESC4, pystr, next - 2);
                 goto bail;
             }
+            esc_pos = next - 2;
             /* Decode 4 hex digits */
             for (; next < end; next++) {
                 JSON_UNICHR hex_digit = (JSON_UNICHR)buf[next];
@@ -1462,10 +1581,20 @@ scanstring_str(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                         goto bail;
                 }
             }
-#if defined(Py_UNICODE_WIDE)
-            /* Surrogate pair */
-            if ((c & 0xfc00) == 0xd800) {
-                if (end + 6 <= len && buf[next] == '\\' && buf[next+1] == 'u') {
+            if ((c & 0xf800) == 0xd800) {
+                /* Surrogate escape: only well-formed as a high+low pair */
+                int paired = 0;
+                int pair_candidate;
+                if (lone_surrogates == JSON_SURROGATES_PASS) {
+                    pair_candidate = (c & 0xfc00) == 0xd800;
+                }
+                else {
+                    pair_candidate = (c >= 0xd800 && c <= 0xdbff);
+                }
+                if (pair_candidate && end + 6 <= len &&
+                    buf[next] == '\\' && buf[next+1] == 'u' &&
+                    (JSON_JOIN_SURROGATES_STR ||
+                     lone_surrogates != JSON_SURROGATES_PASS)) {
                     JSON_UNICHR c2 = 0;
                     end += 6;
                     /* Decode 4 hex digits */
@@ -1493,11 +1622,31 @@ scanstring_str(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                         next = end;
                     }
                     else {
+                        paired = 1;
+#if JSON_JOIN_SURROGATES_STR
                         c = 0x10000 + (((c - 0xd800) << 10) | (c2 - 0xdc00));
+#else
+                        /* Narrow Py_UNICODE cannot hold the combined
+                         * character: emit the high half now and let the
+                         * low half go through the normal append path. */
+                        has_unicode = 1;
+                        APPEND_OLD_CHUNK
+                        chunk = PyUnicode_FromOrdinal(c);
+                        if (chunk == NULL) {
+                            goto bail;
+                        }
+                        c = c2;
+#endif
+                    }
+                }
+                if (!paired && lone_surrogates != JSON_SURROGATES_PASS) {
+                    if (json_handle_lone_surrogate(state, lone_surrogates,
+                            lone_surrogate_hook, pystr, esc_pos, &c,
+                            repaired) < 0) {
+                        goto bail;
                     }
                 }
             }
-#endif /* Py_UNICODE_WIDE */
         }
         if (c > 0x7f) {
             has_unicode = 1;
@@ -1548,7 +1697,9 @@ bail:
 #if PY_VERSION_HEX >= 0x030E0000
 static PyObject *
 scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
-                   int strict, Py_ssize_t *next_end_ptr)
+                   int strict, int lone_surrogates,
+                   PyObject *lone_surrogate_hook, int *repaired,
+                   Py_ssize_t *next_end_ptr)
 {
     /* Python 3.14+: use PyUnicodeWriter instead of a chunks list.
      * The writer is lazily created on the first escape sequence so that
@@ -1635,6 +1786,7 @@ scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
             }
         }
         else {
+            Py_ssize_t esc_pos;
             c = 0;
             next++;
             end = next + 4;
@@ -1642,6 +1794,7 @@ scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                 raise_errmsg(state, ERR_STRING_ESC4, pystr, next - 2);
                 goto bail;
             }
+            esc_pos = next - 2;
             /* Decode 4 hex digits */
             for (; next < end; next++) {
                 JSON_UNICHR hex_digit = PyUnicode_READ(kind, buf, next);
@@ -1661,10 +1814,18 @@ scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                         goto bail;
                 }
             }
-            /* Surrogate pair */
-            if ((c & 0xfc00) == 0xd800) {
+            if ((c & 0xf800) == 0xd800) {
+                /* Surrogate escape: only well-formed as a high+low pair */
+                int paired = 0;
+                int pair_candidate;
                 JSON_UNICHR c2 = 0;
-                if (end + 6 <= len &&
+                if (lone_surrogates == JSON_SURROGATES_PASS) {
+                    pair_candidate = (c & 0xfc00) == 0xd800;
+                }
+                else {
+                    pair_candidate = (c >= 0xd800 && c <= 0xdbff);
+                }
+                if (pair_candidate && end + 6 <= len &&
                     PyUnicode_READ(kind, buf, next) == '\\' &&
                     PyUnicode_READ(kind, buf, next + 1) == 'u') {
                     end += 6;
@@ -1693,7 +1854,15 @@ scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                         next = end;
                     }
                     else {
+                        paired = 1;
                         c = 0x10000 + (((c - 0xd800) << 10) | (c2 - 0xdc00));
+                    }
+                }
+                if (!paired && lone_surrogates != JSON_SURROGATES_PASS) {
+                    if (json_handle_lone_surrogate(state, lone_surrogates,
+                            lone_surrogate_hook, pystr, esc_pos, &c,
+                            repaired) < 0) {
+                        goto bail;
                     }
                 }
             }
@@ -1736,11 +1905,16 @@ bail:
 #else /* PY_VERSION_HEX < 0x030E0000 */
 static PyObject *
 scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
-                   int strict, Py_ssize_t *next_end_ptr)
+                   int strict, int lone_surrogates,
+                   PyObject *lone_surrogate_hook, int *repaired,
+                   Py_ssize_t *next_end_ptr)
 {
     /* Read the JSON string from PyUnicode pystr.
     end is the index of the first character after the quote.
     if strict is zero then literal control characters are allowed
+    lone_surrogates is a JSON_SURROGATES_* mode for unpaired surrogates
+    lone_surrogate_hook is called as hook(pos, codepoint) per replacement
+    *repaired (when non-NULL) is set to 1 if a replacement was made
     *next_end_ptr is a return-by-reference index of the character
         after the end quote
 
@@ -1826,6 +2000,7 @@ scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
             }
         }
         else {
+            Py_ssize_t esc_pos;
             c = 0;
             next++;
             end = next + 4;
@@ -1833,6 +2008,7 @@ scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                 raise_errmsg(state, ERR_STRING_ESC4, pystr, next - 2);
                 goto bail;
             }
+            esc_pos = next - 2;
             /* Decode 4 hex digits */
             for (; next < end; next++) {
                 JSON_UNICHR hex_digit = PyUnicode_READ(kind, buf, next);
@@ -1852,13 +2028,22 @@ scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                         goto bail;
                 }
             }
-#if PY_MAJOR_VERSION >= 3 || defined(Py_UNICODE_WIDE)
-            /* Surrogate pair */
-            if ((c & 0xfc00) == 0xd800) {
-                JSON_UNICHR c2 = 0;
-                if (end + 6 <= len &&
+            if ((c & 0xf800) == 0xd800) {
+                /* Surrogate escape: only well-formed as a high+low pair */
+                int paired = 0;
+                int pair_candidate;
+                if (lone_surrogates == JSON_SURROGATES_PASS) {
+                    pair_candidate = (c & 0xfc00) == 0xd800;
+                }
+                else {
+                    pair_candidate = (c >= 0xd800 && c <= 0xdbff);
+                }
+                if (pair_candidate && end + 6 <= len &&
                     PyUnicode_READ(kind, buf, next) == '\\' &&
-                    PyUnicode_READ(kind, buf, next + 1) == 'u') {
+                    PyUnicode_READ(kind, buf, next + 1) == 'u' &&
+                    (JSON_JOIN_SURROGATES_UNICODE ||
+                     lone_surrogates != JSON_SURROGATES_PASS)) {
+                    JSON_UNICHR c2 = 0;
                     end += 6;
                     /* Decode 4 hex digits */
                     for (next += 2; next < end; next++) {
@@ -1885,11 +2070,30 @@ scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                         next = end;
                     }
                     else {
+                        paired = 1;
+#if JSON_JOIN_SURROGATES_UNICODE
                         c = 0x10000 + (((c - 0xd800) << 10) | (c2 - 0xdc00));
+#else
+                        /* Narrow Py_UNICODE cannot hold the combined
+                         * character: emit the high half now and let the
+                         * low half go through the normal append path. */
+                        APPEND_OLD_CHUNK
+                        chunk = PyUnicode_FromOrdinal(c);
+                        if (chunk == NULL) {
+                            goto bail;
+                        }
+                        c = c2;
+#endif
+                    }
+                }
+                if (!paired && lone_surrogates != JSON_SURROGATES_PASS) {
+                    if (json_handle_lone_surrogate(state, lone_surrogates,
+                            lone_surrogate_hook, pystr, esc_pos, &c,
+                            repaired) < 0) {
+                        goto bail;
                     }
                 }
             }
-#endif
         }
         APPEND_OLD_CHUNK
         chunk = PyUnicode_FromOrdinal(c);
@@ -1925,13 +2129,20 @@ bail:
 #endif /* PY_VERSION_HEX >= 0x030E0000 */
 
 PyDoc_STRVAR(pydoc_scanstring,
-    "scanstring(basestring, end, encoding, strict=True) -> (str, end)\n"
+    "scanstring(basestring, end, encoding, strict=True, "
+    "lone_surrogates='pass', lone_surrogate_hook=None) -> (str, end)\n"
     "\n"
     "Scan the string s for a JSON string. End is the index of the\n"
     "character in s after the quote that started the JSON string.\n"
     "Unescapes all valid JSON string escape sequences and raises ValueError\n"
     "on attempt to decode an invalid string. If strict is False then literal\n"
     "control characters are allowed in the string.\n"
+    "\n"
+    "lone_surrogates controls how unpaired surrogate \\uXXXX escapes are\n"
+    "handled: 'pass' (the default) emits them as-is, 'reject' raises\n"
+    "JSONDecodeError, and 'replace' substitutes U+FFFD, calling\n"
+    "lone_surrogate_hook(pos, codepoint) for each replacement if a hook\n"
+    "is given.\n"
     "\n"
     "Returns a tuple of the decoded string and the index of the character in s\n"
     "after the end quote."
@@ -1942,11 +2153,20 @@ py_scanstring(PyObject* self UNUSED, PyObject *args)
 {
     PyObject *pystr;
     PyObject *rval;
+    PyObject *lone_surrogates_obj = NULL;
+    PyObject *lone_surrogate_hook = NULL;
     Py_ssize_t end;
     Py_ssize_t next_end = -1;
     char *encoding = NULL;
     int strict = 1;
-    if (!PyArg_ParseTuple(args, "On|zi:scanstring", &pystr, &end, &encoding, &strict)) {
+    int lone_surrogates = JSON_SURROGATES_PASS;
+    if (!PyArg_ParseTuple(args, "On|ziOO:scanstring", &pystr, &end,
+                          &encoding, &strict, &lone_surrogates_obj,
+                          &lone_surrogate_hook)) {
+        return NULL;
+    }
+    lone_surrogates = json_lone_surrogates_mode(lone_surrogates_obj);
+    if (lone_surrogates < 0) {
         return NULL;
     }
     if (encoding == NULL) {
@@ -1956,14 +2176,16 @@ py_scanstring(PyObject* self UNUSED, PyObject *args)
         if (PyUnicode_READY(pystr))
             return NULL;
         rval = scanstring_unicode(get_speedups_state(self), pystr, end,
-                                  strict, &next_end);
+                                  strict, lone_surrogates,
+                                  lone_surrogate_hook, NULL, &next_end);
     }
 #if PY_MAJOR_VERSION < 3
     /* Using a bytes input is unsupported for scanning in Python 3.
        It is coerced to str in the decoder before it gets here. */
     else if (PyString_Check(pystr)) {
         rval = scanstring_str(get_speedups_state(self), pystr, end,
-                              encoding, strict, &next_end);
+                              encoding, strict, lone_surrogates,
+                              lone_surrogate_hook, NULL, &next_end);
     }
 #endif
     else {
@@ -2332,8 +2554,10 @@ _match_number_int_fast_str(PyScannerObject *s, PyObject *numstr)
     void *str = PyUnicode_DATA(p); \
     Py_ssize_t end_idx = PyUnicode_GET_LENGTH(p) - 1
 #define JSON_SCAN_READ(i) PyUnicode_READ(kind, str, (i))
-#define JSON_SCAN_SCANSTRING_CALL(pos, nextp) \
-    scanstring_unicode(state, pystr, (pos), s->strict, (nextp))
+#define JSON_SCAN_SCANSTRING_CALL(pos, nextp, repairedp) \
+    scanstring_unicode(state, pystr, (pos), s->strict, \
+                       s->lone_surrogates, s->lone_surrogate_hook, \
+                       (repairedp), (nextp))
 #if PY_MAJOR_VERSION >= 3
 #define JSON_SCAN_NUMSTR_CREATE(sidx, eidx) \
     PyUnicode_Substring(pystr, (sidx), (eidx))
@@ -2354,9 +2578,11 @@ _match_number_int_fast_str(PyScannerObject *s, PyObject *numstr)
     char *str = PyString_AS_STRING(p); \
     Py_ssize_t end_idx = PyString_GET_SIZE(p) - 1
 #define JSON_SCAN_READ(i) ((unsigned char)str[(i)])
-#define JSON_SCAN_SCANSTRING_CALL(pos, nextp) \
+#define JSON_SCAN_SCANSTRING_CALL(pos, nextp, repairedp) \
     scanstring_str(state, pystr, (pos), \
-                   PyString_AS_STRING(s->encoding), s->strict, (nextp))
+                   PyString_AS_STRING(s->encoding), s->strict, \
+                   s->lone_surrogates, s->lone_surrogate_hook, \
+                   (repairedp), (nextp))
 #define JSON_SCAN_NUMSTR_CREATE(sidx, eidx) \
     PyString_FromStringAndSize(&str[(sidx)], (eidx) - (sidx))
 #define JSON_SCAN_PARSE_FLOAT_FAST(ns) _match_number_float_fast_str(ns)
@@ -2501,6 +2727,31 @@ scanner_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     LOAD_ATTR(parse_constant, "parse_constant");
 
 #undef LOAD_ATTR
+
+    /* Optional attributes introduced with lone surrogate handling.
+     * Contexts that predate them get the historical defaults. */
+    s->lone_surrogates = JSON_SURROGATES_PASS;
+    s->lone_surrogates_obj = PyObject_GetAttrString(ctx, "lone_surrogates");
+    if (s->lone_surrogates_obj == NULL) {
+        if (!PyErr_ExceptionMatches(PyExc_AttributeError))
+            goto bail;
+        PyErr_Clear();
+    }
+    else {
+        s->lone_surrogates =
+            json_lone_surrogates_mode(s->lone_surrogates_obj);
+        if (s->lone_surrogates < 0)
+            goto bail;
+    }
+    s->lone_surrogate_hook =
+        PyObject_GetAttrString(ctx, "lone_surrogate_hook");
+    if (s->lone_surrogate_hook == NULL) {
+        if (!PyErr_ExceptionMatches(PyExc_AttributeError))
+            goto bail;
+        PyErr_Clear();
+        s->lone_surrogate_hook = Py_None;
+        Py_INCREF(Py_None);
+    }
 
     return (PyObject *)s;
 

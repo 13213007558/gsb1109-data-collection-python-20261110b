@@ -457,13 +457,23 @@ Basic Usage
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
 
+    *lone_surrogates* controls how unpaired surrogate ``\uXXXX`` escapes
+    in JSON strings are handled: ``'pass'`` (the default) emits them
+    as-is, ``'reject'`` raises :exc:`JSONDecodeError`, and ``'replace'``
+    substitutes U+FFFD. See :class:`JSONDecoder` for details.
+
+    *lone_surrogate_hook*, if specified, is called as
+    ``hook(pos, codepoint)`` for each lone surrogate replaced in
+    ``'replace'`` mode.
+
 
 Encoders and decoders
 ---------------------
 
 .. class:: JSONDecoder(encoding='utf-8', object_hook=None, parse_float=None, \
                        parse_int=None, parse_constant=None, \
-                       object_pairs_hook=None, strict=True, allow_nan=False)
+                       object_pairs_hook=None, strict=True, allow_nan=False, \
+                       lone_surrogates='pass', lone_surrogate_hook=None)
 
    Simple JSON decoder.
 
@@ -549,6 +559,23 @@ Encoders and decoders
         This argument was added to make it behave closer to the spec by
         default. The previous behavior can be restored by setting this to
         False.
+
+   *lone_surrogates* controls how unpaired surrogate ``\uXXXX`` escapes
+   in JSON strings are handled. The default ``'pass'`` preserves
+   historical behavior and emits them as-is. ``'reject'`` raises
+   :exc:`JSONDecodeError` at the offending escape. ``'replace'``
+   substitutes U+FFFD for each lone surrogate, in both object keys and
+   string values; if two object keys compare equal after replacement and
+   at least one of them was repaired, a :exc:`JSONDecodeError` is raised
+   instead of silently keeping only the last value. Well-formed surrogate
+   pairs are combined normally in every mode, and U+FFFD characters
+   already present in the input are never treated as repairs.
+
+   *lone_surrogate_hook*, if specified, is called as
+   ``hook(pos, codepoint)`` for each lone surrogate replaced in
+   ``'replace'`` mode, where *pos* is the index of the ``\uXXXX`` escape
+   in the input document and *codepoint* is the original surrogate value.
+   It has no effect in other modes.
 
    .. method:: decode(s)
 
