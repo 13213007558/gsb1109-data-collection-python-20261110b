@@ -1776,6 +1776,103 @@ class JSONTests(BaseTestCase):
         self.assertEqual(dset.export("yaml"), expected_yaml)
 
 
+class RoundTripMatrixTests(BaseTestCase):
+    """Round-trip matrix pinning down what 'json' and 'xlsx' preserve.
+
+    Each case records the expected value (and type) at two steps:
+
+    - ``export``: the value as stored in the serialized payload
+      (parsed JSON object / openpyxl cell value)
+    - ``import``: the value after loading the payload back into a Dataset
+
+    When a format cannot represent a Python type, the expected loss is
+    pinned to the step where it happens, so a library convention (e.g.
+    openpyxl storing ``Decimal`` as float) is not mistaken for a new
+    regression, and a genuine regression points at the failing step.
+    """
+
+    MATRIX = [
+        # (case, input, {'json': (after_export, after_import),
+        #                'xlsx': (after_export, after_import)})
+        (
+            'plain_bool', True,
+            {'json': (True, True), 'xlsx': (True, True)},
+        ),
+        (
+            'date', dt.date(2024, 3, 5),
+            {
+                # JSON has no date type: tablib serializes to ISO text on export.
+                'json': ('2024-03-05', '2024-03-05'),
+                # openpyxl normalizes date to datetime on export.
+                'xlsx': (dt.datetime(2024, 3, 5), dt.datetime(2024, 3, 5)),
+            },
+        ),
+        (
+            'none', None,
+            {'json': (None, None), 'xlsx': (None, None)},
+        ),
+        (
+            'empty_string', '',
+            {
+                'json': ('', ''),
+                # openpyxl stores '' as an empty cell, read back as None.
+                'xlsx': (None, None),
+            },
+        ),
+        (
+            'leading_zero_id', '0042',
+            {'json': ('0042', '0042'), 'xlsx': ('0042', '0042')},
+        ),
+        (
+            'precise_decimal', Decimal('19.99'),
+            {
+                # JSON has no decimal type: tablib serializes to text on export.
+                'json': ('19.99', '19.99'),
+                # openpyxl converts Decimal to float on export.
+                'xlsx': (19.99, 19.99),
+            },
+        ),
+    ]
+
+    def _exported_value(self, fmt, payload):
+        """Value as stored in the serialized payload (export step)."""
+        if fmt == 'json':
+            return json.loads(payload)[0]['supplier_value']
+        if fmt == 'xlsx':
+            sheet = load_workbook(BytesIO(payload)).active
+            return sheet['A2'].value
+        raise AssertionError(f'unknown format: {fmt}')
+
+    def _roundtrip_value(self, fmt, payload):
+        """Value after loading the payload back (import step)."""
+        return tablib.Dataset().load(payload, fmt)[0][0]
+
+    def _assert_same_value_and_type(self, actual, expected):
+        self.assertEqual(type(actual), type(expected))
+        self.assertEqual(actual, expected)
+
+    def _check_matrix(self, fmt):
+        for case, value, expectations in self.MATRIX:
+            expected_export, expected_import = expectations[fmt]
+            dataset = tablib.Dataset(headers=['supplier_value'])
+            dataset.append([value])
+            payload = dataset.export(fmt)
+            with self.subTest(format=fmt, case=case, step='export'):
+                self._assert_same_value_and_type(
+                    self._exported_value(fmt, payload), expected_export
+                )
+            with self.subTest(format=fmt, case=case, step='import'):
+                self._assert_same_value_and_type(
+                    self._roundtrip_value(fmt, payload), expected_import
+                )
+
+    def test_json_roundtrip_matrix(self):
+        self._check_matrix('json')
+
+    def test_xlsx_roundtrip_matrix(self):
+        self._check_matrix('xlsx')
+
+
 class YAMLTests(BaseTestCase):
     def test_yaml_format_detect(self):
         """Test YAML format detection."""
