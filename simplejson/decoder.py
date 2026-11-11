@@ -4,6 +4,7 @@ from __future__ import absolute_import
 import re
 import sys
 from .compat import PY3, unichr
+from .raw_json import RawJSON
 from .scanner import make_scanner, JSONDecodeError
 
 
@@ -325,7 +326,7 @@ class JSONDecoder(object):
     def __init__(self, encoding=None, object_hook=None, parse_float=None,
             parse_int=None, parse_constant=None, strict=True,
             object_pairs_hook=None, allow_nan=False,
-            array_hook=None):
+            array_hook=None, preserve_raw=None):
         """
         *encoding* determines the encoding used to interpret any
         :class:`str` objects decoded by this instance (``'utf-8'`` by
@@ -371,6 +372,20 @@ class JSONDecoder(object):
         ``True`` means that unescaped control characters are parse errors, if
         ``False`` then control characters will be allowed in strings.
 
+        *preserve_raw*, if specified, is an iterable of paths whose JSON
+        values should not be decoded. Each path is a tuple of string keys
+        and/or integer array indices, starting at the document root, e.g.
+        ``[('receipt',)]`` or ``[('payload', 'items', 2)]``. The original
+        source text of each value at a listed path is captured verbatim
+        (whitespace and key order included) and returned as a
+        :class:`simplejson.RawJSON` instance, which is not a ``str``
+        subclass, so preserved values can be told apart from decoded
+        strings with ``isinstance``. The captured text is still required
+        to be valid JSON; invalid input raises :class:`JSONDecodeError`
+        as usual. Paths are matched by their full position, so a key that
+        also appears elsewhere in the document is decoded normally unless
+        its own full path is listed.
+
         """
         if encoding is None:
             encoding = DEFAULT_ENCODING
@@ -384,6 +399,25 @@ class JSONDecoder(object):
         self.parse_constant = parse_constant
         self.strict = strict
         self.array_hook = array_hook
+        if preserve_raw:
+            raw_paths = set()
+            raw_prefixes = set()
+            for path in preserve_raw:
+                path = tuple(path)
+                for element in path:
+                    if (not isinstance(element, (str, int)) or
+                            isinstance(element, bool)):
+                        raise TypeError(
+                            'preserve_raw paths must contain only str keys '
+                            'and int indices, got %r' % (element,))
+                raw_paths.add(path)
+                for i in range(len(path)):
+                    raw_prefixes.add(path[:i])
+            self.preserve_raw = frozenset(raw_paths)
+            self._preserve_prefixes = frozenset(raw_prefixes)
+        else:
+            self.preserve_raw = None
+            self._preserve_prefixes = None
         self.parse_object = JSONObject
         self.parse_array = JSONArray
         self.parse_string = scanstring
@@ -397,11 +431,113 @@ class JSONDecoder(object):
         """
         if _PY3 and isinstance(s, bytes):
             s = str(s, self.encoding)
-        obj, end = self.raw_decode(s)
+        if self.preserve_raw:
+            obj, end = self._preserve_decode(s)
+        else:
+            obj, end = self.raw_decode(s)
         end = _w(s, end).end()
         if end != len(s):
             raise JSONDecodeError("Extra data", s, end, len(s))
         return obj
+
+    def _preserve_decode(self, s, _w=WHITESPACE.match):
+        idx = _w(s, 0).end()
+        # strip UTF-8 bom, mirroring raw_decode
+        if len(s) > idx:
+            ord0 = ord(s[idx])
+            if ord0 == 0xfeff:
+                idx += 1
+            elif ord0 == 0xef and s[idx:idx + 3] == '\xef\xbb\xbf':
+                idx += 3
+        return self._preserve_scan(s, idx, ())
+
+    def _preserve_scan(self, s, idx, path, _w=WHITESPACE.match):
+        idx = _w(s, idx).end()
+        if path in self.preserve_raw:
+            # Validate the value and locate its end, but keep the
+            # original source text instead of the decoded object
+            _, end = self.raw_decode(s, idx)
+            return RawJSON(s[idx:end]), end
+        if path not in self._preserve_prefixes:
+            # No preserved path reaches into this subtree
+            return self.scan_once(s, idx)
+        nextchar = s[idx:idx + 1]
+        if nextchar == '{':
+            return self._preserve_object(s, idx + 1, path)
+        elif nextchar == '[':
+            return self._preserve_array(s, idx + 1, path)
+        # A scalar cannot contain a preserved path below it
+        return self.scan_once(s, idx)
+
+    def _preserve_object(self, s, end, path,
+            _w=WHITESPACE.match, _ws=WHITESPACE_STR):
+        pairs = []
+        nextchar = s[end:end + 1]
+        if nextchar in _ws:
+            end = _w(s, end).end()
+            nextchar = s[end:end + 1]
+        if nextchar == '}':
+            end += 1
+        elif nextchar != '"':
+            raise JSONDecodeError(
+                "Expecting property name enclosed in double quotes or '}'",
+                s, end)
+        else:
+            end += 1
+            while True:
+                key, end = self.parse_string(
+                    s, end, self.encoding, self.strict)
+                if s[end:end + 1] != ':':
+                    end = _w(s, end).end()
+                    if s[end:end + 1] != ':':
+                        raise JSONDecodeError(
+                            "Expecting ':' delimiter", s, end)
+                end += 1
+                value, end = self._preserve_scan(s, end, path + (key,))
+                pairs.append((key, value))
+                end = _w(s, end).end()
+                nextchar = s[end:end + 1]
+                end += 1
+                if nextchar == '}':
+                    break
+                elif nextchar != ',':
+                    raise JSONDecodeError(
+                        "Expecting ',' delimiter or '}'", s, end - 1)
+                end = _w(s, end).end()
+                if s[end:end + 1] != '"':
+                    raise JSONDecodeError(
+                        "Expecting property name enclosed in double quotes",
+                        s, end)
+                end += 1
+        if self.object_pairs_hook is not None:
+            return self.object_pairs_hook(pairs), end
+        result = dict(pairs)
+        if self.object_hook is not None:
+            result = self.object_hook(result)
+        return result, end
+
+    def _preserve_array(self, s, end, path, _w=WHITESPACE.match):
+        values = []
+        end = _w(s, end).end()
+        if s[end:end + 1] == ']':
+            end += 1
+        else:
+            index = 0
+            while True:
+                value, end = self._preserve_scan(s, end, path + (index,))
+                values.append(value)
+                index += 1
+                end = _w(s, end).end()
+                nextchar = s[end:end + 1]
+                end += 1
+                if nextchar == ']':
+                    break
+                elif nextchar != ',':
+                    raise JSONDecodeError(
+                        "Expecting ',' delimiter or ']'", s, end - 1)
+        if self.array_hook is not None:
+            values = self.array_hook(values)
+        return values, end
 
     def raw_decode(self, s, idx=0, _w=WHITESPACE.match, _PY3=PY3):
         """Decode a JSON document from ``s`` (a ``str`` or ``unicode``

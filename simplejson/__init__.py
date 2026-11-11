@@ -402,7 +402,8 @@ _default_decoder = JSONDecoder()
 
 def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_int=None, parse_constant=None, object_pairs_hook=None,
-        use_decimal=False, allow_nan=False, array_hook=None, **kw):
+        use_decimal=False, allow_nan=False, array_hook=None,
+        preserve_raw=None, **kw):
     """Deserialize ``fp`` (a ``.read()``-supporting file-like object containing
     a JSON document as `str` or `bytes`) to a Python object.
 
@@ -456,12 +457,13 @@ def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_float=parse_float, parse_int=parse_int,
         parse_constant=parse_constant, object_pairs_hook=object_pairs_hook,
         use_decimal=use_decimal, allow_nan=allow_nan,
-        array_hook=array_hook, **kw)
+        array_hook=array_hook, preserve_raw=preserve_raw, **kw)
 
 
 def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_int=None, parse_constant=None, object_pairs_hook=None,
-        use_decimal=False, allow_nan=False, array_hook=None, **kw):
+        use_decimal=False, allow_nan=False, array_hook=None,
+        preserve_raw=None, **kw):
     """Deserialize ``s`` (a ``str`` or ``unicode`` instance containing a JSON
     document) to a Python object.
 
@@ -505,6 +507,17 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
 
+    *preserve_raw*, if specified, is an iterable of paths whose JSON values
+    should not be decoded. Each path is a tuple of string keys and/or integer
+    array indices, starting at the document root, e.g. ``[('receipt',)]``.
+    The original source text of each value at a listed path is captured
+    verbatim and returned as a :class:`RawJSON` instance, which is not a
+    :class:`str` subclass, so preserved values can be told apart from
+    decoded strings with ``isinstance``. The captured text is still required
+    to be valid JSON, and paths are matched by their full position, so a
+    key that also appears elsewhere in the document is decoded normally
+    unless its own full path is listed.
+
     To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
     kwarg. NOTE: You should use *object_hook* or *object_pairs_hook* instead
     of subclassing whenever possible.
@@ -513,7 +526,7 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     if (cls is None and encoding is None and object_hook is None and
             parse_int is None and parse_float is None and
             parse_constant is None and object_pairs_hook is None
-            and array_hook is None
+            and array_hook is None and preserve_raw is None
             and not use_decimal and not allow_nan and not kw):
         return _default_decoder.decode(s)
     if cls is None:
@@ -524,6 +537,8 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
         kw['object_pairs_hook'] = object_pairs_hook
     if array_hook is not None:
         kw['array_hook'] = array_hook
+    if preserve_raw is not None:
+        kw['preserve_raw'] = preserve_raw
     if parse_float is not None:
         kw['parse_float'] = parse_float
     if parse_int is not None:

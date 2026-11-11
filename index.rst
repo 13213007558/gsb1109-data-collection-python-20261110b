@@ -370,7 +370,8 @@ Basic Usage
 .. function:: loads(s, encoding='utf-8', cls=None, object_hook=None, \
                     parse_float=None, parse_int=None, \
                     parse_constant=None, object_pairs_hook=None, \
-                    use_decimal=None, allow_nan=False, **kw)
+                    use_decimal=None, allow_nan=False, preserve_raw=None, \
+                    **kw)
 
     Deserialize *s* (a :class:`str` or :class:`unicode` instance containing a JSON
     document) to a Python object. :exc:`JSONDecodeError` will be
@@ -433,6 +434,26 @@ Basic Usage
     .. versionchanged:: 3.8.0
         *iterable_as_array* is new in 3.8.0.
 
+    *preserve_raw*, if specified, is an iterable of paths whose JSON values
+    should not be decoded. Each path is a tuple of string keys and/or integer
+    array indices, starting at the document root, e.g. ``[('receipt',)]``.
+    The original source text of each value at a listed path is captured
+    verbatim (whitespace and key order included) and returned as a
+    :class:`RawJSON` instance, which is not a :class:`str` subclass, so
+    preserved values can be told apart from decoded strings with
+    ``isinstance``. The captured text is still required to be valid JSON, and
+    paths are matched by their full position, so a key that also appears
+    elsewhere in the document is decoded normally unless its own full path
+    is listed::
+
+        >>> import simplejson as json
+        >>> result = json.loads('{"receipt": { "b": 2,  "a": 1 }, "id": 7}',
+        ...     preserve_raw=[('receipt',)])
+        >>> result['receipt']
+        RawJSON('{ "b": 2,  "a": 1 }')
+        >>> result['id']
+        7
+
     To use a custom :class:`JSONDecoder` subclass, specify it with the ``cls``
     kwarg.  Additional keyword arguments will be passed to the constructor of the
     class. You probably shouldn't do this.
@@ -463,7 +484,8 @@ Encoders and decoders
 
 .. class:: JSONDecoder(encoding='utf-8', object_hook=None, parse_float=None, \
                        parse_int=None, parse_constant=None, \
-                       object_pairs_hook=None, strict=True, allow_nan=False)
+                       object_pairs_hook=None, strict=True, allow_nan=False, \
+                       preserve_raw=None)
 
    Simple JSON decoder.
 
@@ -549,6 +571,12 @@ Encoders and decoders
         This argument was added to make it behave closer to the spec by
         default. The previous behavior can be restored by setting this to
         False.
+
+   *preserve_raw*, if specified, is an iterable of paths whose JSON values
+   should not be decoded. Each path is a tuple of string keys and/or integer
+   array indices, starting at the document root. The original source text of
+   each value at a listed path is captured verbatim and returned as a
+   :class:`RawJSON` instance. See :func:`loads` for details.
 
    .. method:: decode(s)
 
