@@ -1,0 +1,8 @@
+excel_serial,number_format,csv_output,note
+2024-01-01 00:00:00,mm-dd-yy,2024-01-01 00:00:00,1900 system epoch 1899-12-30: serial 45292 is 2024-01-01
+2024-01-01 12:00:00,m/d/yy h:mm,2024-01-01 12:00:00,fractional serial .5 is noon of the same calendar day
+12:00:00,h:mm:ss,12:00:00,serial below 1 carries only a time fraction and renders as time of day
+1900-02-28 00:00:00,mm-dd-yy,1900-02-28 00:00:00,serial 60 is the fictitious Lotus 1900-02-29; fixed epoch maps it to 1900-02-28
+1900-02-27 00:00:00,mm-dd-yy,1900-02-27 00:00:00,"serial 59 is 1900-02-27, the day before the fictitious leap day"
+1900-03-01 00:00:00,mm-dd-yy,1900-03-01 00:00:00,serial 61 is 1900-03-01 and stays in sync with Excel after the gap
+43830,0.00,43830,same serial with a plain numeric format stays a number; integer floats lose the decimal places

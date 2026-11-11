@@ -1,0 +1,5 @@
+excel_serial,number_format,csv_output,note
+2024-01-01 00:00:00,mm-dd-yy,2024-01-01 00:00:00,1904 system epoch 1904-01-01: serial 43830 is the same day as 45292 in the 1900 system
+2028-01-02 00:00:00,mm-dd-yy,2028-01-02 00:00:00,"same serial 45292 as the 1900 workbook but 1462 days later; the date system drives the gap, not timezone"
+12:00:00,h:mm:ss,12:00:00,fractional serial renders as time of day in both date systems
+43830,0.00,43830,numeric format keeps the raw serial regardless of the workbook date system; integer floats lose decimal places

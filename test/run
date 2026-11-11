@@ -91,6 +91,14 @@ compare("shared_string_oob")
 compare("quoted_literals")
 compare("date1904_0")
 compare("date1904_1")
+# Date arithmetic contract for the financial-report import, see
+# test/make_dateedge_xlsx.py for the full rationale. Conversion is calendar
+# math on a fixed epoch with no host timezone involved; serial 60 in the 1900
+# system maps to 1900-02-28 (the fictitious Lotus leap day); sub-1 serials are
+# time-only; an integer serial kept under the 0.00 numeric format stays "43830".
+dateedge_args = ["--dateformat=%Y-%m-%d %H:%M:%S", "--timeformat=%H:%M:%S"]
+compare("dateedge_1900", dateedge_args)
+compare("dateedge_1904", dateedge_args)
 compare("hidden_rows")
 
 
