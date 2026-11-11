@@ -73,6 +73,7 @@ class VCR:
             "headers": matchers.headers,
             "raw_body": matchers.raw_body,
             "body": matchers.body,
+            "multipart": matchers.multipart,
         }
         self.persister = FilesystemPersister
         self.record_mode = validate_record_mode(record_mode)

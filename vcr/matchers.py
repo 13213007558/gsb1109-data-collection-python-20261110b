@@ -3,6 +3,7 @@ import json
 import logging
 import urllib
 import xmlrpc.client
+from email.message import Message
 from string import hexdigits
 from xml.parsers.expat import ExpatError
 
@@ -148,6 +149,140 @@ def body(r1, r2):
 def headers(r1, r2):
     if r1.headers != r2.headers:
         raise AssertionError(f"{r1.headers} != {r2.headers}")
+
+
+class _MultipartParseError(ValueError):
+    """A multipart body could not be parsed well enough to compare it."""
+
+
+def _multipart_boundary(headers):
+    content_type = headers.get("Content-Type", "")
+    if isinstance(content_type, bytes):
+        content_type = content_type.decode("utf-8", "replace")
+    message = Message()
+    message["Content-Type"] = content_type
+    if message.get_content_maintype() != "multipart":
+        raise _MultipartParseError(f"Content-Type is not multipart: {content_type!r}")
+    boundary = message.get_param("boundary")
+    if not boundary:
+        raise _MultipartParseError(f"no boundary in Content-Type: {content_type!r}")
+    try:
+        return boundary.encode("ascii")
+    except UnicodeEncodeError:
+        raise _MultipartParseError(f"boundary is not ASCII: {boundary!r}") from None
+
+
+def _multipart_body_bytes(request):
+    body = read_body(request)
+    if body is None:
+        raise _MultipartParseError("request has no body")
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body)
+    raise _MultipartParseError(f"unsupported body type {type(body).__name__}")
+
+
+def _find_next_delimiter(body, delimiter, start):
+    """Index of the CRLF preceding the next real delimiter line, or None.
+
+    A delimiter only counts at a line start (preceded by CRLF) and only when
+    immediately followed by CRLF, "--" (closing delimiter) or end of body, so
+    content that merely contains boundary-like bytes (e.g. "--boundaryXYZ" or
+    "--boundary" mid-line) is not mistaken for a delimiter.
+    """
+    needle = b"\r\n" + delimiter
+    idx = body.find(needle, start)
+    while idx != -1:
+        after = idx + len(needle)
+        if after == len(body) or body[after : after + 2] in (b"\r\n", b"--"):
+            return idx
+        idx = body.find(needle, idx + 1)
+    return None
+
+
+def _parse_part_headers(raw):
+    headers = {}
+    for line in raw.split(b"\r\n"):
+        name, sep, value = line.partition(b":")
+        if not sep:
+            raise _MultipartParseError(f"malformed part header line: {line!r}")
+        headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def _part_key(raw_headers, content):
+    headers = _parse_part_headers(raw_headers)
+    disposition = headers.get(b"content-disposition", b"").decode("utf-8", "surrogateescape")
+    message = Message()
+    message["Content-Disposition"] = disposition
+    if message.get_content_disposition() != "form-data":
+        raise _MultipartParseError(f"part is not form-data: {disposition!r}")
+    name = message.get_param("name", header="Content-Disposition")
+    if name is None:
+        raise _MultipartParseError(f"part has no field name: {disposition!r}")
+    filename = message.get_param("filename", header="Content-Disposition")
+    content_type = headers.get(b"content-type", b"").decode("utf-8", "surrogateescape")
+    return (name, filename, content_type.lower(), content)
+
+
+def _parse_multipart(request):
+    """A request's multipart body as an ordered list of comparable part keys."""
+    boundary = _multipart_boundary(request.headers)
+    body = _multipart_body_bytes(request)
+    delimiter = b"--" + boundary
+    if not body.startswith(delimiter):
+        raise _MultipartParseError("body does not start with the boundary delimiter")
+    pos = len(delimiter)
+    parts = []
+    while True:
+        if body[pos : pos + 2] == b"--":
+            # Closing delimiter; anything after it is the epilogue.
+            return parts
+        if body[pos : pos + 2] != b"\r\n":
+            raise _MultipartParseError("malformed boundary delimiter line")
+        pos += 2
+        header_end = body.find(b"\r\n\r\n", pos)
+        if header_end == -1:
+            raise _MultipartParseError("part headers are not terminated")
+        part_end = _find_next_delimiter(body, delimiter, header_end + 4)
+        if part_end is None:
+            raise _MultipartParseError("closing boundary delimiter not found")
+        parts.append(_part_key(body[pos:header_end], body[header_end + 4 : part_end]))
+        pos = part_end + 2 + len(delimiter)
+
+
+def _multipart_diff(parts1, parts2):
+    if len(parts1) != len(parts2):
+        return f"multipart part counts differ ({len(parts1)} in this request, {len(parts2)} recorded)"
+    for index, (part1, part2) in enumerate(zip(parts1, parts2, strict=True)):
+        if part1 == part2:
+            continue
+        labels = ("field name", "filename", "content type", "content")
+        differing = [label for label, v1, v2 in zip(labels, part1, part2, strict=True) if v1 != v2]
+        name1, name2 = part1[0], part2[0]
+        return (
+            f"multipart part {index} differs in {', '.join(differing)} "
+            f"(field {name1!r} in this request, {name2!r} recorded)"
+        )
+    return "the multipart bodies differ"
+
+
+def multipart(r1, r2):
+    """Match two multipart/form-data bodies part by part, ignoring the boundary.
+
+    Parts compare by field name, filename, content type and content, in order;
+    the boundary itself is ignored so clients that generate a fresh boundary
+    per request still match. A body that cannot be parsed fails the match
+    rather than comparing equal to other unparseable bodies.
+    """
+    try:
+        parts1 = _parse_multipart(r1)
+        parts2 = _parse_multipart(r2)
+    except _MultipartParseError as e:
+        raise AssertionError(f"insufficient basis for multipart matching: {e}") from None
+    if parts1 != parts2:
+        raise AssertionError(_multipart_diff(parts1, parts2))
 
 
 def _header_checker(value, header="Content-Type"):

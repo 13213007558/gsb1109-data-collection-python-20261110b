@@ -452,3 +452,132 @@ def test_body_matcher_diff_is_capped():
     assert len(lines) == matchers.MAX_DIFF_LINES + 1
     assert lines[-1].startswith("… (") and lines[-1].endswith(" more lines)")
     assert all(len(line) <= matchers.MAX_DIFF_LINE_LENGTH + 1 for line in lines)
+
+
+def make_multipart_request(parts, boundary="boundary"):
+    """Build a Request with a multipart/form-data body.
+
+    ``parts`` is a list of ``(name, filename, content_type, content)`` tuples;
+    ``filename`` and ``content_type`` may be None.
+    """
+    chunks = []
+    for name, filename, content_type, content in parts:
+        disposition = f'form-data; name="{name}"'
+        if filename is not None:
+            disposition += f'; filename="{filename}"'
+        chunks.append(f"--{boundary}\r\nContent-Disposition: {disposition}\r\n")
+        if content_type is not None:
+            chunks.append(f"Content-Type: {content_type}\r\n")
+        chunks.append("\r\n")
+        chunks.append(content)
+        chunks.append("\r\n")
+    chunks.append(f"--{boundary}--\r\n")
+    body = b"".join(c if isinstance(c, bytes) else c.encode("utf-8") for c in chunks)
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    return request.Request("POST", "http://host.com/upload", body, headers)
+
+
+FIELD = ("field", None, None, "value")
+FILE_A = ("file", "a.txt", "text/plain", b"contents of a")
+FILE_B = ("file", "b.txt", "text/plain", b"contents of b")
+
+
+def test_multipart_matcher_ignores_boundary():
+    r1 = make_multipart_request([FIELD, FILE_A], boundary="----client1boundary")
+    r2 = make_multipart_request([FIELD, FILE_A], boundary="----client2boundary")
+    assert matchers.multipart(r1, r2) is None
+
+
+def test_multipart_matcher_matches_quoted_boundary():
+    r1 = make_multipart_request([FIELD, FILE_A])
+    r2 = make_multipart_request([FIELD, FILE_A])
+    r2.headers["Content-Type"] = 'multipart/form-data; boundary="boundary"'
+    assert matchers.multipart(r1, r2) is None
+
+
+@pytest.mark.parametrize(
+    "parts1, parts2",
+    [
+        # same field name and filename, different file content
+        ([FILE_A], [("file", "a.txt", "text/plain", b"other contents")]),
+        # different filename
+        ([FILE_A], [("file", "c.txt", "text/plain", b"contents of a")]),
+        # different part content type
+        ([FILE_A], [("file", "a.txt", "application/octet-stream", b"contents of a")]),
+        # different field value
+        ([FIELD], [("field", None, None, "other value")]),
+        # different field name
+        ([FIELD], [("other", None, None, "value")]),
+        # two same-named files swapped: order matters
+        ([FILE_A, FILE_B], [FILE_B, FILE_A]),
+        # extra part
+        ([FIELD, FILE_A], [FIELD]),
+    ],
+)
+def test_multipart_matcher_does_not_match(parts1, parts2):
+    r1 = make_multipart_request(parts1, boundary="one")
+    r2 = make_multipart_request(parts2, boundary="two")
+    with pytest.raises(AssertionError):
+        matchers.multipart(r1, r2)
+
+
+def test_multipart_matcher_swapped_files_report_part_index():
+    r1 = make_multipart_request([FILE_A, FILE_B])
+    r2 = make_multipart_request([FILE_B, FILE_A])
+    with pytest.raises(AssertionError, match=r"multipart part 0 differs"):
+        matchers.multipart(r1, r2)
+
+
+def test_multipart_matcher_handles_boundary_like_bytes_in_content():
+    # Content containing the boundary string mid-line, a longer string with
+    # the boundary as a prefix at a line start, and a bare "--" line must not
+    # be split into bogus parts.
+    content = b"see --boundary here\r\n--boundaryish line\r\n--\r\ntrailing --boundary"
+    part = ("field", None, None, content)
+    r1 = make_multipart_request([part, FILE_A], boundary="boundary")
+    r2 = make_multipart_request([part, FILE_A], boundary="boundary")
+    assert matchers.multipart(r1, r2) is None
+    # And a real difference after the boundary-like bytes is still detected.
+    changed = ("field", None, None, content + b"!")
+    r3 = make_multipart_request([changed, FILE_A], boundary="boundary")
+    with pytest.raises(AssertionError):
+        matchers.multipart(r1, r3)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # truncated before the closing delimiter
+        lambda body: body[: body.rfind(b"\r\n--boundary--")],
+        # closing delimiter missing its "--"
+        lambda body: body.replace(b"\r\n--boundary--\r\n", b"\r\n--boundary\r\n"),
+        # part headers never terminated
+        lambda body: body.replace(b"\r\n\r\nvalue", b"\r\nvalue"),
+        # body does not start with the delimiter
+        lambda body: b"preamble\r\n" + body,
+    ],
+)
+def test_multipart_matcher_rejects_unparseable_bodies(mutate):
+    good = make_multipart_request([FIELD])
+    bad = request.Request(
+        "POST",
+        "http://host.com/upload",
+        mutate(good.body),
+        {"Content-Type": "multipart/form-data; boundary=boundary"},
+    )
+    for r1, r2 in [(good, bad), (bad, good), (bad, bad)]:
+        with pytest.raises(AssertionError, match="insufficient basis for multipart matching"):
+            matchers.multipart(r1, r2)
+
+
+def test_multipart_matcher_requires_multipart_content_type():
+    r1 = request.Request("POST", "http://host.com/", b"a=1", {"Content-Type": "text/plain"})
+    r2 = request.Request("POST", "http://host.com/", b"a=1", {"Content-Type": "text/plain"})
+    with pytest.raises(AssertionError, match="insufficient basis for multipart matching"):
+        matchers.multipart(r1, r2)
+
+
+def test_multipart_matcher_is_registered():
+    import vcr
+
+    assert vcr.VCR().matchers["multipart"] is matchers.multipart

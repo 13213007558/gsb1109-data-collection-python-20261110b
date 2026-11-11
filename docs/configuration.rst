@@ -51,6 +51,9 @@ The following options are available :
 -  raw\_body (the entire request body as is)
 -  body (the entire request body unmarshalled by content-type
    i.e. xmlrpc, json, form-urlencoded, falling back on raw\_body)
+-  multipart (a multipart/form-data body compared part by part — field
+   name, filename, content type and content, in order — ignoring the
+   client-generated boundary; unparseable bodies never match)
 -  headers (the headers of the request)
 
    Backwards compatible matchers:
