@@ -681,6 +681,45 @@ recorded response instead of being sent and recorded again.
             response = urllib.request.urlopen('http://www.zombo.com/').read()
         assert cass.all_played
 
+Replaying at a chosen time
+--------------------------
+
+A cassette records the absolute timestamps the server sent, in the ``Date``
+and ``Expires`` response headers and in an HTTP-date form of
+``Retry-After``. Replayed months later, a client can treat all of them as
+stale. The ``playback_start`` option lets you state what the recording's
+starting point should count as "now":
+
+.. code:: python
+
+    from datetime import datetime, UTC
+    import vcr
+
+    start = datetime(2026, 11, 11, 9, 0, 0, tzinfo=UTC)
+    with vcr.use_cassette('fixtures/vcr_cassettes/synopsis.yaml', playback_start=start):
+        ...  # your HTTP interactions here
+
+VCR.py measures the offset from the cassette's first recorded ``Date``
+header to ``playback_start`` and moves every HTTP-date in every response by
+that same amount, so the intervals between interactions and the order of
+responses are unchanged. ``Date`` is anchored exactly at the chosen start,
+and freshness windows and delays stay as long as they were when recorded.
+
+``Retry-After`` is only moved when it is an HTTP-date. A delay given in
+seconds (e.g. ``Retry-After: 120``) is already relative and means the same
+thing at any time, so it is replayed unchanged. Values that cannot be
+parsed as dates are also left alone.
+
+The shift applies to this playback only. The responses handed to your code
+are copies, so the cassette in memory and the cassette file keep their
+original timestamps and can still be replayed without the option or used
+for audit. If the cassette has no parseable ``Date`` header there is
+nothing to anchor on, VCR.py logs a warning and replays it unchanged.
+
+A naive ``datetime`` is interpreted as UTC. ``playback_start`` can be set
+on a ``VCR`` instance as the default for all its cassettes, and overridden
+or left out per cassette.
+
 Discards Cassette on Errors
 ---------------------------
 

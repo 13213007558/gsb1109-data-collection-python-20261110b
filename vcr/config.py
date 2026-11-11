@@ -56,6 +56,7 @@ class VCR:
         before_save_interaction=None,
         after_load_interaction=None,
         skip_patchers=(),
+        playback_start=None,
     ):
         self.serializer = serializer
         self.match_on = match_on
@@ -95,6 +96,7 @@ class VCR:
         self.before_save_interaction = before_save_interaction
         self.after_load_interaction = after_load_interaction
         self.skip_patchers = validate_skip_patchers(skip_patchers)
+        self.playback_start = playback_start
 
     def _get_serializer(self, serializer_name):
         try:
@@ -172,6 +174,7 @@ class VCR:
             "before_save_interaction": kwargs.get("before_save_interaction", self.before_save_interaction),
             "after_load_interaction": kwargs.get("after_load_interaction", self.after_load_interaction),
             "skip_patchers": kwargs.get("skip_patchers", self.skip_patchers),
+            "playback_start": kwargs.get("playback_start", self.playback_start),
         }
         path = kwargs.get("path")
         if path:

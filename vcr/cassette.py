@@ -14,6 +14,7 @@ from .filters import sensitive_data_hooks
 from .matchers import get_matchers_results, method, requests_match, uri
 from .patch import CassettePatcherBuilder, validate_skip_patchers
 from .persisters.filesystem import CassetteDecodeError, CassetteNotFoundError, FilesystemPersister
+from .playback import coerce_playback_start, find_anchor, shift_response_dates
 from .record_mode import RecordMode
 from .serializers import yamlserializer
 from .util import partition_dict
@@ -191,6 +192,7 @@ class Cassette:
         before_save_interaction=None,
         after_load_interaction=None,
         skip_patchers=(),
+        playback_start=None,
     ):
         self._persister = persister or FilesystemPersister
         self._path = path
@@ -204,6 +206,10 @@ class Cassette:
         self.custom_patches = custom_patches
         self.allow_playback_repeats = allow_playback_repeats
         self.drop_unused_requests = drop_unused_requests
+        # Rewrites HTTP-date response headers at playback so the recording can
+        # be anchored to a chosen "now" without touching the cassette file.
+        self._playback_start = coerce_playback_start(playback_start)
+        self._playback_offset = None
         # Hooks run on each interaction as the cassette is saved and loaded.
         # filter_sensitive_data hides values after the user's save hooks and
         # restores them before the user's load hooks, so those see real values.
@@ -305,11 +311,43 @@ class Cassette:
                     # Use stored (possibly modified) request, not the raw incoming request
                     self._played_interactions.append((self.data[index][0], response))
                 self.play_counts[index] += 1
-                return response
+                return self._shift_for_playback(response)
         # The cassette doesn't contain the request asked for.
         raise UnhandledHTTPRequestError(
             f"The cassette ({self._path!r}) doesn't contain the request ({request!r}) asked for",
         )
+
+    def _compute_playback_offset(self):
+        """Fix how far recorded timestamps move for this playback.
+
+        Anchored on the first recorded ``Date`` header, so all interactions
+        shift by one identical amount. With no parseable ``Date`` there is
+        nothing to anchor on, and the cassette is replayed unchanged.
+        """
+        if self._playback_start is None:
+            return
+        anchor = find_anchor(self.responses)
+        if anchor is None:
+            log.warning(
+                "Cassette %s has no parseable Date header, so playback_start "
+                "can't be applied; replaying with the recorded timestamps.",
+                self._path,
+            )
+            return
+        self._playback_offset = self._playback_start - anchor
+
+    def _shift_for_playback(self, response):
+        """Return a playback copy of ``response`` with HTTP-dates shifted.
+
+        The offset is computed once, from the first recorded ``Date`` header, so
+        every interaction moves by the same amount and recorded intervals and
+        ordering are preserved. The cassette's stored response is not mutated, so
+        saving still writes the original timestamps.
+        """
+        if self._playback_start is None or self._playback_offset is None:
+            return response
+        shifted = copy.deepcopy(response)
+        return shift_response_dates(shifted, self._playback_offset)
 
     def responses_of(self, request):
         """
@@ -476,6 +514,7 @@ class Cassette:
                 self.append(request, response)
                 self._old_interactions.append((request, response))
             self._loaded_count = len(self.data)
+            self._compute_playback_offset()
             self.dirty = False
             self.rewound = True
             self._metadata = metadata[0] if metadata else {}

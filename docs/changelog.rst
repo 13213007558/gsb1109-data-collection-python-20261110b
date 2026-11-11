@@ -4,6 +4,7 @@ Changelog
 All help in providing PRs to close out bug issues is appreciated. Even if that is providing a repo that fully replicates issues. We have very generous contributors that have added these to bug issues which meant another contributor picked up the bug and closed it out.
 
 -  Unreleased
+    - New ``playback_start`` option: give a ``datetime`` for what the recording's starting point counts as "now" during a playback. The ``Date``, ``Expires`` and HTTP-date form of ``Retry-After`` response headers are all moved by one offset, measured from the cassette's first ``Date`` header, preserving recorded intervals and response order; a ``Retry-After`` given in seconds is left unchanged. It affects the in-memory playback only, so the cassette file keeps its original timestamps and stays usable for audit
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
 
 -  9.4.2
