@@ -8,8 +8,33 @@ from io import StringIO
 from inspect import isgenerator
 import codecs
 
+#: Namespace of the canonical ``xsi:nil`` attribute.
+XSI_NAMESPACE = "http://www.w3.org/2001/XMLSchema-instance"
+
+#: Sentinel representing a value that was explicitly cleared in the source
+#: document, i.e. an element carrying the namespaced ``nil="true"`` attribute.
+#: It is distinct from ``None``, which represents a plain empty/self-closing
+#: element (a field that was simply left blank), and from a missing key, which
+#: means the element was absent altogether.
+Nil = type("Nil", (), {"__repr__": lambda self: "Nil"})()
+Nil.__doc__ = "Sentinel for an explicitly nil (cleared) XML element."
+
+# Internal marker distinguishing "prefix never declared in scope" from a
+# declaration whose URI is ``None``/empty.
+_NS_UNDECLARED = object()
+
+
 class ParsingInterrupted(Exception):
     pass
+
+
+class XSINilConflictError(ValueError):
+    """Raised when an ``xsi:nil="true"`` element also carries a value.
+
+    Per the XML Schema rules a nilled element must have no content; finding
+    character data or child elements alongside ``xsi:nil="true"`` is a
+    conflict. Plain empty elements and ``xsi:nil="false"`` are not affected.
+    """
 
 
 class _DictSAXHandler:
@@ -29,6 +54,10 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        process_namespaces=False,
+        process_xsi_nil=False,
+        xsi_namespace=XSI_NAMESPACE,
+        nil_sentinel=Nil,
     ):
         self.path = []
         self.stack = []
@@ -46,9 +75,27 @@ class _DictSAXHandler:
         self.strip_whitespace = strip_whitespace
         self.namespace_separator = namespace_separator
         self.namespaces = namespaces
+        self.process_namespaces = process_namespaces
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        self.process_xsi_nil = process_xsi_nil
+        self.xsi_namespace = xsi_namespace
+        self.nil_sentinel = nil_sentinel
+        # Maps an in-scope namespace prefix to its URI. Only maintained while
+        # ``process_xsi_nil`` is enabled so that a prefixed ``nil`` attribute
+        # can be resolved against its actual namespace.
+        self._ns_scope = {}
+        # Undo records (prefix, previous-or-marker) for declarations that are
+        # still open, so leaving an element restores the surrounding scope.
+        self._ns_undo = []
+        # Parallel stack for declarations seen as ``xmlns*`` attributes when
+        # expat namespace processing is disabled (the default mode).
+        self._ns_attr_undo = []
+        # Parallel to ``stack``: per open element, ``None`` when it has no
+        # namespaced nil attribute, otherwise the nil sentinel (nil="true")
+        # or ``False`` (any other value such as nil="false").
+        self._nil_stack = []
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -73,10 +120,98 @@ class _DictSAXHandler:
 
     def startNamespaceDecl(self, prefix, uri):
         self.namespace_declarations[prefix or ''] = uri
+        if self.process_xsi_nil:
+            key = prefix or ''
+            self._ns_undo.append((key, self._ns_scope.get(key, _NS_UNDECLARED)))
+            self._ns_scope[key] = uri
+
+    def endNamespaceDecl(self, prefix):
+        if not self.process_xsi_nil:
+            return
+        key, previous = self._ns_undo.pop()
+        if previous is _NS_UNDECLARED:
+            self._ns_scope.pop(key, None)
+        else:
+            self._ns_scope[key] = previous
+
+    def _push_namespace_decls(self, attrs):
+        """Track ``xmlns`` declarations reported as plain attributes.
+
+        Expat only invokes the namespace-declaration callbacks while namespace
+        processing is enabled. In the default mode they arrive as ordinary
+        ``xmlns``/``xmlns:prefix`` attributes, so they are tracked here to keep
+        prefix resolution correct.
+        """
+        undo = []
+        for raw_name, uri in attrs.items():
+            if raw_name == 'xmlns':
+                key = ''
+            elif raw_name.startswith('xmlns:'):
+                key = raw_name[len('xmlns:'):]
+            else:
+                continue
+            undo.append((key, self._ns_scope.get(key, _NS_UNDECLARED)))
+            self._ns_scope[key] = uri
+        self._ns_attr_undo.append(undo)
+
+    def _pop_namespace_decls(self):
+        for key, previous in self._ns_attr_undo.pop():
+            if previous is _NS_UNDECLARED:
+                self._ns_scope.pop(key, None)
+            else:
+                self._ns_scope[key] = previous
+
+    def _attribute_namespace(self, raw_name):
+        """Return the resolved namespace URI of an attribute.
+
+        With namespace processing enabled expat reports the name as
+        ``'<uri><separator><local>'``; otherwise a prefixed name is resolved
+        against the currently in-scope namespace prefixes. Unprefixed
+        attributes have no namespace and yield ``None``.
+        """
+        if self.process_namespaces:
+            if self.namespace_separator in raw_name:
+                return raw_name.rsplit(self.namespace_separator, 1)[0]
+            return None
+        if ':' in raw_name:
+            prefix = raw_name.split(':', 1)[0]
+            return self._ns_scope.get(prefix)
+        return None
+
+    def _xsi_nil_value(self, attrs):
+        """Return the value of the namespaced ``nil`` attribute, if present."""
+        for raw_name, raw_value in attrs.items():
+            if self.process_namespaces:
+                local = raw_name.rsplit(self.namespace_separator, 1)[-1]
+            else:
+                local = raw_name.split(':', 1)[-1]
+            if local != 'nil':
+                continue
+            if self._attribute_namespace(raw_name) == self.xsi_namespace:
+                return raw_value
+        return None
+
+    def _start_nil(self, attrs):
+        """Return the nil state for an opening element.
+
+        Returns the nil sentinel when the namespaced attribute is a truthy
+        boolean, ``False`` when it is present but not truthy, and ``None``
+        when the element carries no namespaced ``nil`` attribute.
+        """
+        nil_value = self._xsi_nil_value(attrs)
+        if nil_value is None:
+            return None
+        if nil_value.strip().lower() in ('true', '1'):
+            return self.nil_sentinel
+        return False
 
     def startElement(self, full_name, attrs):
         name = self._build_name(full_name)
         attrs = self._attrs_to_dict(attrs)
+        if self.process_xsi_nil and not self.process_namespaces:
+            self._push_namespace_decls(attrs)
+        nil_state = self._start_nil(attrs) if self.process_xsi_nil else None
+        self._nil_stack.append(nil_state)
         if self.namespace_declarations:
             if not attrs:
                 attrs = self.dict_constructor()
@@ -101,8 +236,38 @@ class _DictSAXHandler:
             self.item = attrs or None
             self.data = []
 
+    def _has_element_children(self, item):
+        if not isinstance(item, dict):
+            return False
+        for key in item:
+            if key == self.cdata_key or key == self.comment_key:
+                continue
+            if isinstance(key, str) and key.startswith(self.attr_prefix):
+                continue
+            return True
+        return False
+
+    def _resolve_nil(self, name, nil_state, item, data):
+        """Apply a namespaced nil state to a finished element.
+
+        Returns the ``(item, data)`` to attach to the parent. A truthy nil on
+        an empty element collapses to the nil sentinel; any character data or
+        element child alongside it is a conflict and raises.
+        """
+        if nil_state is not self.nil_sentinel:
+            return item, data
+        if data or self._has_element_children(item):
+            raise XSINilConflictError(
+                "element %r carries xsi:nil=\"true\" but also has content"
+                % name
+            )
+        return self.nil_sentinel, None
+
     def endElement(self, full_name):
         name = self._build_name(full_name)
+        nil_state = self._nil_stack.pop()
+        if self.process_xsi_nil and not self.process_namespaces:
+            self._pop_namespace_decls()
         # If we just closed an item at the streaming depth, emit it and drop it
         # without attaching it back to its parent. This avoids accumulating all
         # streamed items in memory when using item_depth > 0.
@@ -119,6 +284,8 @@ class _DictSAXHandler:
                     self.push_data(item, self.cdata_key, data)
             else:
                 item = data
+            if self.process_xsi_nil:
+                item, data = self._resolve_nil(name, nil_state, item, data)
 
             should_continue = self.item_callback(self.path, item)
             if not should_continue:
@@ -144,9 +311,18 @@ class _DictSAXHandler:
             if item is not None:
                 if data:
                     self.push_data(item, self.cdata_key, data)
+                if self.process_xsi_nil:
+                    item, data = self._resolve_nil(name, nil_state, item, data)
                 self.item = self.push_data(self.item, name, item)
             else:
-                self.item = self.push_data(self.item, name, data)
+                if self.process_xsi_nil:
+                    item, data = self._resolve_nil(name, nil_state, item, data)
+                    if item is self.nil_sentinel:
+                        self.item = self.push_data(self.item, name, item)
+                    else:
+                        self.item = self.push_data(self.item, name, data)
+                else:
+                    self.item = self.push_data(self.item, name, data)
         else:
             self.item = None
             self.data = []
@@ -342,8 +518,26 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         at the default `True`, comments will have leading and trailing
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
+
+    If `process_xsi_nil` is `True`, elements carrying the namespaced
+    ``xsi:nil="true"`` attribute are collapsed to the `nil_sentinel` (the
+    module-level :data:`Nil` object by default) instead of ``None``. This keeps
+    three otherwise ambiguous cases distinct in the result:
+
+    * ``<phone/>`` -> ``None``: the element is present but empty (no value).
+    * a missing ``phone`` key: the element is absent from the document.
+    * ``<phone xsi:nil="true"/>`` -> :data:`Nil`: the value was explicitly
+      cleared. Only an attribute in the `xsi_namespace`
+      (default ``http://www.w3.org/2001/XMLSchema-instance``) counts; an
+      unprefixed ``nil="true"`` is ignored. An element that is nilled yet also
+      carries text or child elements raises :class:`XSINilConflictError`.
+
+    Pass a custom `nil_sentinel` to use a different marker. The same sentinel
+    is understood by `unparse` to round-trip the explicit clear back into
+    ``xsi:nil="true"``.
     """
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
+                              process_namespaces=process_namespaces,
                               **kwargs)
     if isinstance(xml_input, str):
         encoding = encoding or 'utf-8'
@@ -356,6 +550,7 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
     )
     parser.ordered_attributes = True
     parser.StartNamespaceDeclHandler = handler.startNamespaceDecl
+    parser.EndNamespaceDeclHandler = handler.endNamespaceDecl
     parser.StartElementHandler = handler.startElement
     parser.EndElementHandler = handler.endElement
     parser.CharacterDataHandler = handler.characters
@@ -461,7 +656,11 @@ def _emit(key, value, content_handler,
           expand_iter=None,
           encoding='utf-8',
           bytes_errors='replace',
-          comment_key='#comment'):
+          comment_key='#comment',
+          nil_sentinel=Nil,
+          xsi_namespace=XSI_NAMESPACE,
+          nil_attribute='xsi:nil',
+          ns_prefixes=None):
     if isinstance(key, str) and key == comment_key:
         comments_list = value if isinstance(value, list) else [value]
         if isinstance(indent, int):
@@ -494,7 +693,8 @@ def _emit(key, value, content_handler,
     for index, v in enumerate(value):
         if full_document and depth == 0 and index > 0:
             raise ValueError('document with multiple roots')
-        if v is None:
+        is_nil = v is nil_sentinel
+        if v is None or is_nil:
             v = {}
         elif not isinstance(v, (dict, str)):
             if expand_iter and hasattr(v, '__iter__') and not isinstance(v, (bytes, bytearray, memoryview)):
@@ -508,6 +708,10 @@ def _emit(key, value, content_handler,
         children = []
         for ik, iv in v.items():
             if ik == cdata_key:
+                if iv is nil_sentinel:
+                    is_nil = True
+                    cdata = None
+                    continue
                 if iv is None:
                     cdata = None
                 else:
@@ -535,6 +739,26 @@ def _emit(key, value, content_handler,
             if isinstance(iv, list) and not iv:
                 continue # Skip empty lists to avoid creating empty child elements
             children.append((ik, iv))
+        # Namespace prefixes made available by this element's own xmlns decls,
+        # layered over those inherited from ancestors.
+        scope = dict(ns_prefixes or {})
+        for attr_name, attr_value in attrs.items():
+            if attr_name == 'xmlns':
+                scope[''] = attr_value
+            elif attr_name.startswith('xmlns:'):
+                scope[attr_name[len('xmlns:'):]] = attr_value
+        if is_nil:
+            if children or cdata is not None:
+                raise XSINilConflictError(
+                    "element %r is marked nil but also has content" % key
+                )
+            if ':' in nil_attribute:
+                prefix = nil_attribute.split(':', 1)[0]
+                declaration = 'xmlns' + (':%s' % prefix if prefix else '')
+                if scope.get(prefix) != xsi_namespace and declaration not in attrs:
+                    attrs[declaration] = xsi_namespace
+                    scope[prefix] = xsi_namespace
+            attrs.setdefault(nil_attribute, "true")
         if isinstance(indent, int):
             indent = ' ' * indent
         if pretty:
@@ -548,7 +772,9 @@ def _emit(key, value, content_handler,
                   pretty, newl, indent, namespaces=namespaces,
                   namespace_separator=namespace_separator,
                   expand_iter=expand_iter, encoding=encoding,
-                  bytes_errors=bytes_errors, comment_key=comment_key)
+                  bytes_errors=bytes_errors, comment_key=comment_key,
+                  nil_sentinel=nil_sentinel, xsi_namespace=xsi_namespace,
+                  nil_attribute=nil_attribute, ns_prefixes=scope)
         if cdata is not None:
             content_handler.characters(cdata)
         if pretty and children:
@@ -566,7 +792,8 @@ class _XMLGenerator(XMLGenerator):
 
 def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             short_empty_elements=False, comment_key='#comment',
-            **kwargs):
+            nil_sentinel=Nil, xsi_namespace=XSI_NAMESPACE,
+            nil_attribute='xsi:nil', **kwargs):
     """Emit an XML document for the given `input_dict` (reverse of `parse`).
 
     The resulting XML document is returned as a string, but if `output` (a
@@ -579,6 +806,14 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
     Empty lists are omitted entirely: ``{"a": []}`` produces no ``<a>`` element.
     Provide a placeholder entry (for example ``{"a": [""]}``) when an explicit
     empty container element must be emitted.
+
+    Values equal to `nil_sentinel` (the module-level :data:`Nil` object by
+    default) are emitted as an empty element carrying
+    ``<nil_attribute>="true"`` (default ``xsi:nil="true"``), so an explicit
+    clear stays distinguishable from a plain empty element (``None``) or an
+    absent key. A nil value that also carries text or child elements raises
+    :class:`XSINilConflictError`. Use the same `nil_sentinel` and
+    `xsi_namespace` passed to `parse` for a clean round-trip.
 
     The `pretty` parameter (default=`False`) enables pretty-printing. In this
     mode, lines are terminated with `'\n'` and indented with `'\t'`, but this
@@ -615,6 +850,9 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
             encoding=encoding,
             bytes_errors=bytes_errors,
             comment_key=comment_key,
+            nil_sentinel=nil_sentinel,
+            xsi_namespace=xsi_namespace,
+            nil_attribute=nil_attribute,
             **kwargs,
         )
         if key != comment_key:

@@ -1,10 +1,14 @@
 from xmltodict import parse, ParsingInterrupted
+from xmltodict import Nil, XSINilConflictError, XSI_NAMESPACE
 import collections
 import pytest
 from io import BytesIO
 
 from xml.parsers.expat import ParserCreate
 from xml.parsers import expat
+
+
+XSI_DECL = 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
 
 
 def test_string_vs_file():
@@ -720,3 +724,199 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+# ---------------------------------------------------------------------------
+# xsi:nil handling (process_xsi_nil)
+# ---------------------------------------------------------------------------
+
+def test_nil_distinguishes_empty_absent_and_cleared():
+    xml = (
+        f"<root {XSI_DECL}>"
+        "<phone/>"
+        '<email xsi:nil="true"/>'
+        "<name>bob</name>"
+        "</root>"
+    )
+    result = parse(xml, process_xsi_nil=True)
+    # present but blank -> None
+    assert result["root"]["phone"] is None
+    # explicitly cleared -> Nil sentinel
+    assert result["root"]["email"] is Nil
+    # absent element -> no key at all
+    assert "missing" not in result["root"]
+    assert result["root"]["name"] == "bob"
+
+
+def test_nil_disabled_by_default_preserves_attribute_dict():
+    xml = f'<root {XSI_DECL}><phone xsi:nil="true"/></root>'
+    assert parse(xml) == {
+        "root": {
+            "@xmlns:xsi": XSI_NAMESPACE,
+            "phone": {"@xsi:nil": "true"},
+        }
+    }
+
+
+def test_unprefixed_nil_attribute_is_ignored():
+    xml = f'<root {XSI_DECL}><phone nil="true"/></root>'
+    result = parse(xml, process_xsi_nil=True)
+    assert result["root"]["phone"] is not Nil
+    assert result["root"]["phone"] == {"@nil": "true"}
+
+
+def test_nil_attribute_in_wrong_namespace_is_ignored():
+    xml = (
+        '<root xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xmlns:o="http://other.example/">'
+        '<a o:nil="true"/>'
+        '<b xmlns:xsi="http://rebound.example/" xsi:nil="true"/>'
+        "</root>"
+    )
+    result = parse(xml, process_xsi_nil=True)
+    assert result["root"]["a"] is not Nil
+    assert result["root"]["b"] is not Nil
+
+
+def test_nil_works_with_any_prefix_bound_to_xsi_namespace():
+    xml = (
+        f'<root xmlns:i="{XSI_NAMESPACE}">'
+        '<phone i:nil="true"/>'
+        "</root>"
+    )
+    result = parse(xml, process_xsi_nil=True)
+    assert result["root"]["phone"] is Nil
+
+
+def test_nil_false_is_not_a_clear():
+    xml = f'<root {XSI_DECL}><phone xsi:nil="false"/></root>'
+    result = parse(xml, process_xsi_nil=True)
+    assert result["root"]["phone"] is not Nil
+    assert result["root"]["phone"] == {"@xsi:nil": "false"}
+
+
+def test_nil_accepts_boolean_true_variants():
+    for value in ("true", "TRUE", " True ", "1"):
+        xml = f'<root {XSI_DECL}><phone xsi:nil="{value}"/></root>'
+        assert parse(xml, process_xsi_nil=True)["root"]["phone"] is Nil, value
+
+
+def test_nil_collapses_even_with_other_attributes():
+    xml = f'<root {XSI_DECL}><phone id="7" xsi:nil="true"/></root>'
+    result = parse(xml, process_xsi_nil=True)
+    assert result["root"]["phone"] is Nil
+
+
+def test_nil_with_text_conflicts():
+    xml = f'<root {XSI_DECL}><phone xsi:nil="true">12345</phone></root>'
+    with pytest.raises(XSINilConflictError, match="phone"):
+        parse(xml, process_xsi_nil=True)
+
+
+def test_nil_with_child_element_conflicts():
+    xml = (
+        f'<root {XSI_DECL}>'
+        '<phone xsi:nil="true"><ext>1</ext></phone>'
+        "</root>"
+    )
+    with pytest.raises(XSINilConflictError):
+        parse(xml, process_xsi_nil=True)
+
+
+def test_nil_with_whitespace_only_text_is_not_a_conflict():
+    xml = f'<root {XSI_DECL}><phone xsi:nil="true">   </phone></root>'
+    assert parse(xml, process_xsi_nil=True)["root"]["phone"] is Nil
+
+
+def test_nil_custom_sentinel():
+    class ClearMarker:
+        pass
+
+    marker = ClearMarker()
+    xml = f'<root {XSI_DECL}><phone xsi:nil="true"/></root>'
+    result = parse(xml, process_xsi_nil=True, nil_sentinel=marker)
+    assert result["root"]["phone"] is marker
+
+
+def test_nil_custom_namespace():
+    custom_ns = "http://example.com/custom-nil"
+    xml = (
+        f'<root xmlns:c="{custom_ns}" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        '<a c:nil="true"/>'
+        '<b xsi:nil="true"/>'
+        "</root>"
+    )
+    result = parse(xml, process_xsi_nil=True, xsi_namespace=custom_ns)
+    assert result["root"]["a"] is Nil
+    assert result["root"]["b"] is not Nil
+
+
+def test_nil_with_xml_attribs_disabled():
+    xml = f'<root {XSI_DECL}><phone xsi:nil="true"/></root>'
+    result = parse(xml, process_xsi_nil=True, xml_attribs=False)
+    assert result["root"]["phone"] is Nil
+
+
+def test_nil_inside_force_list():
+    xml = (
+        f"<root {XSI_DECL}>"
+        '<p xsi:nil="true"/><p>x</p><p/>'
+        "</root>"
+    )
+    result = parse(xml, process_xsi_nil=True, force_list=("p",))
+    assert result["root"]["p"] == [Nil, "x", None]
+
+
+def test_nil_with_process_namespaces_enabled():
+    xml = (
+        '<root xmlns:p="http://p.example/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        '<p:phone xsi:nil="true"/>'
+        '<plain xsi:nil="true"/>'
+        '<other nil="true"/>'
+        "</root>"
+    )
+    result = parse(xml, process_namespaces=True, process_xsi_nil=True)
+    assert result["root"]["http://p.example/:phone"] is Nil
+    assert result["root"]["plain"] is Nil
+    assert result["root"]["other"] == {"@nil": "true"}
+
+
+def test_nil_streaming_emits_sentinel():
+    xml = f'<r {XSI_DECL}><p xsi:nil="true"/></r>'
+    items = []
+    parse(
+        xml,
+        item_depth=2,
+        item_callback=lambda path, item: items.append(item) or True,
+        process_xsi_nil=True,
+    )
+    assert items == [Nil]
+
+
+def test_nil_streaming_conflict_raises():
+    xml = f'<r {XSI_DECL}><p xsi:nil="true">x</p></r>'
+    with pytest.raises(XSINilConflictError):
+        parse(
+            xml,
+            item_depth=2,
+            item_callback=lambda path, item: True,
+            process_xsi_nil=True,
+        )
+
+
+def test_nil_nested_scope_restoration():
+    # The rebound prefix inside <wrap> must not leak to the sibling <after>.
+    xml = (
+        f'<root {XSI_DECL}>'
+        '<wrap xmlns:xsi="http://other.example/">'
+        '<a xsi:nil="true"/>'
+        "</wrap>"
+        '<after xsi:nil="true"/>'
+        "</root>"
+    )
+    result = parse(xml, process_xsi_nil=True)
+    assert result["root"]["wrap"]["a"] is not Nil
+    assert result["root"]["after"] is Nil
+

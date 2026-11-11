@@ -127,6 +127,54 @@ $ gunzip enwiki.dicts.gz | script2.py
 ...
 ```
 
+## Explicit nil (`xsi:nil`)
+
+Incremental-sync payloads need to tell three different "no value" cases apart.
+Pass `process_xsi_nil=True` to `parse()` and an element carrying the
+namespaced `xsi:nil="true"` attribute is collapsed to the module-level `Nil`
+sentinel instead of `None`, so downstream code never has to inspect attribute
+dictionaries:
+
+* `<phone/>` → `None` — the element is present but was left blank.
+* a missing `phone` key — the element is absent from the document.
+* `<phone xsi:nil="true"/>` → `xmltodict.Nil` — the stored value is being
+  explicitly cleared.
+
+```python
+>>> import xmltodict
+>>> xml = '''<contact xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+...   <phone/>
+...   <email xsi:nil="true"/>
+... </contact>'''
+>>> doc = xmltodict.parse(xml, process_xsi_nil=True)
+>>> doc['contact']['phone'] is None
+True
+>>> doc['contact']['email'] is xmltodict.Nil
+True
+>>> 'missing' in doc['contact']
+False
+```
+
+Only an attribute in the `xsi_namespace`
+(`http://www.w3.org/2001/XMLSchema-instance` by default) counts; an
+unprefixed `nil="true"` or an attribute in another namespace is left alone,
+and `xsi:nil="false"` does not produce a sentinel. A nilled element that also
+carries text or child elements is invalid and raises
+`xmltodict.XSINilConflictError`. A different marker can be supplied via
+`nil_sentinel`, and the recognized namespace via `xsi_namespace`.
+
+`unparse()` understands the same sentinel, so the explicit clear round-trips
+back into a properly namespaced `xsi:nil="true"` (the `xsi` prefix is
+declared automatically when it is not already in scope):
+
+```python
+>>> xmltodict.unparse(
+...     {"contact": {"phone": None, "email": xmltodict.Nil}},
+...     full_document=False,
+... )
+'<contact><phone></phone><email xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:nil="true"></email></contact>'
+```
+
 ## Roundtripping
 
 You can also convert in the other direction, using the `unparse()` method:
@@ -220,6 +268,9 @@ Parse XML input into a Python dictionary.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
+- `process_xsi_nil=False`: When True, elements with a namespaced `xsi:nil="true"` attribute collapse to the `nil_sentinel` (the module-level `Nil` object) rather than `None`, distinguishing an explicit clear from a blank element or a missing key. Raises `XSINilConflictError` if such an element also has content.
+- `xsi_namespace='http://www.w3.org/2001/XMLSchema-instance'`: Namespace URI that the `nil` attribute must belong to for `process_xsi_nil` to apply.
+- `nil_sentinel=Nil`: Marker placed in the dict for an explicitly nil element. Use the same object with `unparse()` for round-tripping.
 
 ### xmltodict.unparse()
 
@@ -237,6 +288,9 @@ Convert a Python dictionary back into XML.
 - `indent='\t'`: Indentation string for pretty printing. May also be an integer number of spaces.
 - `newl='\n'`: Newline character for pretty printing.
 - `expand_iter=None`: Tag name to use for items in nested lists (breaks roundtripping).
+- `nil_sentinel=Nil`: Value that marks an explicitly nil element. It is emitted as an empty element carrying `nil_attribute="true"`, with the required namespace prefix declared automatically when not already in scope. Raises `XSINilConflictError` if the same node also has content.
+- `xsi_namespace='http://www.w3.org/2001/XMLSchema-instance'`: Namespace URI bound to the nil attribute's prefix.
+- `nil_attribute='xsi:nil'`: Attribute name emitted on nil elements; use a colon-less name (for example `'nil'`) to emit no namespace declaration.
 
 > **Note:** When building XML from dictionaries, keys whose values are empty
 > lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a

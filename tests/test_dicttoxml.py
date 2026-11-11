@@ -1,4 +1,5 @@
 from xmltodict import parse, unparse
+from xmltodict import Nil, XSINilConflictError, XSI_NAMESPACE
 import pytest
 import re
 from textwrap import dedent
@@ -778,3 +779,116 @@ def test_pretty_print_top_level_comment_with_int_indent():
     <!--top-->
     <a>1</a>''')
     assert xml == unparse(obj, pretty=True, indent=4)
+
+
+# ---------------------------------------------------------------------------
+# xsi:nil handling (nil_sentinel / Nil)
+# ---------------------------------------------------------------------------
+
+XSI_ATTR = 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+
+
+def test_unparse_nil_scalar_emits_xsi_nil():
+    xml = unparse({"phone": Nil}, full_document=False)
+    assert xml == f'<phone {XSI_ATTR} xsi:nil="true"></phone>'
+
+
+def test_unparse_distinguishes_none_from_nil():
+    xml = unparse(
+        {"root": {"phone": None, "email": Nil}},
+        full_document=False,
+    )
+    assert xml == (
+        "<root>"
+        "<phone></phone>"
+        f'<email {XSI_ATTR} xsi:nil="true"></email>'
+        "</root>"
+    )
+
+
+def test_unparse_nil_with_short_empty_elements():
+    xml = unparse({"phone": Nil}, full_document=False,
+                  short_empty_elements=True)
+    assert xml == f'<phone {XSI_ATTR} xsi:nil="true"/>'
+
+
+def test_unparse_nil_in_list():
+    xml = unparse({"r": {"p": [Nil, "x", None]}}, full_document=False)
+    assert f'<p {XSI_ATTR} xsi:nil="true"></p>' in xml
+    assert "<p>x</p>" in xml
+    assert "<p></p>" in xml
+    result = parse(xml, process_xsi_nil=True)
+    assert result["r"]["p"] == [Nil, "x", None]
+
+
+def test_unparse_nil_roundtrip():
+    obj = {"root": {"phone": None, "email": Nil, "name": "bob"}}
+    xml = unparse(obj, full_document=False)
+    assert parse(xml, process_xsi_nil=True) == obj
+
+
+def test_unparse_nil_declares_namespace_once_when_inherited():
+    obj = {"r": {"@xmlns": {"xsi": XSI_NAMESPACE}, "a": Nil, "b": Nil}}
+    xml = unparse(obj, full_document=False)
+    assert xml == (
+        f'<r {XSI_ATTR}>'
+        '<a xsi:nil="true"></a>'
+        '<b xsi:nil="true"></b>'
+        "</r>"
+    )
+    assert xml.count(XSI_ATTR) == 1
+
+
+def test_unparse_nil_in_deep_chain_declares_on_element():
+    obj = {"r": {"b": {"c": {"d": Nil}}}}
+    xml = unparse(obj, full_document=False)
+    assert xml == (
+        "<r><b><c>"
+        f'<d {XSI_ATTR} xsi:nil="true"></d>'
+        "</c></b></r>"
+    )
+
+
+def test_unparse_nil_keeps_ordinary_attributes():
+    obj = {"phone": {"#text": Nil, "@id": "7"}}
+    xml = unparse(obj, full_document=False)
+    assert xml == f'<phone id="7" {XSI_ATTR} xsi:nil="true"></phone>'
+    assert parse(xml, process_xsi_nil=True)["phone"] is Nil
+
+
+def test_unparse_nil_with_child_element_conflicts():
+    with pytest.raises(XSINilConflictError):
+        unparse({"phone": {"#text": Nil, "sub": "y"}}, full_document=False)
+
+
+def test_unparse_custom_sentinel_and_nil_attribute():
+    class ClearMarker:
+        pass
+
+    marker = ClearMarker()
+    xml = unparse(
+        {"phone": marker},
+        full_document=False,
+        nil_sentinel=marker,
+        nil_attribute="i:nil",
+    )
+    assert xml == (
+        '<phone xmlns:i="http://www.w3.org/2001/XMLSchema-instance" '
+        'i:nil="true"></phone>'
+    )
+
+
+def test_unparse_nil_rebinds_wrong_ancestor_namespace():
+    # The ancestor binds xsi to another URI; the nil element must rebind it
+    # locally so the explicit clear stays a correctly namespaced xsi:nil.
+    obj = {
+        "r": {
+            "@xmlns": {"xsi": "http://other.example/"},
+            "p": Nil,
+        }
+    }
+    xml = unparse(obj, full_document=False)
+    assert 'xmlns:xsi="http://other.example/"' in xml
+    assert f'<p {XSI_ATTR} xsi:nil="true"></p>' in xml
+    assert parse(xml, process_xsi_nil=True)["r"]["p"] is Nil
+
