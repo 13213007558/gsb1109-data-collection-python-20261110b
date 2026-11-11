@@ -778,3 +778,34 @@ def test_pretty_print_top_level_comment_with_int_indent():
     <!--top-->
     <a>1</a>''')
     assert xml == unparse(obj, pretty=True, indent=4)
+
+
+def test_unparse_mixed_content_roundtrip():
+    xml = '<p>请在<em>周五</em>前<em>提交</em>原件</p>'
+    obj = parse(xml, preserve_mixed_content=True)
+    assert _strip(unparse(obj)) == xml
+
+
+def test_unparse_mixed_content_edit_single_segment():
+    obj = parse('<p>请在<em>周五</em>前<em>提交</em>原件</p>',
+                preserve_mixed_content=True)
+    obj['p']['#content'][3]['em'] = '递交'
+    assert _strip(unparse(obj)) == '<p>请在<em>周五</em>前<em>递交</em>原件</p>'
+
+
+def test_unparse_mixed_content_with_attributes():
+    obj = {'p': {'@class': 'notice',
+                 '#content': ['请在', {'em': '周五'}, '前']}}
+    assert _strip(unparse(obj)) == '<p class="notice">请在<em>周五</em>前</p>'
+
+
+def test_unparse_mixed_content_custom_key():
+    obj = {'p': {'#mixed': ['x', {'em': 'y'}, 'z']}}
+    assert unparse(obj, full_document=False,
+                   mixed_content_key='#mixed') == '<p>x<em>y</em>z</p>'
+
+
+def test_unparse_mixed_content_pretty_keeps_text_untouched():
+    obj = parse('<p>请在<em>周五</em>前</p>', preserve_mixed_content=True)
+    xml = unparse(obj, pretty=True)
+    assert '请在<em>周五</em>前' in xml

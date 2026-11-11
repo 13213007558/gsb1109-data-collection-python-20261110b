@@ -220,6 +220,8 @@ Parse XML input into a Python dictionary.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
+- `preserve_mixed_content=False`: Preserve the order of mixed content (text interleaved with child elements). When True, an element containing both text and child elements stores its content under `mixed_content_key` as an ordered list of text strings and single-key dicts (`{child_name: child_value}`), so `unparse` can rebuild the original node positions. Off by default; plain key-value output is unchanged.
+- `mixed_content_key='#content'`: Key under which ordered mixed content is stored when `preserve_mixed_content=True`. Also accepted by `unparse` to emit such lists in document order.
 
 ### xmltodict.unparse()
 
@@ -243,7 +245,7 @@ Convert a Python dictionary back into XML.
 > placeholder child (for example, `{'a': ['']}`) if an explicit empty container
 > element is required in the output.
 
-Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, mixed content ordering, multiple top-level comments). For exact fidelity, use a full XML library such as lxml.
+Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, multiple top-level comments). Mixed content ordering can be preserved by opting into `preserve_mixed_content=True`; for anything beyond that, use a full XML library such as lxml.
 
 ## Examples
 

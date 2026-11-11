@@ -29,10 +29,13 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        preserve_mixed_content=False,
+        mixed_content_key="#content",
     ):
         self.path = []
         self.stack = []
         self.data = []
+        self.segments = []
         self.item = None
         self.item_depth = item_depth
         self.xml_attribs = xml_attribs
@@ -49,6 +52,8 @@ class _DictSAXHandler:
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        self.preserve_mixed_content = preserve_mixed_content
+        self.mixed_content_key = mixed_content_key
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -84,7 +89,7 @@ class _DictSAXHandler:
             self.namespace_declarations = self.dict_constructor()
         self.path.append((name, attrs or None))
         if len(self.path) >= self.item_depth:
-            self.stack.append((self.item, self.data))
+            self.stack.append((self.item, self.data, self.segments))
             if self.xml_attribs:
                 attr_entries = []
                 for key, value in attrs.items():
@@ -100,6 +105,7 @@ class _DictSAXHandler:
                 attrs = None
             self.item = attrs or None
             self.data = []
+            self.segments = []
 
     def endElement(self, full_name):
         name = self._build_name(full_name)
@@ -119,6 +125,7 @@ class _DictSAXHandler:
                     self.push_data(item, self.cdata_key, data)
             else:
                 item = data
+            item = self._finalize_mixed(item, self.segments)
 
             should_continue = self.item_callback(self.path, item)
             if not should_continue:
@@ -126,17 +133,19 @@ class _DictSAXHandler:
             # Reset state for the parent context without keeping a reference to
             # the emitted item.
             if self.stack:
-                self.item, self.data = self.stack.pop()
+                self.item, self.data, self.segments = self.stack.pop()
             else:
                 self.item = None
                 self.data = []
+                self.segments = []
             self.path.pop()
             return
         if self.stack:
             data = (None if not self.data
                     else self.cdata_separator.join(self.data))
             item = self.item
-            self.item, self.data = self.stack.pop()
+            segments = self.segments
+            self.item, self.data, self.segments = self.stack.pop()
             if self.strip_whitespace and data:
                 data = data.strip() or None
             if data and self._should_force_cdata(name, data) and item is None:
@@ -144,12 +153,14 @@ class _DictSAXHandler:
             if item is not None:
                 if data:
                     self.push_data(item, self.cdata_key, data)
+                item = self._finalize_mixed(item, segments)
                 self.item = self.push_data(self.item, name, item)
             else:
                 self.item = self.push_data(self.item, name, data)
         else:
             self.item = None
             self.data = []
+            self.segments = []
         self.path.pop()
 
     def characters(self, data):
@@ -157,6 +168,11 @@ class _DictSAXHandler:
             self.data = [data]
         else:
             self.data.append(data)
+        if self.preserve_mixed_content:
+            if self.segments and isinstance(self.segments[-1], str):
+                self.segments[-1] += data
+            else:
+                self.segments.append(data)
 
     def comments(self, data):
         if self.strip_whitespace:
@@ -182,7 +198,37 @@ class _DictSAXHandler:
                 item[key] = [data]
             else:
                 item[key] = data
+        if (self.preserve_mixed_content
+                and key != self.cdata_key and key != self.comment_key):
+            self.segments.append((key, data))
         return item
+
+    def _finalize_mixed(self, item, segments):
+        if not self.preserve_mixed_content:
+            return item
+        has_child = any(isinstance(segment, tuple) for segment in segments)
+        if not has_child:
+            return item
+        content = []
+        for segment in segments:
+            if isinstance(segment, tuple):
+                content.append({segment[0]: segment[1]})
+                continue
+            text = segment.strip() if self.strip_whitespace else segment
+            if text:
+                content.append(text)
+        has_text = any(isinstance(entry, str) for entry in content)
+        if not has_text:
+            return item
+        mixed_item = self.dict_constructor()
+        if isinstance(item, dict):
+            for key, value in item.items():
+                if key == self.comment_key:
+                    mixed_item[key] = value
+                elif self.attr_prefix and key.startswith(self.attr_prefix):
+                    mixed_item[key] = value
+        mixed_item[self.mixed_content_key] = content
+        return mixed_item
 
     def _should_force_list(self, key, value):
         if not self.force_list:
@@ -342,6 +388,26 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         at the default `True`, comments will have leading and trailing
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
+
+    If `preserve_mixed_content` is `True`, elements that interleave text and
+    child elements keep their content in document order under
+    `mixed_content_key` (default=`'#content'`): an ordered list whose entries
+    are either text strings or single-key dicts of the form
+    `{child_name: child_value}`. Attributes still appear with the `@` prefix.
+    Elements without mixed content keep the regular structure, and the option
+    is off by default so existing key-value consumers are unaffected.
+
+        For example, given this input:
+        <p>请在<em>周五</em>前<em>提交</em>原件</p>
+
+        If called with `preserve_mixed_content=True`, it will produce
+        this dictionary:
+        {'p': {'#content': ['请在', {'em': '周五'}, '前',
+                            {'em': '提交'}, '原件']}}
+
+        Edit one segment in place (e.g. `doc['p']['#content'][3]['em'] =
+        '递交'`) and `unparse` will rebuild the document with every other
+        text run and node back in its original position.
     """
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
                               **kwargs)
@@ -461,7 +527,8 @@ def _emit(key, value, content_handler,
           expand_iter=None,
           encoding='utf-8',
           bytes_errors='replace',
-          comment_key='#comment'):
+          comment_key='#comment',
+          mixed_content_key='#content'):
     if isinstance(key, str) and key == comment_key:
         comments_list = value if isinstance(value, list) else [value]
         if isinstance(indent, int):
@@ -506,7 +573,11 @@ def _emit(key, value, content_handler,
         cdata = None
         attrs = {}
         children = []
+        mixed_content = None
         for ik, iv in v.items():
+            if ik == mixed_content_key:
+                mixed_content = iv if isinstance(iv, list) else [iv]
+                continue
             if ik == cdata_key:
                 if iv is None:
                     cdata = None
@@ -540,7 +611,7 @@ def _emit(key, value, content_handler,
         if pretty:
             content_handler.ignorableWhitespace(depth * indent)
         content_handler.startElement(key, AttributesImpl(attrs))
-        if pretty and children:
+        if pretty and children and mixed_content is None:
             content_handler.ignorableWhitespace(newl)
         for child_key, child_value in children:
             _emit(child_key, child_value, content_handler,
@@ -548,10 +619,28 @@ def _emit(key, value, content_handler,
                   pretty, newl, indent, namespaces=namespaces,
                   namespace_separator=namespace_separator,
                   expand_iter=expand_iter, encoding=encoding,
-                  bytes_errors=bytes_errors, comment_key=comment_key)
+                  bytes_errors=bytes_errors, comment_key=comment_key,
+                  mixed_content_key=mixed_content_key)
+        if mixed_content is not None:
+            for entry in mixed_content:
+                if isinstance(entry, dict):
+                    for child_key, child_value in entry.items():
+                        _emit(child_key, child_value, content_handler,
+                              attr_prefix, cdata_key, depth+1, preprocessor,
+                              False, newl, indent, namespaces=namespaces,
+                              namespace_separator=namespace_separator,
+                              expand_iter=expand_iter, encoding=encoding,
+                              bytes_errors=bytes_errors,
+                              comment_key=comment_key,
+                              mixed_content_key=mixed_content_key)
+                elif entry is not None:
+                    content_handler.characters(
+                        _convert_value_to_string(
+                            entry, encoding=encoding,
+                            bytes_errors=bytes_errors))
         if cdata is not None:
             content_handler.characters(cdata)
-        if pretty and children:
+        if pretty and children and mixed_content is None:
             content_handler.ignorableWhitespace(depth * indent)
         content_handler.endElement(key)
         if pretty and depth:
@@ -579,6 +668,12 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
     Empty lists are omitted entirely: ``{"a": []}`` produces no ``<a>`` element.
     Provide a placeholder entry (for example ``{"a": [""]}``) when an explicit
     empty container element must be emitted.
+
+    A list stored under `mixed_content_key` (default=`'#content'`) is emitted
+    in document order: string entries become character data and single-key
+    dict entries become child elements, so documents parsed with
+    `preserve_mixed_content=True` round-trip with text runs and nodes back in
+    their original positions.
 
     The `pretty` parameter (default=`False`) enables pretty-printing. In this
     mode, lines are terminated with `'\n'` and indented with `'\t'`, but this

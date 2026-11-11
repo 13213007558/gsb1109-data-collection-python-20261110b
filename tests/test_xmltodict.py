@@ -720,3 +720,85 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+def test_preserve_mixed_content():
+    xml = '<p>请在<em>周五</em>前<em>提交</em>原件</p>'
+    expected = {
+        'p': {
+            '#content': [
+                '请在',
+                {'em': '周五'},
+                '前',
+                {'em': '提交'},
+                '原件',
+            ]
+        }
+    }
+    assert parse(xml, preserve_mixed_content=True) == expected
+
+
+def test_preserve_mixed_content_default_off():
+    xml = '<p>请在<em>周五</em>前<em>提交</em>原件</p>'
+    assert parse(xml) == {'p': {'em': ['周五', '提交'], '#text': '请在前原件'}}
+
+
+def test_preserve_mixed_content_with_attributes():
+    xml = '<p class="notice">请在<em>周五</em>前</p>'
+    expected = {
+        'p': {
+            '@class': 'notice',
+            '#content': ['请在', {'em': '周五'}, '前'],
+        }
+    }
+    assert parse(xml, preserve_mixed_content=True) == expected
+
+
+def test_preserve_mixed_content_nested_elements():
+    xml = '<p>开始<b>粗<i>斜</i>尾</b>结束</p>'
+    expected = {
+        'p': {
+            '#content': [
+                '开始',
+                {'b': {'#content': ['粗', {'i': '斜'}, '尾']}},
+                '结束',
+            ]
+        }
+    }
+    assert parse(xml, preserve_mixed_content=True) == expected
+
+
+def test_preserve_mixed_content_children_only_unchanged():
+    xml = '<a><b>1</b><b>2</b></a>'
+    assert parse(xml, preserve_mixed_content=True) == {'a': {'b': ['1', '2']}}
+
+
+def test_preserve_mixed_content_text_only_unchanged():
+    assert parse('<a>data</a>', preserve_mixed_content=True) == {'a': 'data'}
+
+
+def test_preserve_mixed_content_whitespace_not_mixed():
+    xml = '<a>\n  <b>1</b>\n  <b>2</b>\n</a>'
+    assert parse(xml, preserve_mixed_content=True) == {'a': {'b': ['1', '2']}}
+
+
+def test_preserve_mixed_content_custom_key():
+    xml = '<p>x<em>y</em>z</p>'
+    result = parse(xml, preserve_mixed_content=True, mixed_content_key='#mixed')
+    assert result == {'p': {'#mixed': ['x', {'em': 'y'}, 'z']}}
+
+
+def test_preserve_mixed_content_streaming():
+    xml = '<root><p>a<em>b</em>c</p><p>d<em>e</em>f</p></root>'
+    items = []
+
+    def handler(path, item):
+        items.append(item)
+        return True
+
+    parse(xml, item_depth=2, item_callback=handler,
+          preserve_mixed_content=True)
+    assert items == [
+        {'#content': ['a', {'em': 'b'}, 'c']},
+        {'#content': ['d', {'em': 'e'}, 'f']},
+    ]
