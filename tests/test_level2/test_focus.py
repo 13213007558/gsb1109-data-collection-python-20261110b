@@ -1,4 +1,7 @@
 """Test focus selector."""
+import bs4
+
+import soupsieve as sv
 from .. import util
 
 
@@ -53,3 +56,14 @@ class TestFocus(util.TestCase):
             ["1", "2", "3", "4", "5", "6"],
             flags=util.HTML
         )
+
+    def test_focus_with_state(self):
+        """Test focus when the focused element is supplied explicitly."""
+
+        soup = bs4.BeautifulSoup(self.MARKUP, 'html.parser')
+        focused = soup.find(id='1')
+        rule = sv.compile('input:focus')
+
+        self.assertEqual(rule.select(soup, state=sv.InteractiveState(focused, hover=[])), [focused])
+        self.assertTrue(rule.match(focused, state=sv.InteractiveState(focused, hover=[])))
+        self.assertFalse(rule.match(soup.find(id='2'), state=sv.InteractiveState(focused, hover=[])))

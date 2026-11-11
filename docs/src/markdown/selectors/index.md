@@ -11,7 +11,10 @@ Soup Sieve aims to allow users to target XML/HTML elements with CSS selectors. I
 does not currently implement any pseudo elements and has no plans to do so. Soup Sieve also will not match anything for
 pseudo classes that are only relevant in a live, browser environment, but it will gracefully handle them if they've been
 implemented; such pseudo classes are non-applicable in the Beautiful Soup environment and are noted in [Non-Applicable
-Pseudo Classes](./unsupported.md#non-applicable-pseudo-classes).
+Pseudo Classes](./unsupported.md#non-applicable-pseudo-classes). The interactive pseudo classes (`#!css :focus`,
+`#!css :focus-visible`, `#!css :focus-within`, and `#!css :hover`) are an exception: the markup does not record focus or
+the pointer position, so they only match when the caller provides that information with an
+[`InteractiveState`](../api.md#interactive-state).
 
 When speaking about namespaces, they only apply to XML, XHTML, or when dealing with recognized foreign tags in HTML5.
 Currently, Beautiful Soup's `html5lib` parser is the only parser that will return the appropriate namespaces for a HTML5

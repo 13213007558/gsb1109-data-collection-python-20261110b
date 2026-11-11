@@ -3,6 +3,14 @@ icon: lucide/scroll-text
 ---
 # Changelog
 
+## 4.2
+
+-   **NEW**: The interactive pseudo classes `:focus`, `:focus-visible`, `:focus-within`, and `:hover` can now match
+    when the caller provides the focus and pointer state with an `InteractiveState` object through the new keyword-only
+    `state` argument of the matching functions and compiled methods. The state is supplied per call, so a compiled
+    selector stays shareable across sessions and threads, each with its own elements. Calls that provide no state keep
+    matching nothing for these pseudo classes instead of pretending that a browser ran.
+
 ## 4.1
 
 -   **NEW**: Soup Sieve is now thread safe, and this is now tested, including on free-threaded Python. This is assuming

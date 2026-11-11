@@ -62,6 +62,7 @@ AUTO_DIR_IGNORED_ELEMENTS = frozenset(('bdi', 'script', 'style', 'textarea'))
 
 DIR_FLAGS = ct.SEL_DIR_LTR | ct.SEL_DIR_RTL
 RANGES = ct.SEL_IN_RANGE | ct.SEL_OUT_OF_RANGE
+INTERACTIVE_FLAGS = ct.SEL_HOVER | ct.SEL_FOCUS | ct.SEL_FOCUS_VISIBLE | ct.SEL_FOCUS_WITHIN
 
 DIR_MAP = {
     'ltr': ct.SEL_DIR_LTR,
@@ -103,6 +104,77 @@ class TreeForms(NamedTuple):
     defaults: dict[int, bs4.Tag]
     # The last radio button with a `checked` attribute of each radio button group, by form owner and name
     checked: dict[tuple[int, str], bs4.Tag]
+
+
+class InteractiveState:
+    """
+    The interactive state of a document, as provided by the caller.
+
+    Beautiful Soup only stores the parsed markup, so it cannot know which element has focus or which elements the
+    pointer is hovering over. A caller that tracks this, such as an automation tool, provides the elements in each
+    state and the interactive pseudo classes are matched against them. Elements are tracked by `id()` as `bs4`
+    hashes tags by their content.
+    """
+
+    __slots__ = ('focus', 'focus_visible', 'hover')
+
+    focus: bs4.Tag | None
+    focus_visible: bs4.Tag | tuple[bs4.Tag, ...] | None
+    hover: tuple[bs4.Tag, ...]
+
+    def __init__(
+        self,
+        focus: bs4.Tag | None,
+        focus_visible: bs4.Tag | Iterable[bs4.Tag] | None = None,
+        hover: Iterable[bs4.Tag] | None = None
+    ) -> None:
+        """Validate the state elements and normalize the iterables into tuples."""
+
+        if focus is not None and not isinstance(focus, bs4.Tag):
+            raise TypeError(f"The focused element must be a Beautiful Soup 'Tag', not {type(focus)}")
+
+        if focus_visible is None:
+            visible: bs4.Tag | tuple[bs4.Tag, ...] | None = None
+        elif isinstance(focus_visible, bs4.Tag):
+            visible = focus_visible
+        elif isinstance(focus_visible, Iterable):
+            visible = tuple(focus_visible)
+        else:
+            raise TypeError(
+                "The 'focus_visible' elements must be a Beautiful Soup 'Tag' or an iterable of 'Tag' objects"
+            )
+
+        if hover is None:
+            hovered: tuple[bs4.Tag, ...] = ()
+        elif isinstance(hover, bs4.Tag):
+            # A tag is iterable (its children), so it must be wrapped instead of being iterated.
+            hovered = (hover,)
+        elif isinstance(hover, Iterable):
+            hovered = tuple(hover)
+        else:
+            raise TypeError("The 'hover' elements must be an iterable of Beautiful Soup 'Tag' objects")
+
+        visible_elements: tuple[bs4.Tag, ...]
+        if visible is None:
+            visible_elements = ()
+        elif isinstance(visible, tuple):
+            visible_elements = visible
+        else:
+            visible_elements = (visible,)
+        for element in (*visible_elements, *hovered):
+            if not isinstance(element, bs4.Tag):
+                raise TypeError(
+                    f"Interactive state elements must be Beautiful Soup 'Tag' objects, not {type(element)}"
+                )
+
+        self.focus = focus
+        self.focus_visible = visible
+        self.hover = hovered
+
+    def __repr__(self) -> str:
+        """Representation."""
+
+        return f'InteractiveState(focus={self.focus!r}, focus_visible={self.focus_visible!r}, hover={self.hover!r})'
 
 
 class _DocumentNav:
@@ -603,7 +675,8 @@ class CSSMatch(_DocumentNav):
         selectors: ct.SelectorList,
         scope: bs4.Tag | None,
         namespaces: ct.Namespaces | None,
-        flags: int
+        flags: int,
+        state: InteractiveState | None = None
     ) -> None:
         """Initialize."""
 
@@ -626,6 +699,25 @@ class CSSMatch(_DocumentNav):
         self.tree_cache: dict[int, bs4.Tag] = {}
         self.select_cache: dict[int, bs4.Tag | None] = {}
         self.index_cache: dict[int, dict[int, int]] = {}
+
+        # The interactive state is supplied per match, as it is not present in the parsed markup.
+        self.interactive = state is not None
+        if state is not None:
+            self.hover_ids: frozenset[int] = frozenset(id(el) for el in state.hover)
+            self.focus_id: int | None = id(state.focus) if state.focus is not None else None
+            if state.focus_visible is None:
+                # `:focus-visible` is not derivable from the markup, so without explicit elements it never matches.
+                self.focus_visible_ids: frozenset[int] = frozenset()
+            elif isinstance(state.focus_visible, bs4.Tag):
+                self.focus_visible_ids = frozenset((id(state.focus_visible),))
+            else:
+                self.focus_visible_ids = frozenset(id(el) for el in state.focus_visible)
+            focused = state.focus
+        else:
+            self.hover_ids = frozenset()
+            self.focus_id = None
+            self.focus_visible_ids = frozenset()
+            focused = None
 
         # Find the root element for the whole tree
         doc = scope
@@ -652,6 +744,15 @@ class CSSMatch(_DocumentNav):
         # A document can be both XML and HTML (XHTML)
         self.is_xml = self.is_xml_tree(doc)
         self.is_html = not self.is_xml or self.has_html_namespace
+
+        # `:focus-within` matches the focused element itself and every ancestor up to the document root.
+        # This is calculated last, as navigating parents depends on the document type flags above.
+        within: set[int] = set()
+        current: bs4.Tag | None = focused
+        while current is not None:
+            within.add(id(current))
+            current = self.get_parent(current)
+        self.focus_within_ids: frozenset[int] = frozenset(within)
 
     def reset(self) -> None:  # pragma: no cover
         """Reset."""
@@ -1225,6 +1326,24 @@ class CSSMatch(_DocumentNav):
         """Match element as scope."""
 
         return self.scope is el
+
+    def match_interactive(self, el: bs4.Tag, flags: int) -> bool:
+        """Match the interactive pseudo classes (`:hover`, `:focus`, `:focus-visible`, and `:focus-within`)."""
+
+        if not self.interactive:
+            # No state was supplied, so these pseudo classes cannot match without pretending to be a browser.
+            return False
+
+        element_id = id(el)
+        if flags & ct.SEL_HOVER and element_id not in self.hover_ids:
+            return False
+        if flags & ct.SEL_FOCUS and element_id != self.focus_id:
+            return False
+        if flags & ct.SEL_FOCUS_VISIBLE and element_id not in self.focus_visible_ids:
+            return False
+        if flags & ct.SEL_FOCUS_WITHIN and element_id not in self.focus_within_ids:
+            return False
+        return True
 
     def match_nth_tag_type(self, el: bs4.Tag, child: bs4.Tag) -> bool:
         """Match tag type for `nth` matches."""
@@ -1995,6 +2114,10 @@ class CSSMatch(_DocumentNav):
                 # Verify element is scope
                 if selector.flags & ct.SEL_SCOPE and not self.match_scope(el):
                     continue
+                # Verify interactive state (`:hover`, `:focus`, `:focus-visible`, and `:focus-within`)
+                interactive_flags = selector.flags & INTERACTIVE_FLAGS
+                if interactive_flags and not self.match_interactive(el, interactive_flags):
+                    continue
                 # Verify element has placeholder shown
                 if selector.flags & ct.SEL_PLACEHOLDER_SHOWN and not self.match_placeholder_shown(el):
                     continue
@@ -2123,17 +2246,22 @@ class SoupSieve(ct.Immutable):
             flags=flags
         )
 
-    def match(self, tag: bs4.Tag) -> bool:
+    def match(self, tag: bs4.Tag, *, state: InteractiveState | None = None) -> bool:
         """Match."""
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).match(tag)
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, state).match(tag)
 
-    def closest(self, tag: bs4.Tag) -> bs4.Tag | None:
+    def closest(self, tag: bs4.Tag, *, state: InteractiveState | None = None) -> bs4.Tag | None:
         """Match closest ancestor."""
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).closest()
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, state).closest()
 
-    def filter(self, iterable: Iterable[bs4.Tag]) -> list[bs4.Tag]:  # noqa A001
+    def filter(  # noqa A001
+        self,
+        iterable: Iterable[bs4.Tag],
+        *,
+        state: InteractiveState | None = None
+    ) -> list[bs4.Tag]:
         """
         Filter.
 
@@ -2146,26 +2274,41 @@ class SoupSieve(ct.Immutable):
         """
 
         if isinstance(iterable, bs4.Tag):
-            return CSSMatch(self.selectors, iterable, self.namespaces, self.flags).filter()
+            return CSSMatch(self.selectors, iterable, self.namespaces, self.flags, state).filter()
         else:
             # There is no guarantee that elements are from the same document, evaluate them separately.
-            return [node for node in iterable if not CSSMatch.is_navigable_string(node) and self.match(node)]
+            return [
+                node for node in iterable
+                if not CSSMatch.is_navigable_string(node) and self.match(node, state=state)
+            ]
 
-    def select_one(self, tag: bs4.Tag) -> bs4.Tag | None:
+    def select_one(self, tag: bs4.Tag, *, state: InteractiveState | None = None) -> bs4.Tag | None:
         """Select a single tag."""
 
-        tags = self.select(tag, limit=1)
+        tags = self.select(tag, limit=1, state=state)
         return tags[0] if tags else None
 
-    def select(self, tag: bs4.Tag, limit: int = 0) -> list[bs4.Tag]:
+    def select(
+        self,
+        tag: bs4.Tag,
+        limit: int = 0,
+        *,
+        state: InteractiveState | None = None
+    ) -> list[bs4.Tag]:
         """Select the specified tags."""
 
-        return list(self.iselect(tag, limit))
+        return list(self.iselect(tag, limit, state=state))
 
-    def iselect(self, tag: bs4.Tag, limit: int = 0) -> Iterator[bs4.Tag]:
+    def iselect(
+        self,
+        tag: bs4.Tag,
+        limit: int = 0,
+        *,
+        state: InteractiveState | None = None
+    ) -> Iterator[bs4.Tag]:
         """Iterate the specified tags."""
 
-        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags).select(limit)
+        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags, state).select(limit)
 
     def __repr__(self) -> str:  # pragma: no cover
         """Representation."""

@@ -541,8 +541,8 @@ class TestSoupSieve(util.TestCase):
     def test_pickle_null_and_selector(self):
         """Test pickling a selector list that mixes null selectors with real selectors."""
 
-        # `:focus` can never match, so the first selector is `ct.Null`, while the second is a real selector.
-        p1 = sv.compile('p:focus, div')
+        # `:target` can never match, so the first selector is `ct.Null`, while the second is a real selector.
+        p1 = sv.compile('p:target, div')
         self.assertTrue(p1.selectors[0] is sv.ct.Null)
         self.assertTrue(isinstance(p1.selectors[1], sv.ct.Selector))
 

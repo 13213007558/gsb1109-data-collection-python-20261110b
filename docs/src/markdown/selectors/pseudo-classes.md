@@ -417,6 +417,101 @@ soup.select('span:first-of-type')
 > [!tip] Additional Reading
 > https://developer.mozilla.org/en-US/docs/Web/CSS/:first-of-type
 
+## `#!css :focus`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:focus}
+
+Represents an element that has received focus.
+
+/// tab | Syntax
+```css
+:focus
+```
+///
+
+Beautiful Soup only stores the parsed markup, so it cannot know which element has focus or which elements the pointer
+is over. The interactive pseudo classes (`#!css :focus`, `#!css :focus-visible`, `#!css :focus-within`, and
+`#!css :hover`) therefore only match when the caller supplies the state explicitly with an
+[`InteractiveState`](../api.md#interactive-state) object. When no state is supplied, they match nothing rather than pretending
+that a browser ran.
+
+/// tab | Usage
+```py play
+from bs4 import BeautifulSoup as bs
+import soupsieve as sv
+html = """
+<html>
+<body>
+<input id="name" type="text">
+<input id="email" type="text">
+</body>
+</html>
+"""
+soup = bs(html, 'html5lib')
+name = soup.find(id='name')
+state = sv.InteractiveState(focus=name, hover=[])
+sv.select('input:focus', soup, state=state)
+```
+///
+
+> [!tip] Additional Reading
+> https://developer.mozilla.org/en-US/docs/Web/CSS/:focus
+
+## `#!css :focus-visible`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:focus-visible}
+
+Selects an element that matches `#!css :focus` while the user agent would make the focus evident on it. Whether focus is
+"visible" cannot be derived from the markup, so the matching elements must be provided through
+[`InteractiveState`](../api.md#interactive-state). When no `focus_visible` elements are given, the pseudo class matches nothing.
+
+/// tab | Syntax
+```css
+:focus-visible
+```
+///
+
+/// tab | Usage
+```py play
+from bs4 import BeautifulSoup as bs
+import soupsieve as sv
+html = """
+<html><body><input id="name" type="text"></body></html>
+"""
+soup = bs(html, 'html5lib')
+name = soup.find(id='name')
+state = sv.InteractiveState(name, focus_visible=name, hover=[])
+sv.select('input:focus-visible', soup, state=state)
+```
+///
+
+> [!tip] Additional Reading
+> https://developer.mozilla.org/en-US/docs/Web/CSS/:focus-visible
+
+## `#!css :focus-within`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:focus-within}
+
+Selects an element that has received focus, or an ancestor of the element that has received focus. The ancestors are
+resolved from the focused element supplied in the [`InteractiveState`](../api.md#interactive-state).
+
+/// tab | Syntax
+```css
+:focus-within
+```
+///
+
+/// tab | Usage
+```py play
+from bs4 import BeautifulSoup as bs
+import soupsieve as sv
+html = """
+<html><body><form id="form"><input id="name" type="text"></form></body></html>
+"""
+soup = bs(html, 'html5lib')
+name = soup.find(id='name')
+state = sv.InteractiveState(focus=name, hover=[])
+sv.select('form:focus-within', soup, state=state)
+```
+///
+
+> [!tip] Additional Reading
+> https://developer.mozilla.org/en-US/docs/Web/CSS/:focus-within
+
 ## `#!css :has()` {:#:has}
 
 Selects an element if any of the relative selectors passed as parameters (which are relative to the `:scope` of the
@@ -506,6 +601,36 @@ soup.select('div:has(span, > .class)')
 
 > [!tip] Additional Reading
 > https://developer.mozilla.org/en-US/docs/Web/CSS/:has
+
+## `#!css :hover`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:hover}
+
+Selects an element when the user interacts with it by hovering over it with a pointing device. Because the markup does
+not record the pointer position, the hover path is supplied with an [`InteractiveState`](../api.md#interactive-state) object. The
+elements on the path are the element under the pointer and every one of its ancestors up to the document root; each of
+them matches `#!css :hover`, just as in a browser.
+
+/// tab | Syntax
+```css
+:hover
+```
+///
+
+/// tab | Usage
+```py play
+from bs4 import BeautifulSoup as bs
+import soupsieve as sv
+html = """
+<html><body><p><a id="link" href="#">link</a></p></body></html>
+"""
+soup = bs(html, 'html5lib')
+link = soup.find(id='link')
+state = sv.InteractiveState(focus=None, hover=[link, soup.p, soup.body, soup.html])
+sv.select('a:hover', soup, state=state)
+```
+///
+
+> [!tip] Additional Reading
+> https://developer.mozilla.org/en-US/docs/Web/CSS/:hover
 
 ## `#!css :in-range`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:in-range}
 

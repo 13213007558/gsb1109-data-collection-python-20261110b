@@ -182,6 +182,37 @@ class TestThreads(util.TestCase):
 
         self.run_threads(check, compiled)
 
+    def test_interactive_state_is_per_call(self):
+        """Test that interactive state supplied per call stays isolated across threads sharing one compiled rule."""
+
+        soup = self.soup(MARKUP, 'html.parser')
+        inputs = soup.find_all('input')
+        self.assertTrue(inputs)
+        rule = sv.compile('input:focus')
+        barrier = threading.Barrier(THREADS)
+        errors = []
+
+        def worker(index):
+            barrier.wait()
+            stop = time.monotonic() + DURATION
+            focused = inputs[index % len(inputs)]
+            state = sv.InteractiveState(focused, hover=[])
+            while time.monotonic() < stop and not errors:
+                matched = rule.select(soup, state=state)
+                if matched != [focused]:
+                    errors.append(f'thread {index} matched {[id(el) for el in matched]}')
+                # A call without state must not inherit another thread's state.
+                if rule.select(soup):
+                    errors.append(f'thread {index} matched without supplying state')
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(THREADS)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+
     def test_lazy_pseudo_selectors(self):
         """Test that pseudo-classes defined by selectors are parsed once when they are first used in many threads."""
 

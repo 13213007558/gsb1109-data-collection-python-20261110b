@@ -50,37 +50,6 @@ currently "buffering".
 ```
 ///
 
-## `#!css :focus`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:focus}
-
-Represents an element that has received focus.
-
-/// tab | Syntax
-```css
-:focus
-```
-///
-
-## `#!css :focus-visible`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:focus-visible}
-
-Selects an element that matches `#!css :focus` and the user agent determines that the focus should be made evident on
-the element.
-
-/// tab | Syntax
-```css
-:focus-visible
-```
-///
-
-## `#!css :focus-within`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:focus-within}
-
-Selects an element that has received focus or contains an element that has received focus.
-
-/// tab | Syntax
-```css
-:focus-within
-```
-///
-
 ## `#!css :fullscreen`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon}:material-flask:{: title="Experimental" data-md-color-primary="purple" .icon} {:#:fullscreen}
 
 Selects an element that is currently in fullscreen mode.
@@ -121,16 +90,6 @@ list.
 /// tab | Syntax
 ```css
 :host-context(parent descendant)
-```
-///
-
-## `#!css :hover`:material-language-html5:{: title="HTML" data-md-color-primary="orange" .icon} {:#:hover}
-
-Selects an element when the user interacts with it by hovering over it with a pointing device.
-
-/// tab | Syntax
-```css
-:hover
 ```
 ///
 

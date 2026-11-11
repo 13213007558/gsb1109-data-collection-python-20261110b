@@ -109,7 +109,7 @@ sv.select('div:has(> p:has(+ .b + .c))', soup, flags=sv.NOSTRICT)
 ## `soupsieve.select_one()`
 
 ```py
-def select_one(select, tag, namespaces=None, flags=0, **kwargs):
+def select_one(select, tag, namespaces=None, flags=0, *, state=None, **kwargs):
     """Select the specified tags."""
 ```
 
@@ -127,7 +127,7 @@ sv.select_one('p:is(.a, .b, .c)', soup)
 ## `soupsieve.select()`
 
 ```py
-def select(select, tag, namespaces=None, limit=0, flags=0, **kwargs):
+def select(select, tag, namespaces=None, limit=0, flags=0, *, state=None, **kwargs):
     """Select the specified tags."""
 ```
 
@@ -145,7 +145,7 @@ sv.select('p:is(.a, .b, .c)', soup)
 ## `soupsieve.iselect()`
 
 ```py
-def iselect(select, node, namespaces=None, limit=0, flags=0, **kwargs):
+def iselect(select, node, namespaces=None, limit=0, flags=0, *, state=None, **kwargs):
     """Select the specified tags."""
 ```
 
@@ -154,7 +154,7 @@ def iselect(select, node, namespaces=None, limit=0, flags=0, **kwargs):
 ## `soupsieve.closest()`
 
 ```py
-def closest(select, tag, namespaces=None, flags=0, **kwargs):
+def closest(select, tag, namespaces=None, flags=0, *, state=None, **kwargs):
     """Match closest ancestor to the provided tag."""
 ```
 
@@ -167,7 +167,7 @@ dictionary, and `flags`.
 ## `soupsieve.match()`
 
 ```py
-def match(select, tag, namespaces=None, flags=0, **kwargs):
+def match(select, tag, namespaces=None, flags=0, *, state=None, **kwargs):
     """Match node."""
 ```
 
@@ -185,7 +185,7 @@ sv.match('p:not(.b)', nodes[1])
 ## `soupsieve.filter()`
 
 ```py
-def filter(select, nodes, namespaces=None, flags=0, **kwargs):
+def filter(select, nodes, namespaces=None, flags=0, *, state=None, **kwargs):
     """Filter list of nodes."""
 ```
 
@@ -234,24 +234,64 @@ selector functions available via the module without the need to specify the sele
 class SoupSieve:
     """Match tags in Beautiful Soup with CSS selectors."""
 
-    def match(self, tag):
+    def match(self, tag, *, state=None):
         """Match."""
 
-    def closest(self, tag):
+    def closest(self, tag, *, state=None):
         """Match closest ancestor."""
 
-    def filter(self, iterable):
+    def filter(self, iterable, *, state=None):
         """Filter."""
 
-    def select_one(self, tag):
+    def select_one(self, tag, *, state=None):
         """Select a single tag."""
 
-    def select(self, tag, limit=0):
+    def select(self, tag, limit=0, *, state=None):
         """Select the specified tags."""
 
-    def iselect(self, tag, limit=0):
+    def iselect(self, tag, limit=0, *, state=None):
         """Iterate the specified tags."""
 ```
+
+## Interactive State
+
+The parsed markup never records which element has focus or where the pointer is, so the interactive pseudo classes
+`#!css :focus`, `#!css :focus-visible`, `#!css :focus-within`, and `#!css :hover` only match when the caller supplies
+that information with an `InteractiveState` object. A caller that drives or observes an interactive document, such as a
+browser automation tool, is expected to track the state and provide it on each matching call.
+
+`InteractiveState` takes the focused element, the elements that match `#!css :focus-visible`, and the elements on the
+pointer's hover path. The hover path runs from the element under the pointer up to the document root. The
+`focus_visible` and `hover` arguments accept any iterable of tags and are normalized to tuples; they default to no
+elements.
+
+```py play session="state"
+from bs4 import BeautifulSoup
+import soupsieve as sv
+
+soup = BeautifulSoup('<form><input id="name" type="text"></form>', 'html5lib')
+name = soup.find(id='name')
+state = sv.InteractiveState(focus=name, focus_visible=name, hover=[name, soup.form, soup.body, soup.html])
+sv.select('input:focus', soup, state=state)
+sv.select('form:focus-within', soup, state=state)
+```
+
+The state is passed through the keyword-only `state` argument of every matching function and compiled method. It is not
+part of the compiled selector, so one compiled pattern can be shared while each call supplies its own state, including
+from different threads. When `state` is omitted, the interactive pseudo classes match nothing, preserving the behavior
+of existing code without pretending that a browser ran.
+
+```py play session="state"
+rule = sv.compile('input:hover')
+# No state is supplied, so nothing matches.
+rule.select(soup)
+# The same compiled rule matches once a hover path is supplied for this call.
+rule.select(soup, state=sv.InteractiveState(focus=None, hover=[name]))
+```
+
+`#!css :focus-within` matches the focused element and every one of its ancestors, and `#!css :focus-visible` matches only
+the elements given explicitly; neither can be inferred from the focused element or the markup alone. Passing elements
+of the wrong type raises a `TypeError`.
 
 ## `soupsieve.purge()`
 

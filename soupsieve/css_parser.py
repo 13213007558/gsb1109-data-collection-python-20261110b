@@ -74,13 +74,9 @@ PSEUDO_SIMPLE_NO_MATCH = {
     ':autofill',
     ':buffering',
     ':current',
-    ':focus',
-    ':focus-visible',
-    ':focus-within',
     ':fullscreen',
     ':future',
     ':host',
-    ':hover',
     ':local-link',
     ':past',
     ':paused',
@@ -94,6 +90,15 @@ PSEUDO_SIMPLE_NO_MATCH = {
     ':user-invalid',
     ':volume-locked',
     ':visited'
+}
+
+# Interactive pseudo classes that are only matched when the caller explicitly provides the
+# focus and hover state of the elements being matched.
+PSEUDO_INTERACTIVE = {
+    ':focus': ct.SEL_FOCUS,
+    ':focus-visible': ct.SEL_FOCUS_VISIBLE,
+    ':focus-within': ct.SEL_FOCUS_WITHIN,
+    ':hover': ct.SEL_HOVER
 }
 
 # Attributes whose values are matched case insensitively on HTML elements in HTML documents
@@ -136,7 +141,10 @@ PSEUDO_SPECIAL = {
     ':nth-of-type'
 }
 
-PSEUDO_SUPPORTED = PSEUDO_SIMPLE | PSEUDO_SIMPLE_NO_MATCH | PSEUDO_COMPLEX | PSEUDO_COMPLEX_NO_MATCH | PSEUDO_SPECIAL
+PSEUDO_SUPPORTED = (
+    PSEUDO_SIMPLE | PSEUDO_SIMPLE_NO_MATCH | PSEUDO_INTERACTIVE.keys() |
+    PSEUDO_COMPLEX | PSEUDO_COMPLEX_NO_MATCH | PSEUDO_SPECIAL
+)
 
 # Sub-patterns parts
 # Whitespace
@@ -1034,6 +1042,9 @@ class CSSParser:
         elif complex_pseudo and pseudo in PSEUDO_COMPLEX_NO_MATCH:
             context = self.parse_pseudo_open(pseudo, m.end(0))
             sel.no_match = True
+            has_selector = True
+        elif not complex_pseudo and pseudo in PSEUDO_INTERACTIVE:
+            sel.flags |= PSEUDO_INTERACTIVE[pseudo]
             has_selector = True
         elif not complex_pseudo and pseudo in PSEUDO_SIMPLE_NO_MATCH:
             sel.no_match = True
