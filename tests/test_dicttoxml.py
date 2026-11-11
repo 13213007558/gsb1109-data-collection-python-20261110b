@@ -1,7 +1,14 @@
 from xmltodict import parse, unparse
 import pytest
 import re
+from io import BytesIO, StringIO
 from textwrap import dedent
+
+from xmltodict import (
+    IncompleteExportError,
+    StreamingUnparser,
+    stream_unparse,
+)
 
 _HEADER_RE = re.compile(r'^[^\n]*\n')
 
@@ -778,3 +785,257 @@ def test_pretty_print_top_level_comment_with_int_indent():
     <!--top-->
     <a>1</a>''')
     assert xml == unparse(obj, pretty=True, indent=4)
+
+
+# ---------------------------------------------------------------------------
+# Streaming export (StreamingUnparser / stream_unparse)
+# ---------------------------------------------------------------------------
+
+def _stream(records, root_key="records", **kwargs):
+    output = BytesIO()
+    with StreamingUnparser(output, root_key, **kwargs) as exporter:
+        for record in records:
+            exporter.item(record)
+    return output.getvalue().decode("utf-8")
+
+
+def test_streaming_basic_export_and_roundtrip():
+    records = [
+        {"record": {"id": "1", "name": "a"}},
+        {"record": {"id": "2", "name": "b"}},
+    ]
+    xml = _stream(records)
+    assert xml == (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<records>'
+        '<record><id>1</id><name>a</name></record>'
+        '<record><id>2</id><name>b</name></record>'
+        '</records>'
+    )
+    assert parse(xml) == {
+        "records": {
+            "record": [
+                {"id": "1", "name": "a"},
+                {"id": "2", "name": "b"},
+            ]
+        }
+    }
+
+
+def test_streaming_matches_unparse_compact_and_pretty():
+    bodies = [
+        {"@id": "1", "#text": "first"},
+        {"id": "2", "nested": {"k": ["a", "b"]}},
+        None,
+    ]
+    bulk = {"records": {"record": bodies}}
+
+    compact_stream = _stream(
+        [{"record": body} for body in bodies], short_empty_elements=True)
+    assert compact_stream == unparse(bulk, short_empty_elements=True)
+
+    pretty_stream = _stream(
+        [{"record": body} for body in bodies], pretty=True)
+    assert pretty_stream == unparse(bulk, pretty=True)
+
+
+def test_streaming_empty_collection_is_valid_document():
+    xml = _stream([])
+    assert xml == '<?xml version="1.0" encoding="utf-8"?>\n<records></records>'
+    # The empty document must parse cleanly back into an empty root.
+    assert parse(xml) == {"records": None}
+
+
+def test_streaming_empty_collection_short_empty_elements():
+    xml = _stream([], short_empty_elements=True)
+    assert _strip(xml) == "<records/>"
+
+
+def test_streaming_generator_source_does_not_buffer_records():
+    def records():
+        yield {"record": {"id": "1"}}
+        yield {"record": {"id": "2"}}
+
+    output = BytesIO()
+    stream_unparse(records(), output, "records")
+    assert parse(output.getvalue()) == {
+        "records": {"record": [{"id": "1"}, {"id": "2"}]}
+    }
+
+
+def test_streaming_writes_each_record_immediately():
+    output = BytesIO()
+    exporter = StreamingUnparser(output, "records")
+    exporter.item({"record": {"id": "1"}})
+    # The first record is already on the stream before the second is produced.
+    assert b"<record><id>1</id></record>" in output.getvalue()
+    exporter.item({"record": {"id": "2"}})
+    exporter.close()
+    assert output.getvalue().count(b"<record>") == 2
+
+
+def test_streaming_list_valued_record_emits_siblings():
+    xml = _stream([{"item": ["1", "2", "3"]}], root_key="root")
+    assert _strip(xml) == "<root><item>1</item><item>2</item><item>3</item></root>"
+
+
+def test_streaming_root_attributes():
+    xml = _stream(
+        [{"a": "1"}], root_key="root",
+        root_attrs={"version": "2", "flag": True})
+    assert _strip(xml) == '<root version="2" flag="true"><a>1</a></root>'
+
+
+def test_streaming_encoding_is_consistent_in_declaration_and_bytes():
+    output = BytesIO()
+    with StreamingUnparser(output, "root", encoding="iso-8859-1") as exporter:
+        exporter.item({"x": "café"})
+    raw = output.getvalue()
+    assert raw.startswith(b"<?xml version=\"1.0\" encoding=\"iso-8859-1\"?>")
+    assert "caf\xe9".encode("iso-8859-1") in raw
+    assert parse(raw) == {"root": {"x": "café"}}
+
+
+def test_streaming_namespaces_are_consistent_across_document():
+    namespaces = {"http://a.com/": "a"}
+    output = BytesIO()
+    with StreamingUnparser(
+        output, "http://a.com/:records",
+        root_attrs={"xmlns:a": "http://a.com/"},
+        namespaces=namespaces,
+    ) as exporter:
+        exporter.item({"http://a.com/:record": {"http://a.com/:id": "1"}})
+    xml = output.getvalue().decode()
+    assert xml == (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<a:records xmlns:a="http://a.com/">'
+        '<a:record><a:id>1</a:id></a:record>'
+        '</a:records>'
+    )
+    parse(xml)
+
+
+def test_streaming_comments():
+    output = BytesIO()
+    with StreamingUnparser(output, "root") as exporter:
+        exporter.comment("note")
+        exporter.item({"a": "1"})
+    assert _strip(output.getvalue().decode()) == "<root><!--note--><a>1</a></root>"
+
+
+def test_streaming_accepts_text_stream():
+    output = StringIO()
+    with StreamingUnparser(output, "root") as exporter:
+        exporter.item({"a": 1})
+    assert output.getvalue() == '<?xml version="1.0" encoding="utf-8"?>\n<root><a>1</a></root>'
+
+
+def test_streaming_does_not_close_caller_stream():
+    output = BytesIO()
+    exporter = StreamingUnparser(output, "root")
+    exporter.item({"a": 1})
+    exporter.close()
+    assert not output.closed
+    # The caller remains free to keep handling the stream.
+    output.write(b"after")
+
+
+def test_streaming_requires_output_stream():
+    with pytest.raises(ValueError, match="output stream is required"):
+        StreamingUnparser(None, "root")
+
+
+def test_streaming_requires_full_document():
+    with pytest.raises(ValueError, match="full_document=True"):
+        StreamingUnparser(BytesIO(), "root", full_document=False)
+
+
+def test_streaming_rejects_invalid_bytes_errors():
+    with pytest.raises(ValueError, match="Invalid bytes_errors handler"):
+        StreamingUnparser(BytesIO(), "root", bytes_errors="nope")
+
+
+def test_streaming_rejects_non_dict_record():
+    exporter = StreamingUnparser(BytesIO(), "root")
+    with pytest.raises(ValueError, match="record must be a dict"):
+        exporter.item("not-a-dict")
+    assert exporter.failed
+
+
+def test_streaming_unwritable_value_marks_export_incomplete():
+    output = BytesIO()
+    exporter = StreamingUnparser(output, "root")
+    exporter.item({"a": "1"})
+    with pytest.raises(ValueError):
+        exporter.item({"bad/name": "x"})
+    assert exporter.failed
+    with pytest.raises(IncompleteExportError):
+        exporter.close()
+    # The partial stream is missing the closing root tag.
+    assert b"</root>" not in output.getvalue()
+
+
+def test_streaming_context_manager_reports_incomplete_on_source_failure():
+    output = BytesIO()
+    exporter = None
+    with pytest.raises(RuntimeError, match="boom"):
+        with StreamingUnparser(output, "root") as exporter:
+            exporter.item({"a": "1"})
+            raise RuntimeError("boom")
+    assert exporter.failed
+    assert b"</root>" not in output.getvalue()
+
+
+def test_stream_unparse_wraps_source_failure_in_incomplete_export():
+    def failing_records():
+        yield {"a": "1"}
+        raise RuntimeError("source exploded")
+
+    output = BytesIO()
+    with pytest.raises(IncompleteExportError) as exc_info:
+        stream_unparse(failing_records(), output, "root")
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert b"<a>1</a>" in output.getvalue()
+    assert b"</root>" not in output.getvalue()
+
+
+def test_stream_unparse_empty_iterable_is_valid_document():
+    output = BytesIO()
+    stream_unparse(iter(()), output, "records")
+    xml = output.getvalue().decode()
+    assert parse(xml) == {"records": None}
+
+
+def test_streaming_close_is_idempotent():
+    output = BytesIO()
+    exporter = StreamingUnparser(output, "root")
+    exporter.item({"a": 1})
+    exporter.close()
+    assert exporter.closed
+    exporter.close()
+    assert output.getvalue().count(b"</root>") == 1
+
+
+def test_streaming_failed_export_never_emits_closing_root():
+    output = BytesIO()
+    exporter = StreamingUnparser(output, "root")
+    with pytest.raises(ValueError):
+        exporter.item({"bad name": "x"})
+    with pytest.raises(IncompleteExportError):
+        exporter.close()
+    # A second close does not change the outcome.
+    assert exporter.closed
+    assert b"</root>" not in output.getvalue()
+
+
+def test_streaming_cannot_write_after_close():
+    output = BytesIO()
+    exporter = StreamingUnparser(output, "root")
+    exporter.item({"a": 1})
+    exporter.close()
+    with pytest.raises(ValueError, match="already closed"):
+        exporter.item({"b": 2})
+    with pytest.raises(ValueError, match="already closed"):
+        exporter.comment("late")
+    # The finished document is untouched.
+    assert parse(output.getvalue()) == {"root": {"a": "1"}}

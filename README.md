@@ -194,6 +194,55 @@ Lists that are specified under a key in a dictionary use the key as a tag for ea
 </line>
 ```
 
+## Streaming export
+
+`unparse()` needs the whole document as one dictionary. When records are
+produced one at a time (for example by a page-by-page crawler or generator),
+use `StreamingUnparser` to write them straight into a single-rooted document
+without buffering every record in memory:
+
+```python
+import xmltodict
+
+with open("records.xml", "wb") as stream:
+    with xmltodict.StreamingUnparser(stream, "records") as exporter:
+        for page in crawl_pages():
+            for record in page:
+                exporter.item({"record": record})
+```
+
+Each item uses the same dictionary conventions as `unparse()` (the `@`
+attribute prefix, `#text`, comments, lists, namespaces). An export with no
+items still produces a valid document containing just the declaration and the
+empty root element. The output stream is owned by the caller and is never
+closed by the library.
+
+If a record cannot be written, or the data source fails halfway through, the
+document on the stream stays unfinished and the failure is signaled with
+`IncompleteExportError`, so an incomplete export can never be mistaken for a
+completed one:
+
+```python
+try:
+    with xmltodict.StreamingUnparser(stream, "records") as exporter:
+        for record in record_generator():
+            exporter.item({"record": record})
+except xmltodict.IncompleteExportError:
+    # The stream holds a partial document; decide how to handle it.
+    ...
+```
+
+The `stream_unparse()` helper wraps the common case of draining an iterable
+(including a generator) into a caller-provided stream:
+
+```python
+xmltodict.stream_unparse(
+    ({"record": record} for record in record_generator()),
+    stream,
+    "records",
+)
+```
+
 ## API Reference
 
 ### xmltodict.parse()
@@ -242,6 +291,40 @@ Convert a Python dictionary back into XML.
 > lists are skipped. For example, `{'a': []}` produces no `<a>` element. Add a
 > placeholder child (for example, `{'a': ['']}`) if an explicit empty container
 > element is required in the output.
+
+### xmltodict.StreamingUnparser()
+
+Stream records into one XML document one item at a time, without holding the
+whole document in memory. The caller opens and owns the output stream.
+
+- `output`: File-like object opened by the caller; it is written to but never closed.
+- `root_key`: Tag name of the single root element wrapping every record.
+- `root_attrs=None`: Mapping of attributes for the root element.
+- `encoding='utf-8'`: Encoding used both for the XML declaration and the bytes written.
+- `short_empty_elements=False`: Use short tags for empty elements (`<tag/>`).
+- `attr_prefix`, `cdata_key`, `comment_key`, `pretty`, `indent`, `newl`, `expand_iter`, `namespaces`, `namespace_separator`, `bytes_errors`: Same meaning as in `unparse()`.
+- `.item(record)`: Write one record (a dict in `unparse()` format, for example `{"record": {...}}`) as a root child.
+- `.comment(value)`: Write an XML comment as a root child.
+- `.close()`: Close the root element and finish the document; raises `IncompleteExportError` if an earlier write failed.
+- `.failed` / `.closed`: Status flags for callers managing the export manually.
+
+An export with no items is still a valid document (declaration plus the empty
+root). On any serialization failure or data-source error, the partial stream is
+left without a closing root tag and the incomplete state is reported via
+`IncompleteExportError` (chained to the underlying error where applicable).
+
+### xmltodict.stream_unparse()
+
+Convenience wrapper that drains an iterable (including a generator) of records
+into a caller-provided stream using `StreamingUnparser`. Accepts the same
+keyword arguments; raises `IncompleteExportError` if the iterable or a record
+fails mid-export.
+
+### exception xmltodict.IncompleteExportError
+
+Raised when a streaming export ends before the document was finished. The bytes
+already written to the stream do not form a well-formed XML document. The
+underlying error, when one exists, is available as the exception's `__cause__`.
 
 Note: xmltodict aims to cover the common 90% of cases. It does not preserve every XML nuance (attribute order, mixed content ordering, multiple top-level comments). For exact fidelity, use a full XML library such as lxml.
 

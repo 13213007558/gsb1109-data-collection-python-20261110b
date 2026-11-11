@@ -430,6 +430,51 @@ def _validate_comment(value):
     return value
 
 
+def _element_attrs_and_children(value, attr_prefix, cdata_key, namespaces,
+                                namespace_separator, encoding, bytes_errors):
+    """Split an element body dict into (cdata, attrs, children).
+
+    Shared by :func:`_emit` and :class:`StreamingUnparser` so that streaming
+    output applies exactly the same attribute, namespace and empty-list
+    handling as :func:`unparse`.
+    """
+    cdata = None
+    attrs = {}
+    children = []
+    for ik, iv in value.items():
+        if ik == cdata_key:
+            if iv is None:
+                cdata = None
+            else:
+                cdata = _convert_value_to_string(
+                    iv, encoding=encoding, bytes_errors=bytes_errors)
+            continue
+        if isinstance(ik, str) and ik.startswith(attr_prefix):
+            ik = _process_namespace(ik, namespaces, namespace_separator,
+                                    attr_prefix)
+            if ik == attr_prefix + 'xmlns' and isinstance(iv, dict):
+                for k, v in iv.items():
+                    _validate_name(k, "attribute")
+                    attr = 'xmlns{}'.format(f':{k}' if k else '')
+                    attrs[attr] = '' if v is None else _convert_value_to_string(
+                        v, encoding=encoding, bytes_errors=bytes_errors
+                    )
+                continue
+            if iv is None:
+                iv = ''
+            elif not isinstance(iv, str):
+                iv = _convert_value_to_string(
+                    iv, encoding=encoding, bytes_errors=bytes_errors)
+            attr_name = ik[len(attr_prefix):]
+            _validate_name(attr_name, "attribute")
+            attrs[attr_name] = iv
+            continue
+        if isinstance(iv, list) and not iv:
+            continue  # Skip empty lists to avoid creating empty child elements
+        children.append((ik, iv))
+    return cdata, attrs, children
+
+
 def _process_namespace(name, namespaces, ns_sep=':', attr_prefix='@'):
     if not isinstance(name, str):
         return name
@@ -503,38 +548,9 @@ def _emit(key, value, content_handler,
                 v = _convert_value_to_string(v, encoding=encoding, bytes_errors=bytes_errors)
         if isinstance(v, str):
             v = {cdata_key: v}
-        cdata = None
-        attrs = {}
-        children = []
-        for ik, iv in v.items():
-            if ik == cdata_key:
-                if iv is None:
-                    cdata = None
-                else:
-                    cdata = _convert_value_to_string(iv, encoding=encoding, bytes_errors=bytes_errors)
-                continue
-            if isinstance(ik, str) and ik.startswith(attr_prefix):
-                ik = _process_namespace(ik, namespaces, namespace_separator,
-                                        attr_prefix)
-                if ik == attr_prefix + 'xmlns' and isinstance(iv, dict):
-                    for k, v in iv.items():
-                        _validate_name(k, "attribute")
-                        attr = 'xmlns{}'.format(f':{k}' if k else '')
-                        attrs[attr] = '' if v is None else _convert_value_to_string(
-                            v, encoding=encoding, bytes_errors=bytes_errors
-                        )
-                    continue
-                if iv is None:
-                    iv = ''
-                elif not isinstance(iv, str):
-                    iv = _convert_value_to_string(iv, encoding=encoding, bytes_errors=bytes_errors)
-                attr_name = ik[len(attr_prefix) :]
-                _validate_name(attr_name, "attribute")
-                attrs[attr_name] = iv
-                continue
-            if isinstance(iv, list) and not iv:
-                continue # Skip empty lists to avoid creating empty child elements
-            children.append((ik, iv))
+        cdata, attrs, children = _element_attrs_and_children(
+            v, attr_prefix, cdata_key, namespaces, namespace_separator,
+            encoding, bytes_errors)
         if isinstance(indent, int):
             indent = ' ' * indent
         if pretty:
@@ -630,6 +646,235 @@ def unparse(input_dict, output=None, encoding='utf-8', full_document=True,
         except AttributeError:  # pragma no cover
             pass
         return value
+
+
+class IncompleteExportError(Exception):
+    """Raised when a streaming export did not finish.
+
+    The document left on the output stream is missing its closing root tag
+    (and possibly more content), so it is not a well-formed XML document.
+    The original failure is available as the ``__cause__`` of this exception
+    when the export was aborted by an error rather than abandoned explicitly.
+    """
+
+
+class StreamingUnparser:
+    """Write records into one XML document one item at a time.
+
+    A streaming counterpart of :func:`unparse`: instead of building a single
+    dictionary holding every record, the caller opens the output stream,
+    creates a :class:`StreamingUnparser` for one root element and feeds records
+    as they become available, including from a generator::
+
+        with open("records.xml", "wb") as stream:
+            with xmltodict.StreamingUnparser(stream, "records") as exporter:
+                for record in crawl_pages():
+                    exporter.item({"record": record})
+
+    The output stream is never closed by this class; the caller owns its
+    lifecycle. An empty export (no items) still produces a valid document
+    containing just the declaration and the root element.
+
+    If a value cannot be serialized, or the data source raises while being
+    consumed, the document is left unfinished and :meth:`close` raises
+    :class:`IncompleteExportError` (or the original exception propagates
+    directly from :meth:`item`), so callers can tell the export is incomplete.
+    """
+
+    def __init__(self, output, root_key, root_attrs=None, encoding='utf-8',
+                 full_document=True, short_empty_elements=False,
+                 attr_prefix='@', cdata_key='#text', comment_key='#comment',
+                 **kwargs):
+        bytes_errors = kwargs.pop('bytes_errors', 'replace')
+        try:
+            codecs.lookup_error(bytes_errors)
+        except LookupError as exc:
+            raise ValueError(
+                f"Invalid bytes_errors handler: {bytes_errors}") from exc
+
+        if output is None:
+            raise ValueError("output stream is required for streaming export")
+        if not full_document:
+            raise ValueError(
+                "StreamingUnparser requires full_document=True so the root "
+                "element is always opened and closed")
+        namespaces = kwargs.get('namespaces')
+        namespace_separator = kwargs.get('namespace_separator', ':')
+        root_key = _process_namespace(
+            root_key, namespaces, namespace_separator, attr_prefix)
+        _validate_name(root_key, "element")
+
+        self._output = output
+        self._root_key = root_key
+        self._encoding = encoding
+        self._comment_key = comment_key
+        self._pretty = kwargs.get('pretty', False)
+        self._newl = kwargs.get('newl', '\n')
+        self._kwargs = kwargs
+        self._kwargs.update(
+            attr_prefix=attr_prefix,
+            cdata_key=cdata_key,
+            comment_key=comment_key,
+            namespaces=namespaces,
+            namespace_separator=namespace_separator,
+            bytes_errors=bytes_errors,
+        )
+        if short_empty_elements:
+            self._content_handler = _XMLGenerator(output, encoding, True)
+        else:
+            self._content_handler = _XMLGenerator(output, encoding)
+        self._closed = False
+        self._failed = False
+        self._root_body_started = False
+
+        self._content_handler.startDocument()
+        attrs = {}
+        for attr_name, attr_value in (root_attrs or {}).items():
+            _validate_name(attr_name, "attribute")
+            if attr_value is None:
+                attr_value = ''
+            elif not isinstance(attr_value, str):
+                attr_value = _convert_value_to_string(
+                    attr_value, encoding=encoding, bytes_errors=bytes_errors)
+            attrs[attr_name] = attr_value
+        self._content_handler.startElement(
+            root_key, AttributesImpl(attrs))
+
+    def _before_first_child(self):
+        if not self._root_body_started:
+            self._root_body_started = True
+            if self._pretty:
+                # Match unparse(pretty=True), which puts a newline between the
+                # root start tag and its first child.
+                self._content_handler.ignorableWhitespace(self._newl)
+
+    def _mark_failed(self):
+        self._failed = True
+
+    def _ensure_open(self):
+        if self._closed:
+            raise ValueError("cannot write to a streaming export that is "
+                             "already closed")
+
+    def item(self, record):
+        """Emit one record as a direct child of the root element.
+
+        `record` uses the same dictionary conventions as the input to
+        :func:`unparse`: a mapping of element name to its body, for example
+        ``{"record": {"id": 1}}``. A list-valued entry emits repeated sibling
+        elements, while comment, attribute and cdata keys behave exactly as
+        they do in :func:`unparse`. Each call is written immediately and the
+        record is not retained.
+        """
+        try:
+            self._ensure_open()
+            if not isinstance(record, dict):
+                raise ValueError(
+                    "record must be a dict mapping element names to values, "
+                    "as in unparse input (for example {'record': {...}})")
+            self._before_first_child()
+            for key, value in record.items():
+                _emit(
+                    key,
+                    value,
+                    self._content_handler,
+                    full_document=False,
+                    depth=1,
+                    encoding=self._encoding,
+                    **self._kwargs,
+                )
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def comment(self, value):
+        """Emit an XML comment as a direct child of the root element."""
+        try:
+            self._ensure_open()
+            self._before_first_child()
+            _emit(
+                self._comment_key,
+                value,
+                self._content_handler,
+                full_document=False,
+                depth=1,
+                encoding=self._encoding,
+                **self._kwargs,
+            )
+        except BaseException:
+            self._mark_failed()
+            raise
+
+    def close(self):
+        """Close the root element and finish the document.
+
+        Raises :class:`IncompleteExportError` if an earlier write failed, so
+        the caller knows the bytes already on the output stream do not form a
+        complete document. The output stream itself is never closed.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._failed:
+            raise IncompleteExportError(
+                "streaming XML export was aborted before the document was "
+                "finished; output on the stream is incomplete")
+        self._content_handler.endElement(self._root_key)
+        self._content_handler.endDocument()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.close()
+        else:
+            # The data source or a write failed mid-export: make sure nobody
+            # mistakes the partial stream for a finished document.
+            self._mark_failed()
+            try:
+                self.close()
+            except IncompleteExportError:
+                pass
+        return False
+
+    @property
+    def closed(self):
+        """Whether :meth:`close` has run."""
+        return self._closed
+
+    @property
+    def failed(self):
+        """Whether the export was abandoned before completion."""
+        return self._failed
+
+
+def stream_unparse(records, output, root_key, root_attrs=None, **kwargs):
+    """Stream an iterable of records into a single-rooted XML document.
+
+    Each item yielded by `records` (which may be a generator) is written
+    straight to `output`, a file-like object opened by the caller, as a child
+    of the `root_key` element, so memory usage stays constant relative to the
+    number of records. An empty iterable still yields a valid document with
+    just the declaration and the empty root element.
+
+    The output stream is not closed: the caller owns it before and after the
+    call. If `records` raises or a record cannot be serialized, the stream is
+    left with an unfinished document and :class:`IncompleteExportError` is
+    raised (chained to the underlying error when one exists).
+    """
+    exporter = StreamingUnparser(
+        output, root_key, root_attrs=root_attrs, **kwargs)
+    try:
+        for record in records:
+            exporter.item(record)
+    except BaseException as exc:
+        exporter._mark_failed()
+        try:
+            exporter.close()
+        except IncompleteExportError as incomplete:
+            raise incomplete from exc
+    exporter.close()
 
 
 if __name__ == '__main__':  # pragma: no cover
