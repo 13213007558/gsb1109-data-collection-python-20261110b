@@ -37,6 +37,17 @@ tag_regexp = re.compile("{([^}]*)}(.*)")
 comment_type = etree.Comment("asd").tag
 
 
+class TemplateElement(etree.ElementBase):
+    """Raw element used for ``<template>`` tags.
+
+    lxml elements have no ``__dict__`` and cannot be weakly referenced, so the
+    detached template contents cannot be stored in an external registry keyed
+    on a normal lxml element. Subclassing :class:`lxml.etree.ElementBase` gives
+    these elements a dictionary, allowing the contents fragment to be carried
+    on the element itself for its whole lifetime (and across parser runs).
+    """
+
+
 class DocumentType(object):
     def __init__(self, name, publicId, systemId):
         self.name = name
@@ -131,6 +142,19 @@ def testSerializer(element):
 
             if element.text:
                 rv.append("|%s\"%s\"" % (' ' * (indent + 2), element.text))
+
+            local_name = nsmatch.group(2) if nsmatch is not None else element.tag
+            if local_name == "template":
+                from .. import _template
+                content = _template.get(element)
+                if content is not None:
+                    rv.append("|%scontent" % (' ' * (indent + 2),))
+                    for child in content:
+                        serializeElement(child, indent + 4)
+                    if hasattr(element, "tail") and element.tail:
+                        rv.append("|%s\"%s\"" % (' ' * indent, element.tail))
+                    return
+
             indent += 2
             for child in element:
                 serializeElement(child, indent)
@@ -232,6 +256,15 @@ class TreeBuilder(base.TreeBuilder):
                 name = infosetFilter.coerceElement(name)
                 builder.Element.__init__(self, name, namespace=namespace)
                 self._attributes = Attributes(self)
+                if name == "template":
+                    # Use a raw element with a __dict__ so the detached
+                    # template contents fragment can be carried on the element
+                    # itself. No children/attributes exist yet; attributes are
+                    # assigned through the property below and land on the
+                    # replacement.
+                    raw = TemplateElement()
+                    raw.tag = self._element.tag
+                    self._element = raw
 
             def _setName(self, name):
                 self._name = infosetFilter.coerceElement(name)
@@ -306,6 +339,19 @@ class TreeBuilder(base.TreeBuilder):
         if element.tail:
             fragment.append(element.tail)
         return fragment
+
+    def createTemplateContent(self, template):
+        # The default fragmentClass is the document wrapper, which cannot be
+        # used as an open element. Build a detached element-backed fragment
+        # instead, using the same wrapper class as ordinary elements.
+        content = self.elementClass("DOCUMENT_FRAGMENT", namespace=None)
+        self.templateContents.append(content)
+        # The template wrapper's raw element is a TemplateElement with a
+        # __dict__, so the fragment is carried on that element rather than in
+        # a registry that a later parse reset would clear.
+        from .. import _template
+        _template.register(template._element, content._element)
+        return content
 
     def insertDoctype(self, token):
         name = token["name"]

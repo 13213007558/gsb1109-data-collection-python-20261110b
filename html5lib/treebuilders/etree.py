@@ -228,10 +228,12 @@ def getETreeBuilder(ElementTreeImplementation, fullTree=False):
 
                 if nsmatch is None:
                     name = element.tag
+                    local_name = element.tag
                 else:
                     ns, name = nsmatch.groups()
                     prefix = constants.prefixes[ns]
                     name = "%s %s" % (prefix, name)
+                    local_name = nsmatch.group(2)
                 rv.append("|%s<%s>" % (' ' * indent, name))
 
                 if hasattr(element, "attrib"):
@@ -250,6 +252,13 @@ def getETreeBuilder(ElementTreeImplementation, fullTree=False):
                         rv.append('|%s%s="%s"' % (' ' * (indent + 2), name, value))
                 if element.text:
                     rv.append("|%s\"%s\"" % (' ' * (indent + 2), element.text))
+                if local_name == "template":
+                    from .. import _template
+                    content = _template.get(element)
+                    if content is not None:
+                        rv.append("|%scontent" % (' ' * (indent + 2),))
+                        for child in content:
+                            serializeElement(child, indent + 4)
             indent += 2
             for child in element:
                 serializeElement(child, indent)
@@ -336,6 +345,10 @@ def getETreeBuilder(ElementTreeImplementation, fullTree=False):
 
         def getFragment(self):
             return base.TreeBuilder.getFragment(self)._element
+
+        def _bindTemplateContent(self, template, content):
+            from .. import _template
+            _template.register(template._element, content._element)
 
     return locals()
 

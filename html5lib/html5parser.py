@@ -111,6 +111,17 @@ class HTMLParser(object):
         self.phases = {name: cls(self, self.tree) for name, cls in
                        _phases.items()}
 
+        # Insertion modes that route an HTML template token straight to the
+        # "in template" mode. Scaffolding phases (initial/before/after head,
+        # after body, frameset, ...) and the text/table-text phases are
+        # excluded so their implied-element / flush-and-reprocess rules run
+        # first; the reprocessed token then reaches one of these phases.
+        self._templateHandlingPhases = frozenset(
+            self.phases[name] for name in (
+                "inHead", "inHeadNoscript", "inBody", "inTemplate",
+                "inTable", "inCaption", "inColumnGroup", "inTableBody",
+                "inRow", "inCell", "inSelect", "inSelectInTable"))
+
     def _parse(self, stream, innerHTML=False, container="div", scripting=False, **kwargs):
 
         self.innerHTMLMode = innerHTML
@@ -209,21 +220,42 @@ class HTMLParser(object):
                     self.parseError(new_token["data"], new_token.get("datavars", {}))
                     new_token = None
                 else:
-                    if (len(self.tree.openElements) == 0 or
-                        currentNodeNamespace == self.tree.defaultNamespace or
-                        (self.isMathMLTextIntegrationPoint(currentNode) and
-                         ((type == StartTagToken and
-                           token["name"] not in frozenset(["mglyph", "malignmark"])) or
-                          type in (CharactersToken, SpaceCharactersToken))) or
-                        (currentNodeNamespace == namespaces["mathml"] and
-                         currentNodeName == "annotation-xml" and
-                         type == StartTagToken and
-                         token["name"] == "svg") or
-                        (self.isHTMLIntegrationPoint(currentNode) and
-                         type in (StartTagToken, CharactersToken, SpaceCharactersToken))):
+                    if self.tree.isTemplateContent(currentNode):
+                        # The current node is a detached template contents
+                        # fragment. It sits above the template element on the
+                        # stack solely to redirect insertions into the
+                        # fragment; mode switching (e.g. into table modes) is
+                        # still driven by the current insertion mode, so the
+                        # foreign-content namespace checks are bypassed here.
+                        phase = self.phase
+                    elif (len(self.tree.openElements) == 0 or
+                          currentNodeNamespace == self.tree.defaultNamespace or
+                          (self.isMathMLTextIntegrationPoint(currentNode) and
+                           ((type == StartTagToken and
+                             token["name"] not in frozenset(["mglyph", "malignmark"])) or
+                            type in (CharactersToken, SpaceCharactersToken))) or
+                          (currentNodeNamespace == namespaces["mathml"] and
+                           currentNodeName == "annotation-xml" and
+                           type == StartTagToken and
+                           token["name"] == "svg") or
+                          (self.isHTMLIntegrationPoint(currentNode) and
+                           type in (StartTagToken, CharactersToken, SpaceCharactersToken))):
                         phase = self.phase
                     else:
                         phase = self.phases["inForeignContent"]
+
+                    if (type in (StartTagToken, EndTagToken) and
+                            new_token["name"] == "template" and
+                            new_token.get("namespace") in (None,
+                                                           namespaces["html"]) and
+                            phase in self._templateHandlingPhases):
+                        # Every content/table/select insertion mode routes HTML
+                        # template tokens to the "in template" insertion mode.
+                        # The document scaffolding phases (initial, before/after
+                        # head, after body, frameset, ...) are deliberately
+                        # excluded: their "anything else" rules first create the
+                        # implied html/head/body and then reprocess the token.
+                        phase = self.phases["inTemplate"]
 
                     if debug:
                         info = {"type": type_names[type]}
@@ -352,7 +384,6 @@ class HTMLParser(object):
             "caption": "inCaption",
             "colgroup": "inColumnGroup",
             "table": "inTable",
-            "head": "inBody",
             "body": "inBody",
             "frameset": "inFrameset",
             "html": "beforeHead"
@@ -364,16 +395,24 @@ class HTMLParser(object):
                 assert self.innerHTML
                 last = True
                 nodeName = self.innerHTML
-            # Check for conditions that should only happen in the innerHTML
-            # case
-            if nodeName in ("select", "colgroup", "head", "html"):
-                assert self.innerHTML
 
             if not last and node.namespace != self.tree.defaultNamespace:
                 continue
 
-            if nodeName in newModes:
+            if nodeName == "head" and not last:
+                # A real head element (e.g. after closing a template that lived
+                # in head) returns to "in head". The innerHTML context node is
+                # handled below through the historical "in body" default.
+                new_phase = self.phases["inHead"]
+                break
+            elif nodeName in newModes:
                 new_phase = self.phases[newModes[nodeName]]
+                break
+            elif nodeName == "template":
+                # The detached contents fragment above the template is skipped
+                # by the namespace check above, so reaching the template
+                # element means we must use the "in template" insertion mode.
+                new_phase = self.phases["inTemplate"]
                 break
             elif last:
                 new_phase = self.phases["inBody"]
@@ -1249,6 +1288,12 @@ class InBodyPhase(Phase):
                 self.parser.parseError()
         self.tree.insertElement(token)
 
+    def startTagTemplate(self, token):
+        # All template setup (element, formatting markers, detached contents
+        # fragment and insertion mode switch) lives in the "in template" phase
+        # so top-level and nested templates share one code path.
+        self.parser.phases["inTemplate"].startTagTemplate(token)
+
     def startTagMath(self, token):
         self.tree.reconstructActiveFormattingElements()
         self.parser.adjustMathMLAttributes(token)
@@ -1280,7 +1325,17 @@ class InBodyPhase(Phase):
         "option", "optgroup", "tbody", "td", "tfoot", "th", "thead",
         "tr", "noscript"
         """
-        self.parser.parseError("unexpected-start-tag-ignored", {"name": token["name"]})
+        if self.tree.inTemplateContent():
+            # Inside a template's detached contents there is no surrounding
+            # table to reject these, so they are kept verbatim in the
+            # fragment rather than being dropped.
+            self.parser.parseError("unexpected-start-tag-ignored",
+                                   {"name": token["name"]})
+            self.tree.reconstructActiveFormattingElements()
+            self.tree.insertElement(token)
+        else:
+            self.parser.parseError("unexpected-start-tag-ignored",
+                                   {"name": token["name"]})
 
     def startTagOther(self, token):
         self.tree.reconstructActiveFormattingElements()
@@ -1564,6 +1619,14 @@ class InBodyPhase(Phase):
         self.tree.insertElement(impliedTagToken("br", "StartTag"))
         self.tree.openElements.pop()
 
+    def endTagTemplate(self, token):
+        # Normally resetInsertionMode() selects "in template" while a
+        # template is open, so this only runs for a stray end tag.
+        if not self.tree.elementInScope("template"):
+            self.parser.parseError("unexpected-end-tag", {"name": "template"})
+            return
+        self.parser.phases["inTemplate"].endTagTemplate(token)
+
     def endTagOther(self, token):
         for node in self.tree.openElements[::-1]:
             if node.name == token["name"]:
@@ -1617,8 +1680,9 @@ class InBodyPhase(Phase):
         ("select", startTagSelect),
         (("rp", "rt"), startTagRpRt),
         (("option", "optgroup"), startTagOpt),
-        (("math"), startTagMath),
-        (("svg"), startTagSvg),
+        ("template", startTagTemplate),
+        ("math", startTagMath),
+        ("svg", startTagSvg),
         (("caption", "col", "colgroup", "frame", "head",
           "tbody", "td", "tfoot", "th", "thead",
           "tr"), startTagMisplaced)
@@ -1640,6 +1704,7 @@ class InBodyPhase(Phase):
           "strike", "strong", "tt", "u"), endTagFormatting),
         (("applet", "marquee", "object"), endTagAppletMarqueeObject),
         ("br", endTagBr),
+        ("template", endTagTemplate),
     ])
     endTagHandler.default = endTagOther
 
@@ -1675,6 +1740,112 @@ class TextPhase(Phase):
     startTagHandler.default = startTagOther
     endTagHandler = _utils.MethodDispatcher([
         ("script", endTagScript)])
+    endTagHandler.default = endTagOther
+
+
+class InTemplatePhase(Phase):
+    # https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intemplate
+    __slots__ = tuple()
+
+    def processEOF(self):
+        self.parser.parseError("eof-in-template")
+        # Close every still-open template (nested templates included) in one
+        # pass rather than re-entering this insertion mode, which the main
+        # loop's reprocessing guard forbids.
+        while self.tree.templateContents:
+            self.endTagTemplate(impliedTagToken("template"))
+        # Any remaining open elements are handled by the ordinary EOF rules.
+        self.parser.phases["inBody"].processEOF()
+
+    def processComment(self, token):
+        return self.parser.phases["inBody"].processComment(token)
+
+    def processSpaceCharacters(self, token):
+        return self.parser.phases["inBody"].processSpaceCharacters(token)
+
+    def processCharacters(self, token):
+        return self.parser.phases["inBody"].processCharacters(token)
+
+    def startTagBaseLinkCommand(self, token):
+        # Head-only elements (base/link/meta, title, style, script,
+        # noscript/noframes, ...) follow the "in head" rules, which take care
+        # of void elements, RCDATA/RAWTEXT switching and so on. Delegating to
+        # the full phase keeps title's text out of the surrounding fragment.
+        return self.parser.phases["inHead"].processStartTag(token)
+
+    def startTagTemplate(self, token):
+        if self.tree.templateContents:
+            # A template nested inside template contents is a parse error, but
+            # the handling is otherwise identical.
+            self.parser.parseError("nested-template")
+        # Insert the template element under the current node (its parent is
+        # the enclosing element or a detached contents fragment).
+        self.tree.insertElement(token)
+        template = self.tree.openElements[-1]
+        # The algorithm requires three active formatting element markers.
+        self.tree.activeFormattingElements.append(Marker)
+        self.tree.activeFormattingElements.append(Marker)
+        self.tree.activeFormattingElements.append(Marker)
+        # Parse its contents into a detached fragment placed directly above
+        # the template element on the stack of open elements, so the ordinary
+        # insertion logic routes every child into the fragment.
+        content = self.tree.createTemplateContent(template)
+        self.tree.openElements.append(content)
+        self.parser.phase = self
+
+    def startTagOther(self, token):
+        # Ordinary template contents use the "in body" rules. Mode changes
+        # performed there (e.g. into table/select modes) persist until the
+        # construct closes, at which point resetInsertionMode() returns here.
+        self.parser.phase = self.parser.phases["inBody"]
+        self.parser.phase.processStartTag(token)
+
+    def endTagTemplate(self, token):
+        if not self.tree.templateContents:
+            # A stray template end tag with no open template.
+            self.parser.parseError("unexpected-end-tag", {"name": "template"})
+            return
+        # Generate implied end tags, but never past the template element.
+        if self.tree.openElements[-1].name != "template":
+            self.tree.generateImpliedEndTags()
+        top = self.tree.openElements[-1]
+        if (top.name != "template" and
+                not self.tree.isTemplateContent(top)):
+            self.parser.parseError("expected-one-end-tag-but-got-another",
+                                   {"gotName": "template",
+                                    "expectedName": top.name})
+
+        # Pop everything still open above the detached contents fragment,
+        # then the fragment and the template element itself.
+        while not self.tree.isTemplateContent(self.tree.openElements[-1]):
+            self.tree.openElements.pop()
+        self.tree.openElements.pop()
+        self.tree.popTemplateContent()
+        template = self.tree.openElements.pop()
+        assert template.name == "template", \
+            "Expected template got %s" % template.name
+
+        # Drop the three active formatting element markers opened for it.
+        for _ in range(3):
+            self.tree.clearActiveFormattingElements()
+
+        self.parser.resetInsertionMode()
+
+    def endTagOther(self, token):
+        # Per spec this is a parse error and the token is ignored; anything
+        # left open is popped when the template end tag is processed.
+        self.parser.parseError("unexpected-end-tag", {"name": token["name"]})
+
+    startTagHandler = _utils.MethodDispatcher([
+        (("base", "basefont", "bgsound", "command", "link", "meta", "noframes",
+          "style", "title", "noscript"), startTagBaseLinkCommand),
+        ("template", startTagTemplate),
+    ])
+    startTagHandler.default = startTagOther
+
+    endTagHandler = _utils.MethodDispatcher([
+        ("template", endTagTemplate),
+    ])
     endTagHandler.default = endTagOther
 
 
@@ -2754,6 +2925,7 @@ _phases = {
     "afterHead": AfterHeadPhase,
     "inBody": InBodyPhase,
     "text": TextPhase,
+    "inTemplate": InTemplatePhase,
     "inTable": InTablePhase,
     "inTableText": InTableTextPhase,
     "inCaption": InCaptionPhase,

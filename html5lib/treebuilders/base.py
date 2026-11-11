@@ -194,6 +194,15 @@ class TreeBuilder(object):
 
         self.document = self.documentClass()
 
+        # Template support. ``templateContents`` is the stack of
+        # DocumentFragment nodes that currently open templates parse their
+        # children into. The innermost entry sits on the stack of open
+        # elements (above its template element) so the ordinary insertion
+        # logic puts template children straight into the detached fragment.
+        # The fragments are detached from the visible tree and only reachable
+        # through the template element binding or a walker/serializer.
+        self.templateContents = []
+
     def elementInScope(self, target, variant=None):
 
         # If we pass a node in we match that. if we pass a string
@@ -408,6 +417,40 @@ class TreeBuilder(object):
         fragment = self.fragmentClass()
         self.openElements[0].reparentChildren(fragment)
         return fragment
+
+    def createTemplateContent(self, template):
+        """Create the DocumentFragment a template parses its children into.
+
+        The fragment is pushed onto :attr:`templateContents` (making it the
+        current insertion parent when it is also placed on the stack of open
+        elements) and bound to the raw template element so it can be retrieved
+        independently of the builder wrappers.
+        """
+        content = self.fragmentClass()
+        self.templateContents.append(content)
+        self._bindTemplateContent(template, content)
+        return content
+
+    def popTemplateContent(self):
+        """Remove and return the innermost template contents fragment."""
+        return self.templateContents.pop()
+
+    def isTemplateContent(self, node):
+        """Whether ``node`` is a template contents fragment currently in use."""
+        return node in self.templateContents
+
+    def inTemplateContent(self):
+        """Whether parsing is currently inside some template's contents.
+
+        True whenever a detached contents fragment is still on the stack of
+        open elements, even if the current node is an ordinary element nested
+        inside that fragment (e.g. a ``td`` inside a bare ``tr``).
+        """
+        return any(self.isTemplateContent(node) for node in self.openElements)
+
+    def _bindTemplateContent(self, template, content):
+        """Persist the raw template element -> raw contents fragment link."""
+        raise NotImplementedError
 
     def testSerializer(self, node):
         """Serialize the subtree of node in the format required by unit tests

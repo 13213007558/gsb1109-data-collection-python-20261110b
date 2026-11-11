@@ -125,6 +125,12 @@ def getETreeBuilder(ElementTreeImplementation):
                     assert list(parents[-1]).count(parent) == 1
                     return parent, list(parents[-1]).index(parent), parents, None
 
+        def getTemplateContent(self, node):
+            if isinstance(node, tuple):
+                node = node[0]
+            from .. import _template
+            return _template.get(node)
+
     return locals()
 
 

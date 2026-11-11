@@ -162,6 +162,10 @@ def getDomBuilder(DomImplementation):
         def getFragment(self):
             return base.TreeBuilder.getFragment(self).element
 
+        def _bindTemplateContent(self, template, content):
+            from .. import _template
+            _template.register(template.element, content.element)
+
         def insertText(self, data, parent=None):
             data = data
             if parent != self:
@@ -225,6 +229,16 @@ def getDomBuilder(DomImplementation):
 
                     for name, value in sorted(attributes):
                         rv.append('|%s%s="%s"' % (' ' * (indent + 2), name, value))
+            if element.nodeType == Node.ELEMENT_NODE and element.nodeName == "template":
+                from .. import _template
+                content = _template.get(element)
+                if content is not None:
+                    rv.append("|%scontent" % (' ' * (indent + 2),))
+                    indent += 4
+                    for child in content.childNodes:
+                        serializeElement(child, indent)
+                    indent -= 4
+                    return
             indent += 2
             for child in element.childNodes:
                 serializeElement(child, indent)

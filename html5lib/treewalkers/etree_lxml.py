@@ -145,6 +145,10 @@ class TreeWalker(base.NonRecursiveTreeWalker):
         elif isinstance(node, Root):
             return (base.DOCUMENT,)
 
+        elif getattr(node, "tag", None) == "DOCUMENT_FRAGMENT":
+            # A template contents fragment: emit its children, no wrapper tag.
+            return (base.DOCUMENT,)
+
         elif isinstance(node, Doctype):
             return base.DOCTYPE, node.name, node.public_id, node.system_id
 
@@ -180,7 +184,10 @@ class TreeWalker(base.NonRecursiveTreeWalker):
     def getFirstChild(self, node):
         assert not isinstance(node, tuple), "Text nodes have no children"
 
-        assert len(node) or node.text, "Node has no children"
+        if not (len(node) or node.text):
+            # An empty document/fragment root (e.g. the contents of a template
+            # with no children) legitimately has nothing to descend into.
+            return None
         if node.text:
             return (node, "text")
         else:
@@ -213,3 +220,11 @@ class TreeWalker(base.NonRecursiveTreeWalker):
             return None
 
         return node.getparent()
+
+    def getTemplateContent(self, node):
+        if isinstance(node, tuple):
+            node = node[0]
+        if isinstance(node, FragmentWrapper):
+            node = node.obj
+        from .. import _template
+        return _template.get(node)

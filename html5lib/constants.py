@@ -289,6 +289,10 @@ E = {
         "Unexpected end of file. Expected inhead-noscript content",
     "char-in-head-noscript":
         "Unexpected non-space character. Expected inhead-noscript content",
+    "eof-in-template":
+        "Unexpected end of file while in template insertion mode.",
+    "nested-template":
+        "Template element nested inside the contents of another template.",
     "XXX-undefined-error":
         "Undefined error (this sucks and should be fixed)",
 }
@@ -310,6 +314,7 @@ scopingElements = frozenset([
     (namespaces["html"], "object"),
     (namespaces["html"], "table"),
     (namespaces["html"], "td"),
+    (namespaces["html"], "template"),
     (namespaces["html"], "th"),
     (namespaces["mathml"], "mi"),
     (namespaces["mathml"], "mo"),
@@ -410,6 +415,7 @@ specialElements = frozenset([
     (namespaces["html"], "table"),
     (namespaces["html"], "tbody"),
     (namespaces["html"], "td"),
+    (namespaces["html"], "template"),
     (namespaces["html"], "textarea"),
     (namespaces["html"], "tfoot"),
     (namespaces["html"], "th"),

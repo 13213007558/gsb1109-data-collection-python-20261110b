@@ -241,6 +241,13 @@ class HTMLSerializer(object):
         in_cdata = False
         self.errors = []
 
+        # Full-page serialization puts template contents back inside their
+        # template element. Walkers created directly (without a serializer)
+        # keep templates collapsed so a plain traversal only sees rendered
+        # content. Filters delegate unknown attributes to their source walker.
+        if hasattr(treewalker, "expand_templates"):
+            treewalker.expand_templates = True
+
         if encoding and self.inject_meta_charset:
             from .filters.inject_meta_charset import Filter
             treewalker = Filter(treewalker, encoding)

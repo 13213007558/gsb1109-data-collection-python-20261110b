@@ -31,6 +31,25 @@ class TreeWalker(object):
 
         """
         self.tree = tree
+        # When True, the otherwise-hidden contents of a <template> element are
+        # emitted inline between its start and end tags. Defaults to False so a
+        # plain walk only ever sees rendered (expanded) content.
+        self.expand_templates = False
+
+    def getTemplateContent(self, node):
+        """Return the raw template contents fragment for ``node`` or None.
+
+        Subclasses override this to unwrap their internal node representation
+        before consulting the template registry.
+        """
+        from .. import _template
+        return _template.get(node)
+
+    def subWalker(self, content):
+        """Build a walker of the same kind over a template contents fragment."""
+        walker = type(self)(content)
+        walker.expand_templates = self.expand_templates
+        return walker
 
     def __iter__(self):
         raise NotImplementedError
@@ -213,6 +232,16 @@ class NonRecursiveTreeWalker(TreeWalker):
                     hasChildren = False
                 else:
                     yield self.startTag(namespace, name, attributes)
+                    if self.expand_templates and name == "template":
+                        # Inline the detached template contents between the
+                        # element's start and end tags so a full-page
+                        # serialization round-trips. The template has no
+                        # ordinary children, so suppress the normal descent.
+                        content = self.getTemplateContent(currentNode)
+                        if content is not None:
+                            for token in self.subWalker(content):
+                                yield token
+                            hasChildren = False
 
             elif type == COMMENT:
                 yield self.comment(details[0])
