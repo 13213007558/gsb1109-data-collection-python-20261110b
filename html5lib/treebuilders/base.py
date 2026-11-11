@@ -42,6 +42,16 @@ class Node(object):
         # A list of miscellaneous flags that can be set on the node.
         self._flags = []
 
+    @property
+    def publicNode(self):
+        """The tree object handed back to the caller for this wrapper node.
+
+        Backends whose wrapper *is* the returned node use the default; the
+        ElementTree and DOM wrappers override it to return their underlying
+        native node, which is what source information is ultimately keyed by.
+        """
+        return self
+
     def __str__(self):
         attributesStr = " ".join(["%s=\"%s\"" % (name, value)
                                   for name, value in
@@ -170,16 +180,22 @@ class TreeBuilder(object):
     # Fragment class
     fragmentClass = None
 
-    def __init__(self, namespaceHTMLElements):
+    def __init__(self, namespaceHTMLElements, locator=None):
         """Create a TreeBuilder
 
         :arg namespaceHTMLElements: whether or not to namespace HTML elements
+
+        :arg locator: an optional
+            :class:`~html5lib._sourcelocator.SourceLocator` that records the
+            provenance of every node.  When :obj:`None` (the default) source
+            tracking is disabled and parsing behaves exactly as before.
 
         """
         if namespaceHTMLElements:
             self.defaultNamespace = "http://www.w3.org/1999/xhtml"
         else:
             self.defaultNamespace = None
+        self.locator = locator
         self.reset()
 
     def reset(self):
@@ -193,6 +209,53 @@ class TreeBuilder(object):
         self.insertFromTable = False
 
         self.document = self.documentClass()
+        if self.locator is not None:
+            # The synthetic document node is parser-generated.
+            self._recordDocumentNode()
+
+    def _recordDocumentNode(self):
+        """Record the document node as parser-generated.
+
+        Most backends expose the returned document through ``publicNode``; the
+        DOM builder keeps its native document separately and overrides this.
+        """
+        node = getattr(self.document, "publicNode", self.document)
+        if node is not None:
+            self.locator.implied(node)
+
+    # -- source tracking helpers ------------------------------------------
+
+    def _tokenIsImplied(self, token):
+        """Return whether ``token`` was synthesized by the parser rather than
+        produced from input markup."""
+        return isinstance(token, dict) and "source" not in token
+
+    def _recordElement(self, element, token):
+        if self.locator is None:
+            return
+        if self._tokenIsImplied(token):
+            self.locator.implied(element.publicNode)
+        else:
+            self.locator.present(element.publicNode, token)
+
+    def recordClone(self, clone):
+        """Mark ``clone`` as a parser-generated copy.
+
+        Called by the adoption agency algorithm; a cloned element is a new
+        node produced during error recovery even if its template came from real
+        markup.
+        """
+        if self.locator is not None:
+            self.locator.clone(clone.publicNode)
+
+    def reparentText(self, fromNode, toNode):
+        """Move the recorded text ranges of ``fromNode`` onto ``toNode``.
+
+        Mirrors :meth:`Node.reparentChildren` for the text provenance kept by
+        the locator; child elements keep their own provenance.
+        """
+        if self.locator is not None:
+            self.locator.reparentText(fromNode.publicNode, toNode.publicNode)
 
     def elementInScope(self, target, variant=None):
 
@@ -293,11 +356,22 @@ class TreeBuilder(object):
 
         doctype = self.doctypeClass(name, publicId, systemId)
         self.document.appendChild(doctype)
+        if self.locator is not None:
+            if self._tokenIsImplied(token):
+                self.locator.implied(doctype.publicNode)
+            else:
+                self.locator.present(doctype.publicNode, token)
 
     def insertComment(self, token, parent=None):
         if parent is None:
             parent = self.openElements[-1]
-        parent.appendChild(self.commentClass(token["data"]))
+        comment = self.commentClass(token["data"])
+        parent.appendChild(comment)
+        if self.locator is not None:
+            if self._tokenIsImplied(token):
+                self.locator.implied(comment.publicNode)
+            else:
+                self.locator.present(comment.publicNode, token)
 
     def createElement(self, token):
         """Create an element but don't insert it anywhere"""
@@ -305,6 +379,7 @@ class TreeBuilder(object):
         namespace = token.get("namespace", self.defaultNamespace)
         element = self.elementClass(name, namespace)
         element.attributes = token["data"]
+        self._recordElement(element, token)
         return element
 
     def _getInsertFromTable(self):
@@ -327,6 +402,7 @@ class TreeBuilder(object):
         namespace = token.get("namespace", self.defaultNamespace)
         element = self.elementClass(name, namespace)
         element.attributes = token["data"]
+        self._recordElement(element, token)
         self.openElements[-1].appendChild(element)
         self.openElements.append(element)
         return element
@@ -347,8 +423,14 @@ class TreeBuilder(object):
             self.openElements.append(element)
         return element
 
-    def insertText(self, data, parent=None):
-        """Insert text data."""
+    def insertText(self, data, parent=None, token=None):
+        """Insert text data.
+
+        When source tracking is enabled ``token`` is the character token the
+        text came from, so that the element receiving it records a source
+        range even if the text was foster-parented away from the table that was
+        open when it was tokenized.
+        """
         if parent is None:
             parent = self.openElements[-1]
 
@@ -356,11 +438,24 @@ class TreeBuilder(object):
                                          self.openElements[-1].name
                                          not in tableInsertModeElements)):
             parent.insertText(data)
+            textParent = parent
+            insertBefore = None
         else:
             # We should be in the InTable mode. This means we want to do
             # special magic element rearranging
-            parent, insertBefore = self.getTableMisnestedNodePosition()
-            parent.insertText(data, insertBefore)
+            textParent, insertBefore = self.getTableMisnestedNodePosition()
+            textParent.insertText(data, insertBefore)
+
+        if self.locator is not None and token is not None:
+            # A merged character token (e.g. table text) carries the list of
+            # original tokens that were concatenated to produce ``data``.
+            sourceTokens = token.get("sourceTokens") if isinstance(token, dict) else None
+            if sourceTokens:
+                for sourceToken in sourceTokens:
+                    self.locator.addText(textParent.publicNode,
+                                         sourceToken, sourceToken["data"])
+            else:
+                self.locator.addText(textParent.publicNode, token, data)
 
     def getTableMisnestedNodePosition(self):
         """Get the foster parent element, and sibling to insert before
@@ -406,7 +501,11 @@ class TreeBuilder(object):
         """Return the final fragment"""
         # assert self.innerHTML
         fragment = self.fragmentClass()
-        self.openElements[0].reparentChildren(fragment)
+        root = self.openElements[0]
+        # The root's direct text becomes the fragment's text / its children's
+        # tails, so move the recorded ranges across before the reparent.
+        self.reparentText(root, fragment)
+        root.reparentChildren(fragment)
         return fragment
 
     def testSerializer(self, node):

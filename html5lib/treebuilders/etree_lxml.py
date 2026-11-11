@@ -43,11 +43,20 @@ class DocumentType(object):
         self.publicId = publicId
         self.systemId = systemId
 
+    @property
+    def publicNode(self):
+        return self
+
 
 class Document(object):
     def __init__(self):
         self._elementTree = None
         self._childNodes = []
+
+    @property
+    def publicNode(self):
+        # getDocument() returns the underlying ElementTree.
+        return self._elementTree
 
     def appendChild(self, element):
         last = self._elementTree.getroot()
@@ -190,7 +199,7 @@ class TreeBuilder(base.TreeBuilder):
     fragmentClass = Document
     implementation = etree
 
-    def __init__(self, namespaceHTMLElements, fullTree=False):
+    def __init__(self, namespaceHTMLElements, fullTree=False, locator=None):
         builder = etree_builders.getETreeModule(etree, fullTree=fullTree)
         infosetFilter = self.infosetFilter = _ihatexml.InfosetFilter(preventDoubleDashComments=True)
         self.namespaceHTMLElements = namespaceHTMLElements
@@ -280,7 +289,7 @@ class TreeBuilder(base.TreeBuilder):
         self.elementClass = Element
         self.commentClass = Comment
         # self.fragmentClass = builder.DocumentFragment
-        base.TreeBuilder.__init__(self, namespaceHTMLElements)
+        base.TreeBuilder.__init__(self, namespaceHTMLElements, locator=locator)
 
     def reset(self):
         base.TreeBuilder.reset(self)
@@ -305,6 +314,15 @@ class TreeBuilder(base.TreeBuilder):
         fragment.extend(list(element))
         if element.tail:
             fragment.append(element.tail)
+        if self.locator is not None:
+            # lxml returns element nodes plus bare text strings; the fragment
+            # container's direct text is surfaced as the last element's tail
+            # (or a leading bare string).  Move the recorded ranges onto the
+            # last element so a returned node still carries the provenance.
+            elementNodes = [item for item in fragment if hasattr(item, "tag")]
+            if elementNodes:
+                self.locator.reparentText(self.openElements[0].publicNode,
+                                          elementNodes[-1])
         return fragment
 
     def insertDoctype(self, token):
@@ -321,6 +339,11 @@ class TreeBuilder(base.TreeBuilder):
                 warnings.warn("lxml cannot represent non-xml doctype", DataLossWarning)
 
             doctype = self.doctypeClass(coercedName, publicId, systemId)
+            if self.locator is not None:
+                if self._tokenIsImplied(token):
+                    self.locator.implied(doctype.publicNode)
+                else:
+                    self.locator.present(doctype.publicNode, token)
             self.doctype = doctype
 
     def insertCommentInitial(self, data, parent=None):
@@ -368,10 +391,17 @@ class TreeBuilder(base.TreeBuilder):
         for comment_token in self.initial_comments:
             comment = self.commentClass(comment_token["data"])
             root.addprevious(comment._element)
+            if self.locator is not None:
+                if self._tokenIsImplied(comment_token):
+                    self.locator.implied(comment.publicNode)
+                else:
+                    self.locator.present(comment.publicNode, comment_token)
 
         # Create the root document and add the ElementTree to it
         self.document = self.documentClass()
         self.document._elementTree = root.getroottree()
+        if self.locator is not None:
+            self.locator.implied(self.document.publicNode)
 
         # Give the root element the right name
         name = token["name"]
@@ -385,6 +415,11 @@ class TreeBuilder(base.TreeBuilder):
         # Add the root element to the internal child/open data structures
         root_element = self.elementClass(name, namespace)
         root_element._element = root
+        if self.locator is not None:
+            if self._tokenIsImplied(token):
+                self.locator.implied(root_element.publicNode)
+            else:
+                self.locator.present(root_element.publicNode, token)
         self.document._childNodes.append(root_element)
         self.openElements.append(root_element)
 

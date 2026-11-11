@@ -26,9 +26,14 @@ from .html5parser import HTMLParser, parse, parseFragment
 from .treebuilders import getTreeBuilder
 from .treewalkers import getTreeWalker
 from .serializer import serialize
+from ._sourcelocator import (
+    SourceLocator, SourceInfo, SourceLocation, SourceRange,
+    SOURCE_ORIGIN_PRESENT, SOURCE_ORIGIN_IMPLIED)
 
 __all__ = ["HTMLParser", "parse", "parseFragment", "getTreeBuilder",
-           "getTreeWalker", "serialize"]
+           "getTreeWalker", "serialize",
+           "SourceLocator", "SourceInfo", "SourceLocation", "SourceRange",
+           "SOURCE_ORIGIN_PRESENT", "SOURCE_ORIGIN_IMPLIED"]
 
 # this has to be at the top level, see how setup.py parses this
 #: Distribution version number.

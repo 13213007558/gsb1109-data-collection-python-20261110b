@@ -3,6 +3,7 @@ from six import viewkeys
 
 from . import _inputstream
 from . import _tokenizer
+from . import _sourcelocator
 
 from . import treebuilders
 from .treebuilders.base import Marker
@@ -76,7 +77,8 @@ class HTMLParser(object):
 
     """
 
-    def __init__(self, tree=None, strict=False, namespaceHTMLElements=True, debug=False):
+    def __init__(self, tree=None, strict=False, namespaceHTMLElements=True,
+                 debug=False, source_locator=False):
         """
         :arg tree: a treebuilder class controlling the type of tree that will be
             returned. Built in treebuilders can be accessed through
@@ -87,6 +89,14 @@ class HTMLParser(object):
         :arg namespaceHTMLElements: whether or not to namespace HTML elements
 
         :arg debug: whether or not to enable debug mode which logs things
+
+        :arg source_locator: when true, build a
+            :class:`~html5lib._sourcelocator.SourceLocator` (available as
+            :attr:`source_locator` after parsing) that records where every node
+            came from in the normalized input.  This distinguishes markup that
+            was present in the source from containers the parser generated, and
+            tracks the multiple input fragments that make up reassigned text.
+            Defaults to false, leaving the default behaviour unchanged.
 
         Example:
 
@@ -99,6 +109,8 @@ class HTMLParser(object):
         # Raise an exception on the first error encountered
         self.strict = strict
         self.debug = debug
+        self.source_locator_enabled = source_locator
+        self._sourceLocator = None
 
         if tree is None:
             tree = treebuilders.getTreeBuilder("etree")
@@ -116,14 +128,33 @@ class HTMLParser(object):
         self.innerHTMLMode = innerHTML
         self.container = container
         self.scripting = scripting
-        self.tokenizer = _tokenizer.HTMLTokenizer(stream, parser=self, **kwargs)
+        self.tokenizer = _tokenizer.HTMLTokenizer(
+            stream, parser=self,
+            source_locator=self.source_locator_enabled, **kwargs)
+        if self.source_locator_enabled:
+            self._sourceLocator = _sourcelocator.SourceLocator(
+                self.tokenizer.stream)
+            self.tree.locator = self._sourceLocator
+        else:
+            self._sourceLocator = None
+            self.tree.locator = None
         self.reset()
 
         try:
             self.mainLoop()
         except _ReparseException:
+            # The encoding changed and the stream is re-read from the start;
+            # discard provenance gathered during the abandoned first pass.
+            if self._sourceLocator is not None:
+                self._sourceLocator.reset()
             self.reset()
             self.mainLoop()
+
+    @property
+    def source_locator(self):
+        """The :class:`~html5lib._sourcelocator.SourceLocator` for the most
+        recent parse, or :obj:`None` when source tracking was not enabled."""
+        return self._sourceLocator
 
     def reset(self):
         self.tree.reset()
@@ -420,10 +451,10 @@ class Phase(object):
         self.parser.parseError("unexpected-doctype")
 
     def processCharacters(self, token):
-        self.tree.insertText(token["data"])
+        self.tree.insertText(token["data"], token=token)
 
     def processSpaceCharacters(self, token):
-        self.tree.insertText(token["data"])
+        self.tree.insertText(token["data"], token=token)
 
     def processStartTag(self, token):
         # Note the caching is done here rather than BoundMethodDispatcher as doing it there
@@ -973,14 +1004,14 @@ class InBodyPhase(Phase):
             data = data[1:]
         if data:
             self.tree.reconstructActiveFormattingElements()
-            self.tree.insertText(data)
+            self.tree.insertText(data, token=token)
 
     def processCharacters(self, token):
         if token["data"] == "\u0000":
             # The tokenizer should always emit null on its own
             return
         self.tree.reconstructActiveFormattingElements()
-        self.tree.insertText(token["data"])
+        self.tree.insertText(token["data"], token=token)
         # This must be bad for performance
         if (self.parser.framesetOK and
             any(char not in spaceCharacters
@@ -989,7 +1020,7 @@ class InBodyPhase(Phase):
 
     def processSpaceCharactersNonPre(self, token):
         self.tree.reconstructActiveFormattingElements()
-        self.tree.insertText(token["data"])
+        self.tree.insertText(token["data"], token=token)
 
     def startTagProcessInHead(self, token):
         return self.parser.phases["inHead"].processStartTag(token)
@@ -1500,6 +1531,7 @@ class InBodyPhase(Phase):
                     bookmark = self.tree.activeFormattingElements.index(node) + 1
                 # Step 9.8
                 clone = node.cloneNode()
+                self.tree.recordClone(clone)
                 # Replace node with clone
                 self.tree.activeFormattingElements[
                     self.tree.activeFormattingElements.index(node)] = clone
@@ -1529,8 +1561,14 @@ class InBodyPhase(Phase):
 
             # Step 11
             clone = formattingElement.cloneNode()
+            self.tree.recordClone(clone)
 
             # Step 12
+            # Keep the text provenance attached to the moved subtree. The
+            # individual fragment locations remain exact; only the element
+            # grouping of text that becomes a child's tail is attributed to
+            # the subtree root.
+            self.tree.reparentText(furthestBlock, clone)
             furthestBlock.reparentChildren(clone)
 
             # Step 13
@@ -1648,7 +1686,7 @@ class TextPhase(Phase):
     __slots__ = tuple()
 
     def processCharacters(self, token):
-        self.tree.insertText(token["data"])
+        self.tree.insertText(token["data"], token=token)
 
     def processEOF(self):
         self.parser.parseError("expected-named-closing-tag-but-got-eof",
@@ -1835,10 +1873,15 @@ class InTableTextPhase(Phase):
     def flushCharacters(self):
         data = "".join([item["data"] for item in self.characterTokens])
         if any(item not in spaceCharacters for item in data):
-            token = {"type": tokenTypes["Characters"], "data": data}
+            # Carry the original tokens so the locator can record each input
+            # fragment even though the data is inserted as one merged string.
+            token = {"type": tokenTypes["Characters"], "data": data,
+                     "sourceTokens": list(self.characterTokens)}
             self.parser.phases["inTable"].insertText(token)
         elif data:
-            self.tree.insertText(data)
+            token = {"type": tokenTypes["SpaceCharacters"], "data": data,
+                     "sourceTokens": list(self.characterTokens)}
+            self.tree.insertText(data, token=token)
         self.characterTokens = []
 
     def processComment(self, token):
@@ -2287,7 +2330,7 @@ class InSelectPhase(Phase):
     def processCharacters(self, token):
         if token["data"] == "\u0000":
             return
-        self.tree.insertText(token["data"])
+        self.tree.insertText(token["data"], token=token)
 
     def startTagOption(self, token):
         # We need to imply </option> if <option> is the current node.

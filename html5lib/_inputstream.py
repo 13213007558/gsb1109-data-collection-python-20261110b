@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, unicode_literals
 from six import text_type
 from six.moves import http_client, urllib
 
+import bisect
 import codecs
 import re
 from io import BytesIO, StringIO
@@ -182,6 +183,10 @@ class HTMLUnicodeInputStream(object):
         # List of where new lines occur
         self.newLines = [0]
 
+        # Source tracking is switched on by the tokenizer when requested; keep
+        # it out of reset() so an encoding-driven reparse does not disable it.
+        self._sourceTracking = False
+
         self.charEncoding = (lookupEncoding("utf-8"), "certain")
         self.dataStream = self.openStream(source)
 
@@ -192,6 +197,16 @@ class HTMLUnicodeInputStream(object):
         self.chunkSize = 0
         self.chunkOffset = 0
         self.errors = []
+
+        # Absolute (normalized) character offset at which self.chunk starts.
+        # The normalized chunks partition the decoded, newline-normalized
+        # stream, so the offset of the next character to read is
+        # chunkStartOffset + chunkOffset.
+        self.chunkStartOffset = 0
+        # Sorted list of normalized offsets at which each line starts. Line 1
+        # starts at offset 0; every LF introduces another entry pointing just
+        # past it.  Only populated while source tracking is enabled.
+        self._lineStarts = [0]
 
         # number of (complete) lines in previous chunks
         self.prevNumLines = 0
@@ -231,6 +246,30 @@ class HTMLUnicodeInputStream(object):
         line, col = self._position(self.chunkOffset)
         return (line + 1, col)
 
+    def charOffset(self):
+        """Return the zero-based normalized character offset of the next
+        character to be read.
+
+        The offset counts code points in the decoded, newline-normalized
+        stream (CR and CR LF have already been collapsed to LF).
+        """
+        return self.chunkStartOffset + self.chunkOffset
+
+    def lineColAt(self, offset):
+        """Translate a normalized character ``offset`` into a
+        ``(line, column)`` pair.
+
+        Line numbers are one-based and columns zero-based, both measured in
+        normalized characters.  The offset may point one past the end of the
+        stream (at EOF).
+        """
+        # Number of line-start entries strictly greater than the offset gives
+        # how many lines start after it; the line index is that value.
+        index = bisect.bisect_right(self._lineStarts, offset) - 1
+        line = index + 1
+        column = offset - self._lineStarts[index]
+        return (line, column)
+
     def char(self):
         """ Read one character from the stream or queue if available. Return
             EOF when EOF is reached.
@@ -251,6 +290,9 @@ class HTMLUnicodeInputStream(object):
             chunkSize = self._defaultChunkSize
 
         self.prevNumLines, self.prevNumCols = self._position(self.chunkSize)
+
+        # Advance the absolute offset past the chunk we are replacing.
+        self.chunkStartOffset += self.chunkSize
 
         self.chunk = ""
         self.chunkSize = 0
@@ -281,6 +323,13 @@ class HTMLUnicodeInputStream(object):
 
         self.chunk = data
         self.chunkSize = len(data)
+
+        # Record where each new line starts in absolute normalized offsets.
+        if self._sourceTracking:
+            chunkBase = self.chunkStartOffset
+            for localIndex in range(len(data)):
+                if data[localIndex] == "\n":
+                    self._lineStarts.append(chunkBase + localIndex + 1)
 
         return True
 

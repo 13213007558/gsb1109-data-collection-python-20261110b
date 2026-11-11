@@ -8,6 +8,7 @@ Overview
    :maxdepth: 2
 
    movingparts
+   sourcelocator
    modules
    changes
    License <license>

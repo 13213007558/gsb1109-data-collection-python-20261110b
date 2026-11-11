@@ -34,6 +34,12 @@ def getETreeBuilder(ElementTreeImplementation, fullTree=False):
             self._childNodes = []
             self._flags = []
 
+        @property
+        def publicNode(self):
+            # Source information is keyed by the native Element (or comment /
+            # document node) that callers actually receive, not the wrapper.
+            return self._element
+
         def _getETreeTag(self, name, namespace):
             if namespace is None:
                 etree_tag = name

@@ -58,6 +58,12 @@ def getDomBuilder(DomImplementation):
             base.Node.__init__(self, element.nodeName)
             self.element = element
 
+        @property
+        def publicNode(self):
+            # The native DOM node is what callers receive and what source
+            # information is keyed by.
+            return self.element
+
         namespace = property(lambda self: hasattr(self.element, "namespaceURI") and
                              self.element.namespaceURI or None)
 
@@ -135,6 +141,11 @@ def getDomBuilder(DomImplementation):
             self.document.appendChild(NodeBuilder(doctype))
             if Dom == minidom:
                 doctype.ownerDocument = self.dom
+            if self.locator is not None:
+                if self._tokenIsImplied(token):
+                    self.locator.implied(doctype)
+                else:
+                    self.locator.present(doctype, token)
 
         def elementClass(self, name, namespace=None):
             if namespace is None and self.defaultNamespace is None:
@@ -162,10 +173,15 @@ def getDomBuilder(DomImplementation):
         def getFragment(self):
             return base.TreeBuilder.getFragment(self).element
 
-        def insertText(self, data, parent=None):
+        def _recordDocumentNode(self):
+            # The native DOMDocument (self.dom) is the object callers receive;
+            # self.document is only a weakref proxy back to this builder.
+            self.locator.implied(self.dom)
+
+        def insertText(self, data, parent=None, **kwargs):
             data = data
             if parent != self:
-                base.TreeBuilder.insertText(self, data, parent)
+                base.TreeBuilder.insertText(self, data, parent, **kwargs)
             else:
                 # HACK: allow text nodes as children of the document node
                 if hasattr(self.dom, '_child_node_types'):

@@ -37,10 +37,14 @@ class HTMLTokenizer(object):
       Points to HTMLInputStream object.
     """
 
-    def __init__(self, stream, parser=None, **kwargs):
+    def __init__(self, stream, parser=None, source_locator=False, **kwargs):
 
         self.stream = HTMLInputStream(stream, **kwargs)
         self.parser = parser
+        # When false (the default) tokens are emitted exactly as they were
+        # before, with no source metadata, so the common path is unchanged.
+        self._sourceTracking = source_locator
+        self.stream._sourceTracking = source_locator
 
         # Setup the initial tokenizer state
         self.escapeFlag = False
@@ -50,6 +54,10 @@ class HTMLTokenizer(object):
 
         # The current token being created
         self.currentToken = None
+        # Normalized offset of the "<" that opened the current tag/comment/
+        # doctype.  Recorded whenever a markup-opening state is entered and used
+        # to stamp tag, comment and doctype tokens with their source span.
+        self._markupStart = 0
         super(HTMLTokenizer, self).__init__()
 
     def __iter__(self):
@@ -66,7 +74,30 @@ class HTMLTokenizer(object):
             while self.stream.errors:
                 yield {"type": tokenTypes["ParseError"], "data": self.stream.errors.pop(0)}
             while self.tokenQueue:
-                yield self.tokenQueue.popleft()
+                token = self.tokenQueue.popleft()
+                if self._sourceTracking:
+                    self._stampTokenSource(token)
+                yield token
+
+    def _stampTokenSource(self, token):
+        """Attach the normalized source span to a token, unless the state that
+        produced it already recorded one (character references do, because
+        entity expansion means the span is not ``len(data)``)."""
+        if not self._sourceTracking or "source" in token \
+                or not isinstance(token, dict):
+            return
+        tokenType = token["type"]
+        endOffset = self.stream.charOffset()
+        if tokenType in (tokenTypes["Characters"], tokenTypes["SpaceCharacters"]):
+            startOffset = endOffset - len(token["data"])
+        elif tokenType in tagTokenTypes or tokenType in (
+                tokenTypes["Comment"], tokenTypes["Doctype"]):
+            startOffset = self._markupStart
+        else:
+            # ParseError and anything else: point at the current position.
+            startOffset = endOffset
+        token["source"] = {"startOffset": startOffset,
+                           "endOffset": endOffset}
 
     def consumeNumberEntity(self, isHex):
         """This function returns either U+FFFD or the character based on the
@@ -144,6 +175,12 @@ class HTMLTokenizer(object):
         # Initialise to the default output for when no entity is matched
         output = "&"
 
+        # The "&" that introduced the reference was already consumed by the
+        # calling state, so it sits one position before the current offset.
+        # Entity expansion changes the number of characters, so the resulting
+        # token cannot derive its span from the length of its data.
+        entityStart = (self.stream.charOffset() - 1
+                       if self._sourceTracking else 0)
         charStack = [self.stream.char()]
         if (charStack[0] in spaceCharacters or charStack[0] in (EOF, "<", "&") or
                 (allowedChar is not None and allowedChar == charStack[0])):
@@ -218,7 +255,13 @@ class HTMLTokenizer(object):
                 tokenType = "SpaceCharacters"
             else:
                 tokenType = "Characters"
-            self.tokenQueue.append({"type": tokenTypes[tokenType], "data": output})
+            token = {"type": tokenTypes[tokenType], "data": output}
+            if self._sourceTracking:
+                # The span covers the actual reference in the input, which may
+                # be shorter (an entity) or longer (a bare "&") than output.
+                token["source"] = {"startOffset": entityStart,
+                                   "endOffset": self.stream.charOffset()}
+            self.tokenQueue.append(token)
 
     def processEntityInAttribute(self, allowedChar):
         """This method replaces the need for "entityInAttributeValueState".
@@ -373,6 +416,10 @@ class HTMLTokenizer(object):
         return True
 
     def tagOpenState(self):
+        # The "<" that brought us here is the start of any tag, comment or
+        # doctype token this state produces.
+        if self._sourceTracking:
+            self._markupStart = self.stream.charOffset() - 1
         data = self.stream.char()
         if data == "!":
             self.state = self.markupDeclarationOpenState
@@ -454,6 +501,8 @@ class HTMLTokenizer(object):
         return True
 
     def rcdataLessThanSignState(self):
+        if self._sourceTracking:
+            self._markupStart = self.stream.charOffset() - 1
         data = self.stream.char()
         if data == "/":
             self.temporaryBuffer = ""
@@ -504,6 +553,8 @@ class HTMLTokenizer(object):
         return True
 
     def rawtextLessThanSignState(self):
+        if self._sourceTracking:
+            self._markupStart = self.stream.charOffset() - 1
         data = self.stream.char()
         if data == "/":
             self.temporaryBuffer = ""
@@ -554,6 +605,8 @@ class HTMLTokenizer(object):
         return True
 
     def scriptDataLessThanSignState(self):
+        if self._sourceTracking:
+            self._markupStart = self.stream.charOffset() - 1
         data = self.stream.char()
         if data == "/":
             self.temporaryBuffer = ""
