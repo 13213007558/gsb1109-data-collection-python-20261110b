@@ -1,0 +1,11 @@
+---
+features:
+  - |
+    Add support for named ordered groups via the ``ordered_group`` parameter of
+    :py:meth:`pytest_httpserver.HTTPServer.expect_request`,
+    :py:meth:`pytest_httpserver.HTTPServer.expect_ordered_request`, and
+    :py:meth:`pytest_httpserver.HTTPServer.expect`. Handlers registered with the
+    same group name must be matched in registration order, while handlers of
+    different groups (and of the default unnamed group) may be matched in any
+    interleaved order. A request matching the next handler of more than one
+    group is reported as an ambiguity error and consumes no handler.

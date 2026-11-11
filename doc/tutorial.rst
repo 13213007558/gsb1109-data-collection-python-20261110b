@@ -370,6 +370,38 @@ For further details about error handling, please read the
 :ref:`handling-test-errors` chapter.
 
 
+Ordered groups
+~~~~~~~~~~~~~~
+
+Ordered handlers registered without a group name all belong to the same
+(default) group, so their requests must arrive in registration order. When
+only the relative order within independent request sequences matters (for
+example, two paginated crawls whose page requests may interleave), handlers
+can be partitioned into named ordered groups with the ``ordered_group``
+parameter:
+
+.. code:: python
+
+    def test_ordered_groups(httpserver: HTTPServer):
+        httpserver.expect_ordered_request("/a/1", ordered_group="a").respond_with_data("a1")
+        httpserver.expect_ordered_request("/a/2", ordered_group="a").respond_with_data("a2")
+        httpserver.expect_ordered_request("/b/1", ordered_group="b").respond_with_data("b1")
+        httpserver.expect_ordered_request("/b/2", ordered_group="b").respond_with_data("b2")
+
+        # requests of different groups may interleave, but the registration
+        # order must be kept within each group
+        requests.get(httpserver.url_for("/a/1"))
+        requests.get(httpserver.url_for("/b/1"))
+        requests.get(httpserver.url_for("/a/2"))
+        requests.get(httpserver.url_for("/b/2"))
+
+An incoming request must match the next (not yet consumed) handler of exactly
+one group. If it matches the next handler of more than one group, the server
+reports an ambiguity error instead of picking one arbitrarily, and no handler
+is consumed. If it matches none, the request fails and the server is put into
+the same *permanent failure* mode as with the default ordered handling.
+
+
 Oneshot handling
 ~~~~~~~~~~~~~~~~
 

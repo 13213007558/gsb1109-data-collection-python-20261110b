@@ -1064,6 +1064,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         super().__init__(host, port, ssl_context, threaded=threaded)
 
         self.ordered_handlers: list[RequestHandler] = []
+        self.ordered_handler_groups: dict[str, list[RequestHandler]] = {}
         self.oneshot_handlers = RequestHandlerList()
         self.handlers = RequestHandlerList()
         self.permanently_failed = False
@@ -1117,23 +1118,59 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         """
 
         self.ordered_handlers = []
+        self.ordered_handler_groups = {}
         self.oneshot_handlers = RequestHandlerList()
         self.handlers = RequestHandlerList()
 
-    def expect(self, matcher: RequestMatcher, handler_type: HandlerType = HandlerType.PERMANENT) -> RequestHandler:
-        """
-        Create and register a request handler.
+    def _register_handler(
+        self,
+        request_handler: RequestHandler,
+        handler_type: HandlerType,
+        ordered_group: str | None = None,
+    ) -> None:
+        if ordered_group is not None and handler_type != HandlerType.ORDERED:
+            raise ValueError("ordered_group can only be specified with HandlerType.ORDERED")
 
-        :param matcher: :py:class:`RequestMatcher` used to match requests.
-        :param handler_type: type of handler
-        """
-        request_handler = RequestHandler(matcher)
         if handler_type == HandlerType.PERMANENT:
             self.handlers.append(request_handler)
         elif handler_type == HandlerType.ONESHOT:
             self.oneshot_handlers.append(request_handler)
         elif handler_type == HandlerType.ORDERED:
-            self.ordered_handlers.append(request_handler)
+            if ordered_group is None:
+                self.ordered_handlers.append(request_handler)
+            else:
+                self.ordered_handler_groups.setdefault(ordered_group, []).append(request_handler)
+
+    def _get_ordered_groups(self) -> list[tuple[str | None, list[RequestHandler]]]:
+        """Return the non-empty ordered handler groups as (group name, handlers) pairs.
+
+        The default (unnamed) group is represented by the ``None`` key.
+        """
+        groups: list[tuple[str | None, list[RequestHandler]]] = []
+        if self.ordered_handlers:
+            groups.append((None, self.ordered_handlers))
+        groups.extend((name, handlers) for name, handlers in self.ordered_handler_groups.items() if handlers)
+        return groups
+
+    def expect(
+        self,
+        matcher: RequestMatcher,
+        handler_type: HandlerType = HandlerType.PERMANENT,
+        ordered_group: str | None = None,
+    ) -> RequestHandler:
+        """
+        Create and register a request handler.
+
+        :param matcher: :py:class:`RequestMatcher` used to match requests.
+        :param handler_type: type of handler
+        :param ordered_group: name of the ordered group the handler belongs to.
+            Only valid when `handler_type` is `HandlerType.ORDERED`. Handlers in
+            the same group must be matched in registration order, but handlers of
+            different groups (and the default unnamed group) may be matched in any
+            interleaved order.
+        """
+        request_handler = RequestHandler(matcher)
+        self._register_handler(request_handler, handler_type, ordered_group)
         return request_handler
 
     def expect_request(
@@ -1148,6 +1185,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         handler_type: HandlerType = HandlerType.PERMANENT,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        ordered_group: str | None = None,
     ) -> RequestHandler:
         """
         Create and register a request handler.
@@ -1164,6 +1202,13 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         handlers registered, the first request must hit the first handler, and the second request must hit the second
         one, and not vice versa. If one or more ordered handler defined, those
         must be exhausted first.
+
+        Ordered handlers can be partitioned into independent groups with the
+        `ordered_group` parameter. Handlers registered with the same group name
+        must be matched in registration order, but handlers of different groups
+        (and of the default unnamed group) may be matched in any interleaved
+        order. If a request matches the next handler of more than one group, the
+        server reports an ambiguity error instead of picking one arbitrarily.
 
         .. note::
 
@@ -1198,6 +1243,8 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param ordered_group: name of the ordered group the handler belongs to.
+            Only valid when `handler_type` is `HandlerType.ORDERED`.
 
         :return: Created and register :py:class:`RequestHandler`.
 
@@ -1216,12 +1263,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             **({"data_form": data_form} if data_form is not None else {}),
         )
         request_handler = RequestHandler(matcher)
-        if handler_type == HandlerType.PERMANENT:
-            self.handlers.append(request_handler)
-        elif handler_type == HandlerType.ONESHOT:
-            self.oneshot_handlers.append(request_handler)
-        elif handler_type == HandlerType.ORDERED:
-            self.ordered_handlers.append(request_handler)
+        self._register_handler(request_handler, handler_type, ordered_group)
         return request_handler
 
     def expect_oneshot_request(
@@ -1281,6 +1323,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             header_value_matcher=header_value_matcher,
             handler_type=HandlerType.ONESHOT,
             json=json,
+            ordered_group=None,
             **({"data_form": data_form} if data_form is not None else {}),
         )
 
@@ -1295,6 +1338,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         header_value_matcher: HVMATCHER_T | None = None,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        ordered_group: str | None = None,
     ) -> RequestHandler:
         """
         Create and register a ordered request handler.
@@ -1325,6 +1369,11 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param ordered_group: name of the ordered group the handler belongs to.
+            Handlers in the same group must be matched in registration order, but
+            handlers of different groups (and of the default unnamed group) may be
+            matched in any interleaved order. If not specified, the handler is
+            registered into the default unnamed group.
 
         :return: Created and register :py:class:`RequestHandler`.
 
@@ -1341,6 +1390,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             header_value_matcher=header_value_matcher,
             handler_type=HandlerType.ORDERED,
             json=json,
+            ordered_group=ordered_group,
             **({"data_form": data_form} if data_form is not None else {}),
         )
 
@@ -1363,6 +1413,10 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         lines: list[str] = []
         lines.append("Ordered matchers:")
         lines.extend(format_handlers(self.ordered_handlers))
+        for group_name, group_handlers in self.ordered_handler_groups.items():
+            lines.append("")
+            lines.append("Ordered matchers (group {!r}):".format(group_name))
+            lines.extend(format_handlers(group_handlers))
         lines.append("")
         lines.append("Oneshot matchers:")
         lines.extend(format_handlers(self.oneshot_handlers))
@@ -1407,7 +1461,10 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         First, the request is checked for the ordered matchers. If there's an ordered matcher,
         it must match the request, otherwise the server will be put into a `permanent failure`
         mode in which it makes all request failed - this is the intended way of working of ordered
-        matchers.
+        matchers. Ordered matchers may be partitioned into independent groups (see the
+        `ordered_group` parameter of :py:meth:`expect_request`): the request must match the
+        next handler of exactly one group. If it matches the next handler of more than one
+        group, an ambiguity error is reported and no handler is consumed.
 
         Then oneshot handlers, and the permanent handlers are looked up.
 
@@ -1423,14 +1480,30 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             return self.respond_permanent_failure()
 
         handler = None
-        if self.ordered_handlers:
-            handler = self.ordered_handlers[0]
-            if not handler.matcher.match(request):
+        ordered_groups = self._get_ordered_groups()
+        if ordered_groups:
+            matching_groups = [
+                (group_name, group_handlers)
+                for group_name, group_handlers in ordered_groups
+                if group_handlers[0].matcher.match(request)
+            ]
+
+            if len(matching_groups) > 1:
+                self.permanently_failed = True
+                return self.respond_nohandler(
+                    request,
+                    self._format_ambiguous_ordered_match(matching_groups),
+                )
+
+            if not matching_groups:
                 self.permanently_failed = True
                 response = self.respond_nohandler(request)
                 return response
 
-            self.ordered_handlers.pop(0)
+            group_name, group_handlers = matching_groups[0]
+            handler = group_handlers.pop(0)
+            if group_name is not None and not group_handlers:
+                del self.ordered_handler_groups[group_name]
             self._update_waiting_result()
 
         if not handler:
@@ -1463,6 +1536,22 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
 
         return response
 
+    @staticmethod
+    def _format_ambiguous_ordered_match(matching_groups: list[tuple[str | None, list[RequestHandler]]]) -> str:
+        """Format an error message for a request matching multiple ordered groups."""
+
+        def format_group_name(group_name: str | None) -> str:
+            if group_name is None:
+                return "the default group"
+            return "group {!r}".format(group_name)
+
+        group_names = ", ".join(format_group_name(group_name) for group_name, _ in matching_groups)
+        return (
+            "\nAmbiguous ordered request: it matches the next handler of {}. "
+            "Refusing to pick one arbitrarily; make the matchers disjoint "
+            "or register the handlers into the same ordered group.".format(group_names)
+        )
+
     def _set_waiting_result(self, value: bool) -> None:  # noqa: FBT001
         """Set waiting_result
 
@@ -1473,7 +1562,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             self._waiting_result.put_nowait(value)
 
     def _update_waiting_result(self) -> None:
-        if not self.oneshot_handlers and not self.ordered_handlers:
+        if not self.oneshot_handlers and not self.ordered_handlers and not self.ordered_handler_groups:
             self._set_waiting_result(value=True)
 
     @contextmanager
