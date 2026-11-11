@@ -24,6 +24,7 @@ from re import Pattern
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
+from typing import NamedTuple
 from typing import TypedDict
 
 from werkzeug import Request
@@ -333,6 +334,7 @@ class RequestMatcherKwargs(TypedDict, total=False):
     """Keyword arguments common to ``expect_request()`` and related methods."""
 
     method: str
+    host: str | None
     data: str | bytes | None
     data_encoding: str
     headers: Mapping[str, str] | None
@@ -340,6 +342,80 @@ class RequestMatcherKwargs(TypedDict, total=False):
     header_value_matcher: HVMATCHER_T | None
     json: Any
     data_form: Mapping[str, str] | None
+
+
+class HostParts(NamedTuple):
+    """A normalized virtual host split into the name and its optional port."""
+
+    host: str
+    port: str | None
+
+
+def parse_host(host: str) -> HostParts:
+    """
+    Split a virtual host identifier or an incoming ``Host`` header into a
+    normalized name and an optional port.
+
+    The name is lowercased (DNS names are case-insensitive) and an IPv6 literal
+    is stripped of its enclosing square brackets. The port, when present, is
+    returned separately so a bare registration such as ``"example.com"`` can
+    match any port while ``"example.com:8080"`` requires that exact port.
+
+    :param host: the host or ``host:port`` authority to parse
+    :return: a :class:`HostParts` tuple of the normalized name and port
+    """
+    normalized = host.strip().lower()
+    if normalized.startswith("["):
+        closing_bracket = normalized.find("]")
+        if closing_bracket == -1:
+            message = "invalid IPv6 host authority, missing closing bracket: {!r}".format(host)
+            raise ValueError(message)
+        name = normalized[1:closing_bracket]
+        remainder = normalized[closing_bracket + 1 :]
+        if remainder:
+            if not remainder.startswith(":"):
+                message = "invalid host authority, unexpected text after IPv6 literal: {!r}".format(host)
+                raise ValueError(message)
+            port = remainder[1:]
+        else:
+            port = None
+        return HostParts(name, port)
+
+    if normalized.count(":") > 1:
+        # A bare IPv6 literal without brackets, e.g. "2001:db8::1": no port.
+        return HostParts(normalized, None)
+
+    name, separator, port = normalized.partition(":")
+    return HostParts(name, port if separator else None)
+
+
+def format_host_authority(parts: HostParts) -> str:
+    """
+    Render :class:`HostParts` back into an authority string, re-adding brackets
+    around an IPv6 literal.
+    """
+    authority = f"[{parts.host}]" if ":" in parts.host else parts.host
+    if parts.port is not None:
+        authority = f"{authority}:{parts.port}"
+    return authority
+
+
+def get_request_host(request: Request) -> HostParts:
+    """
+    Return the parsed virtual host of a request.
+
+    Werkzeug resolves the authority from the ``Host`` header, or, for an
+    absolute-form request target such as ``GET http://example.com/path``, from
+    the target's netloc (which overrides the ``Host`` header). The result is
+    parsed with :func:`parse_host`. A malformed inbound authority (for example
+    an unclosed IPv6 bracket) does not raise: it yields an empty host name, so
+    the request simply fails any host-scoped expectation instead of crashing
+    the server. Host-agnostic expectations still match it.
+    """
+    try:
+        return parse_host(request.host)
+    except ValueError:
+        return HostParts("", None)
 
 
 class RequestMatcher:
@@ -352,6 +428,16 @@ class RequestMatcher:
         :py:class:`URIPattern` object, or a regular expression compiled by :py:func:`re.compile`.
     :param method: HTTP method of the request. If not specified (or `METHOD_ALL`
         specified), all HTTP requests will match.
+    :param host: expected value of the request's virtual host, derived from the
+        ``Host`` header (or from the netloc of an absolute-form request target).
+        Matching is done on the normalized authority: casing and the square
+        brackets around IPv6 literals are ignored. The port is only checked
+        when the expectation carries one: pass ``"example.com"`` to match any
+        port, or ``"example.com:8080"`` to require that exact port; an IPv6
+        literal can be written as ``"2001:db8::1"`` or
+        ``"[2001:db8::1]:8080"``. When ``None`` (the default), the host is not
+        matched, which preserves the single-site behavior. Host matching is
+        independent of the ``headers`` parameter and the two can be combined.
     :param data: payload of the HTTP request. This could be a string (utf-8 encoded
         by default, see `data_encoding`) or a bytes object.
     :param data_encoding: the encoding used for data parameter if data is a string.
@@ -385,6 +471,7 @@ class RequestMatcher:
         header_value_matcher: HVMATCHER_T | None = None,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        host: str | None = None,
     ) -> None:
         if json is not UNDEFINED and data is not None:
             raise ValueError("data and json parameters are mutually exclusive")
@@ -393,6 +480,7 @@ class RequestMatcher:
 
         self.uri = uri
         self.method = method
+        self.host: HostParts | None = None if host is None else parse_host(host)
         self.query_string = query_string
         self.query_matcher = _create_query_matcher(self.query_string)
         self.json = json
@@ -439,6 +527,27 @@ class RequestMatcher:
         if self.data is None:
             return True
         return request.data == self.data
+
+    def match_host(self, request: Request) -> bool:
+        """
+        Matches the virtual host of the request.
+
+        Returns ``True`` when no host expectation was registered, so the
+        single-site (host-agnostic) behavior is preserved. Otherwise the host
+        name must be equal after normalization (case-insensitive, IPv6 brackets
+        ignored). The port is only checked when the expectation itself carries
+        a port: a bare ``"example.com"`` matches any port while
+        ``"example.com:8080"`` requires port 8080.
+
+        :param request: the HTTP request
+        :return: `True` when the host matches or no host matching is required.
+        """
+        if self.host is None:
+            return True
+        actual = get_request_host(request)
+        if actual.host != self.host.host:
+            return False
+        return self.host.port is None or actual.port == self.host.port
 
     def match_uri(self, request: Request) -> bool:
         path = request.path
@@ -512,6 +621,10 @@ class RequestMatcher:
 
         if not self.match_uri(request):
             retval.append(("uri", request.path, self.uri))
+
+        if self.host is not None and not self.match_host(request):
+            actual_host = get_request_host(request)
+            retval.append(("host", format_host_authority(actual_host), format_host_authority(self.host)))
 
         if self.method not in (METHOD_ALL, request.method):
             retval.append(("method", request.method, self.method))
@@ -677,9 +790,18 @@ class RequestHandlerList(list[RequestHandler]):
     def match(self, request: Request) -> RequestHandler | None:
         """
         Returns the first request handler which matches the specified request. Otherwise, it returns `None`.
+
+        Handlers scoped to a virtual host take precedence over host-agnostic
+        handlers, so a site-specific handler is not shadowed by a fallback
+        registered earlier for the same path. Within each group, registration
+        order is preserved. When no handler carries a host expectation this is
+        equivalent to returning the first matching handler in registration order.
         """
         for requesthandler in self:
-            if requesthandler.matcher.match(request):
+            if requesthandler.matcher.host is not None and requesthandler.matcher.match(request):
+                return requesthandler
+        for requesthandler in self:
+            if requesthandler.matcher.host is None and requesthandler.matcher.match(request):
                 return requesthandler
         return None
 
@@ -1148,6 +1270,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         handler_type: HandlerType = HandlerType.PERMANENT,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        host: str | None = None,
     ) -> RequestHandler:
         """
         Create and register a request handler.
@@ -1198,6 +1321,14 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param host: expected virtual host of the request, taken from the ``Host``
+            header (or the netloc of an absolute-form request target). Casing and
+            the brackets of IPv6 literals are normalized away. The port is only
+            significant when ``host`` itself carries one: ``"example.com"``
+            matches any port while ``"example.com:8080"`` requires that port.
+            When ``None`` (the default) the host is not matched, so the
+            single-site behavior is preserved and a host-agnostic handler cannot
+            catch a request that another site's host-scoped handler answers.
 
         :return: Created and register :py:class:`RequestHandler`.
 
@@ -1213,6 +1344,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             query_string=query_string,
             header_value_matcher=header_value_matcher,
             json=json,
+            host=host,
             **({"data_form": data_form} if data_form is not None else {}),
         )
         request_handler = RequestHandler(matcher)
@@ -1235,6 +1367,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         header_value_matcher: HVMATCHER_T | None = None,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        host: str | None = None,
     ) -> RequestHandler:
         """
         Create and register a oneshot request handler.
@@ -1265,6 +1398,8 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param host: expected virtual host. See :py:meth:`expect_request` for the
+            normalization and port-matching rules.
 
         :return: Created and register :py:class:`RequestHandler`.
 
@@ -1281,6 +1416,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             header_value_matcher=header_value_matcher,
             handler_type=HandlerType.ONESHOT,
             json=json,
+            host=host,
             **({"data_form": data_form} if data_form is not None else {}),
         )
 
@@ -1295,6 +1431,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         header_value_matcher: HVMATCHER_T | None = None,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        host: str | None = None,
     ) -> RequestHandler:
         """
         Create and register a ordered request handler.
@@ -1325,6 +1462,8 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param host: expected virtual host. See :py:meth:`expect_request` for the
+            normalization and port-matching rules.
 
         :return: Created and register :py:class:`RequestHandler`.
 
@@ -1341,6 +1480,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             header_value_matcher=header_value_matcher,
             handler_type=HandlerType.ORDERED,
             json=json,
+            host=host,
             **({"data_form": data_form} if data_form is not None else {}),
         )
 

@@ -36,6 +36,21 @@ RequestMatcher
     .. autoclass:: RequestMatcher
         :members:
 
+HostParts
+~~~~~~~~~
+
+    .. autoclass:: HostParts
+        :members:
+
+Virtual host helpers
+~~~~~~~~~~~~~~~~~~~~
+
+    .. autofunction:: parse_host
+
+    .. autofunction:: format_host_authority
+
+    .. autofunction:: get_request_host
+
 
 BakedHTTPServer
 ~~~~~~~~~~~~~~~~

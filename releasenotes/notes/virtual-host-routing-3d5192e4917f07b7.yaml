@@ -1,0 +1,17 @@
+---
+features:
+  - |
+    One server can now emulate multiple virtual hosts. ``expect_request``,
+    ``expect_oneshot_request`` and ``expect_ordered_request`` accept a ``host``
+    parameter, and ``BlockingHTTPServer.assert_request`` accepts it too. The
+    new ``BakedHTTPServer.for_host()`` returns a proxy whose expectations are
+    scoped to one host, which keeps expectations and log queries grouped by
+    site and lets the same path return a different body under each host.
+    Host names are matched case-insensitively and IPv6 brackets are normalized;
+    the port is only required when the expectation itself specifies one, so a
+    bare host matches any port. Host-scoped handlers take precedence over
+    host-agnostic ones while a handler without a host keeps matching every
+    host, preserving the single-site behavior. An unregistered host is not
+    caught by another site's handler and goes through the no-handler path.
+    Absolute-form request targets route by the target's netloc, which
+    overrides the ``Host`` header as per RFC 2616.

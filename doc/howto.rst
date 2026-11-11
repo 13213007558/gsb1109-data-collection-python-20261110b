@@ -839,3 +839,75 @@ All ``expect_request``, ``expect_oneshot_request``, and
 ``expect_ordered_request`` methods are available on the baked object. Other
 attributes such as ``url_for()`` and ``check_assertions()`` are delegated to
 the underlying server transparently.
+
+
+Serving multiple virtual hosts on one server
+---------------------------------------------
+
+One listening server can emulate several sites distinguished by the request's
+authority (the ``Host`` header). Pass the ``host`` parameter to
+``expect_request`` (or the oneshot/ordered variants), or build one proxy per
+site with :py:meth:`pytest_httpserver.BakedHTTPServer.for_host`. The same path
+can then return a different body under each host, and the expectations stay
+grouped by site.
+
+.. literalinclude :: ../tests/examples/test_howto_virtual_hosts.py
+   :language: python
+
+A handler registered without a ``host`` stays host-agnostic, so the default
+single-site usage is unchanged: it still answers every host. When both a
+host-scoped and a host-agnostic handler match the same path, the host-scoped
+one wins regardless of registration order; the host-agnostic handler remains
+the fallback for the other hosts. A request whose host nobody registered for
+that path is **not** silently caught by another site's handler: it goes through
+the normal no-handler handling (an assertion plus the
+``no_handler_status_code`` response), which makes the missing expectation
+explicit.
+
+The request log remains a single list on the server. Query it per site by
+passing a host-scoped :py:class:`pytest_httpserver.RequestMatcher` to
+``assert_request_made`` or ``iter_matching_requests``.
+
+How the authority is matched
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The expected value and the incoming authority are normalized before
+comparison:
+
+* DNS names are compared case-insensitively, and surrounding whitespace is
+  ignored.
+
+* The square brackets around an IPv6 literal are optional in the expectation
+  and are stripped before comparison, so ``"2001:db8::1"`` and
+  ``"[2001:db8::1]"`` are equivalent.
+
+* The **port is significant only when the expectation itself carries one**. A
+  bare name such as ``"site-a.example"`` matches the request no matter which
+  port the client put in the ``Host`` header (``site-a.example``,
+  ``site-a.example:8080``, ...). An expectation with a port, such as
+  ``"site-a.example:8080"``, requires that exact port and rejects
+  ``site-a.example:9000``. For IPv6, write the port outside the brackets:
+  ``"[2001:db8::1]:8080"``.
+
+Hosts with a port, IPv6 literals and absolute request targets
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* *Host with a port:* the client's ``Host: site-a.example:8080`` header is the
+  authority. Register ``host="site-a.example"`` to match it on any port, or
+  ``host="site-a.example:8080"`` to pin the port.
+
+* *IPv6 literal:* clients send the literal in brackets, e.g.
+  ``Host: [2001:db8::1]:8080``. The brackets are normalized away, so
+  ``host="2001:db8::1"`` matches any port while
+  ``host="[2001:db8::1]:8080"`` pins it.
+
+* *Absolute-form request target:* a proxy-style request line such as
+  ``GET http://site-b.example:9000/export HTTP/1.1`` carries the authority in
+  the target itself. Per RFC 2616 the target's netloc is used as the authority
+  and takes precedence over the ``Host`` header, so routing follows
+  ``site-b.example:9000`` even if the two disagree. The path (``/export``) is
+  still matched in the usual way.
+
+These rules also apply to :py:meth:`pytest_httpserver.BlockingHTTPServer.assert_request`,
+which accepts the same ``host`` parameter.
+

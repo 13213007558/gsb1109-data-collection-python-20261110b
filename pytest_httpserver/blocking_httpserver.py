@@ -81,6 +81,7 @@ class BlockingHTTPServer(HTTPServerBase):
         json: Any = UNDEFINED,
         timeout: int = 30,
         data_form: Mapping[str, str] | None = None,
+        host: str | None = None,
     ) -> BlockingRequestHandler:
         """
         Wait for an incoming request and check whether it matches according to the given parameters.
@@ -113,6 +114,11 @@ class BlockingHTTPServer(HTTPServerBase):
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param host: expected virtual host of the request taken from the ``Host``
+            header (or the netloc of an absolute-form request target). Casing and
+            the brackets of IPv6 literals are normalized. A bare host matches any
+            port; a host with a port requires that exact port. ``None`` (the
+            default) does not match the host.
 
         :return: Created and registered :py:class:`BlockingRequestHandler`.
 
@@ -128,6 +134,7 @@ class BlockingHTTPServer(HTTPServerBase):
             query_string=query_string,
             header_value_matcher=header_value_matcher,
             json=json,
+            host=host,
             **({"data_form": data_form} if data_form is not None else {}),
         )
 

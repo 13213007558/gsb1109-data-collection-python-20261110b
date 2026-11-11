@@ -76,6 +76,23 @@ class BakedHTTPServer:
         """
         return self.__class__(self._server, **self._merge_kwargs(kwargs))
 
+    def for_host(self, host: str) -> Self:
+        """
+        Create a proxy whose expectations are scoped to one virtual host.
+
+        Every ``expect_request`` (and the oneshot/ordered variants) made on the
+        returned proxy carries the given ``host``, so a single path can serve
+        different bodies under different hosts. Call this once per simulated
+        site to keep expectations grouped by site. A request whose ``Host`` is
+        not registered for that path falls through to the normal no-handler
+        handling instead of being answered by another site's handler.
+
+        :param host: the authority to scope to, e.g. ``"site-a.example"``,
+            ``"site-a.example:8080"`` or ``"[2001:db8::1]:8080"``. See
+            :py:class:`pytest_httpserver.RequestMatcher` for normalization rules.
+        """
+        return self.bake(host=host)
+
     def expect_request(
         self,
         uri: str | URIPattern | Pattern[str],
