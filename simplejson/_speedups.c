@@ -282,6 +282,7 @@ typedef struct _PyEncoderObject {
     PyObject *module_ref;
     PyObject *markers;
     PyObject *defaultfn;
+    PyObject *transformfn;
     PyObject *encoder;
     PyObject *indent;
     PyObject *key_separator;
@@ -316,6 +317,7 @@ typedef struct _PyEncoderObject {
     X(module_ref)                     \
     X(markers)                        \
     X(defaultfn)                      \
+    X(transformfn)                    \
     X(encoder)                        \
     X(encoding)                       \
     X(indent)                         \
@@ -334,6 +336,7 @@ typedef struct _PyEncoderObject {
 static PyMemberDef encoder_members[] = {
     {"markers", Py_T_OBJECT_EX, offsetof(PyEncoderObject, markers), READONLY, "markers"},
     {"default", Py_T_OBJECT_EX, offsetof(PyEncoderObject, defaultfn), READONLY, "default"},
+    {"transform", Py_T_OBJECT_EX, offsetof(PyEncoderObject, transformfn), READONLY, "transform"},
     {"encoder", Py_T_OBJECT_EX, offsetof(PyEncoderObject, encoder), READONLY, "encoder"},
     {"encoding", Py_T_OBJECT_EX, offsetof(PyEncoderObject, encoding), READONLY, "encoding"},
     {"indent", Py_T_OBJECT_EX, offsetof(PyEncoderObject, indent), READONLY, "indent"},
@@ -415,11 +418,14 @@ static PyObject *
 encoder_stringify_key(PyEncoderObject *s, PyObject *key);
 static int
 encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
-                        PyObject *origin, Py_ssize_t indent_level);
+                        PyObject *origin, Py_ssize_t indent_level,
+                        PyObject *path);
 static int
-encoder_listencode_obj(PyEncoderObject *s, JSON_Accu *rval, PyObject *obj, Py_ssize_t indent_level);
+encoder_listencode_obj(PyEncoderObject *s, JSON_Accu *rval, PyObject *obj,
+                       Py_ssize_t indent_level, PyObject *path);
 static int
-encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct, Py_ssize_t indent_level);
+encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct,
+                        Py_ssize_t indent_level, PyObject *path);
 static PyObject *
 _encoded_const(_speedups_state *state, PyObject *obj);
 static void
@@ -440,7 +446,13 @@ encoder_accumulate_newline_indent(PyEncoderObject *s, _speedups_state *state,
 #if PY_VERSION_HEX >= 0x030B0000
 static void
 encoder_annotate_exception(_speedups_state *state, const char *format, ...);
+static void
+encoder_note_cycle(_speedups_state *state, PyObject *path);
+#else
+#define encoder_note_cycle(state, path) ((void)0)
 #endif
+static PyObject *
+encoder_path_child(PyObject *path, PyObject *part);
 static int
 init_speedups_state(_speedups_state *state, PyObject *module);
 static PyObject *
@@ -2598,6 +2610,7 @@ encoder_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         "ignore_nan",
         "Decimal",
         "iterable_as_array",
+        "transform",
         NULL};
 
     PyEncoderObject *s;
@@ -2605,7 +2618,9 @@ encoder_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     PyObject *item_separator, *sort_keys, *skipkeys, *allow_nan, *key_memo;
     PyObject *use_decimal, *namedtuple_as_object, *tuple_as_array, *iterable_as_array;
     PyObject *int_as_string_bitcount, *item_sort_key, *encoding, *for_json;
-    PyObject *ignore_nan, *Decimal;
+    /* Optional: default to Py_None so older 20-positional-argument callers
+     * (and the keyword-less direct calls in the test suite) keep working. */
+    PyObject *ignore_nan, *Decimal, *transform = Py_None;
     int is_true;
 
     /* Build the format string from per-argument pieces so that each "O"
@@ -2634,6 +2649,7 @@ encoder_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         "O"  /* ignore_nan */
         "O"  /* Decimal */
         "O"  /* iterable_as_array */
+        "|O" /* transform (optional; defaults to None) */
         ":make_encoder";
 
     if (!PyArg_ParseTupleAndKeywords(args, kwds, fmt, kwlist,
@@ -2641,7 +2657,7 @@ encoder_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         &sort_keys, &skipkeys, &allow_nan, &key_memo, &use_decimal,
         &namedtuple_as_object, &tuple_as_array,
         &int_as_string_bitcount, &item_sort_key, &encoding, &for_json,
-        &ignore_nan, &Decimal, &iterable_as_array))
+        &ignore_nan, &Decimal, &iterable_as_array, &transform))
         return NULL;
 
     /* markers goes straight to PyDict_Contains, PyDict_SetItem and
@@ -2650,6 +2666,13 @@ encoder_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         PyErr_Format(PyExc_TypeError,
                      "make_encoder() argument 1 must be dict or None, not %.80s",
                      json_type_name(markers));
+        return NULL;
+    }
+
+    if (transform != Py_None && !PyCallable_Check(transform)) {
+        PyErr_Format(PyExc_TypeError,
+                     "transform must be None or callable, not %.80s",
+                     json_type_name(transform));
         return NULL;
     }
 
@@ -2670,6 +2693,8 @@ encoder_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     s->markers = markers;
     Py_INCREF(defaultfn);
     s->defaultfn = defaultfn;
+    Py_INCREF(transform);
+    s->transformfn = transform;
     Py_INCREF(encoder);
     s->encoder = encoder;
 #if PY_MAJOR_VERSION >= 3
@@ -2827,6 +2852,7 @@ encoder_call(PyObject *self, PyObject *args, PyObject *kwds)
     PyEncoderObject *s;
     JSON_Accu rval;
     _speedups_state *state;
+    PyObject *root_path;
     int encode_rv;
 #if PY_VERSION_HEX < 0x030D0000
     assert(PyEncoder_Check(self));
@@ -2838,8 +2864,18 @@ encoder_call(PyObject *self, PyObject *args, PyObject *kwds)
         return NULL;
     if (JSON_Accu_Init(&rval))
         return NULL;
+    /* Paths only exist to be handed to transform(); leave the root path
+     * NULL (and skip every child-path allocation) when no transform is
+     * configured, so the default/default-only encode keeps its old cost.
+     * PyTuple_New(0) otherwise returns the shared, immortal empty tuple. */
+    root_path = (s->transformfn != Py_None) ? PyTuple_New(0) : NULL;
+    if (s->transformfn != Py_None && root_path == NULL) {
+        JSON_Accu_Destroy(&rval);
+        return NULL;
+    }
     Py_BEGIN_CRITICAL_SECTION(self);
-    encode_rv = encoder_listencode_obj(s, &rval, obj, indent_level);
+    encode_rv = encoder_listencode_obj(s, &rval, obj, indent_level,
+                                       root_path);
     Py_END_CRITICAL_SECTION();
     if (encode_rv) {
         JSON_Accu_Destroy(&rval);
@@ -3023,10 +3059,12 @@ _steal_accumulate(_speedups_state *state, JSON_Accu *accu, PyObject *stolen)
  * path, to remove the entry). If markers tracking is off
  * (s->markers == Py_None), stores NULL in *ident_ptr and returns 0 with
  * no side effects — that NULL is the sentinel both of those understand.
- * On circular reference sets the ValueError; on any other failure sets
- * the corresponding exception. Returns 0 on success, -1 on error. */
+ * On circular reference sets the ValueError (with the location in `path`
+ * attached as a note); on any other failure sets the corresponding
+ * exception. Returns 0 on success, -1 on error. */
 static int
-encoder_markers_push(PyEncoderObject *s, PyObject *obj, PyObject **ident_ptr)
+encoder_markers_push(PyEncoderObject *s, PyObject *obj, PyObject **ident_ptr,
+                     PyObject *path)
 {
     PyObject *ident;
     int has_key;
@@ -3038,8 +3076,13 @@ encoder_markers_push(PyEncoderObject *s, PyObject *obj, PyObject **ident_ptr)
         return -1;
     has_key = PyDict_Contains(s->markers, ident);
     if (has_key) {
-        if (has_key != -1)
+        if (has_key != -1) {
             PyErr_SetString(PyExc_ValueError, "Circular reference detected");
+            /* path is NULL when no transform was configured; keep the
+             * bare message for the default/default-only encode. */
+            if (path != NULL)
+                encoder_note_cycle(get_speedups_state(s->module_ref), path);
+        }
         Py_DECREF(ident);
         return -1;
     }
@@ -3092,10 +3135,11 @@ encoder_markers_discard(PyEncoderObject *s, PyObject *ident)
 /* Raise ValueError if obj is already in the markers dict, i.e. it is
  * currently being encoded further up the stack. Used where a side-
  * effecting call (such as __iter__) has to run before the marker can
- * be pushed. Returns 0 when obj is not marked or tracking is off, -1
+ * be pushed. `path` locates obj and is attached to the error as a note.
+ * Returns 0 when obj is not marked or tracking is off, -1
  * with an exception set otherwise. */
 static int
-encoder_markers_check(PyEncoderObject *s, PyObject *obj)
+encoder_markers_check(PyEncoderObject *s, PyObject *obj, PyObject *path)
 {
     PyObject *ident;
     int has_key;
@@ -3107,12 +3151,149 @@ encoder_markers_check(PyEncoderObject *s, PyObject *obj)
     has_key = PyDict_Contains(s->markers, ident);
     Py_DECREF(ident);
     if (has_key) {
-        if (has_key != -1)
+        if (has_key != -1) {
             PyErr_SetString(PyExc_ValueError, "Circular reference detected");
+            if (path != NULL)
+                encoder_note_cycle(get_speedups_state(s->module_ref), path);
+        }
         return -1;
     }
     return 0;
 }
+
+/* Build the path tuple for a child reached via `part` (a dict key, or an
+ * item index wrapped as a PyLong). Returns a new reference; path is the
+ * parent's (always a tuple, the empty tuple at the document root). */
+static PyObject *
+encoder_path_child(PyObject *path, PyObject *part)
+{
+    Py_ssize_t base = PyTuple_GET_SIZE(path);
+    Py_ssize_t i;
+    PyObject *child = PyTuple_New(base + 1);
+    if (child == NULL)
+        return NULL;
+    for (i = 0; i < base; i++) {
+        PyObject *item = PyTuple_GET_ITEM(path, i);
+        Py_INCREF(item);
+        PyTuple_SET_ITEM(child, i, item);
+    }
+    Py_INCREF(part);
+    PyTuple_SET_ITEM(child, base, part);
+    return child;
+}
+
+/* Path tuple for a dict value. Uses the stringified key so the C and
+ * pure-Python encoders hand transform() identical paths for non-string
+ * keys (e.g. an int key is named by its str form). Returns NULL when no
+ * transform is configured (path == NULL). */
+static PyObject *
+encoder_dict_child_path(PyEncoderObject *s, PyObject *path, PyObject *key)
+{
+    PyObject *path_key, *child;
+    if (path == NULL)
+        return NULL;
+    path_key = encoder_stringify_key(s, key);
+    if (path_key == NULL)
+        return NULL;
+    if (path_key == Py_None) {
+        /* skipkeys: normally already filtered upstream; keep the raw key
+         * rather than dropping the path entirely. */
+        Py_DECREF(path_key);
+        path_key = key;
+        Py_INCREF(path_key);
+    }
+    child = encoder_path_child(path, path_key);
+    Py_DECREF(path_key);
+    return child;
+}
+
+/* Path tuple for a list item. Returns NULL when no transform is
+ * configured (path == NULL). */
+static PyObject *
+encoder_list_child_path(PyObject *path, Py_ssize_t index)
+{
+    PyObject *idx_obj, *child;
+    if (path == NULL)
+        return NULL;
+    idx_obj = PyLong_FromSsize_t(index);
+    if (idx_obj == NULL)
+        return NULL;
+    child = encoder_path_child(path, idx_obj);
+    Py_DECREF(idx_obj);
+    return child;
+}
+
+#if PY_VERSION_HEX >= 0x030B0000
+/* Attach the concrete location of a circular reference to the in-flight
+ * ValueError, mirroring the pure-Python encoder's _note_cycle(). The
+ * primary message stays "Circular reference detected"; this only adds a
+ * PEP 678 note. Fetches the exception first because the note is built by
+ * repr-like formatting, which must not run with a live exception on debug
+ * builds. Diagnostic failures are swallowed. */
+static void
+encoder_note_cycle(_speedups_state *state, PyObject *path)
+{
+    PyObject *exc_type, *exc_value, *exc_tb;
+    PyObject *note, *result, *parts;
+    Py_ssize_t i, size;
+
+    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+    if (exc_value == NULL) {
+        PyErr_Restore(exc_type, exc_value, exc_tb);
+        return;
+    }
+    PyErr_NormalizeException(&exc_type, &exc_value, &exc_tb);
+
+    size = PyTuple_GET_SIZE(path);
+    if (size == 0) {
+        note = PyUnicode_FromString(
+            "Circular reference detected at the document root");
+    }
+    else {
+        parts = PyList_New(1 + size);
+        if (parts == NULL) {
+            PyErr_Clear();
+            PyErr_Restore(exc_type, exc_value, exc_tb);
+            return;
+        }
+        PyList_SET_ITEM(parts, 0, PyUnicode_FromString(
+            "Circular reference detected at path "));
+        for (i = 0; i < size; i++) {
+            PyObject *part = PyTuple_GET_ITEM(path, i);
+            PyObject *piece;
+            if (PyUnicode_Check(part))
+                piece = PyUnicode_FromFormat(".%U", part);
+            else
+                piece = PyUnicode_FromFormat("[%zd]",
+                                              PyLong_AsSsize_t(part));
+            if (piece == NULL) {
+                Py_DECREF(parts);
+                PyErr_Clear();
+                PyErr_Restore(exc_type, exc_value, exc_tb);
+                return;
+            }
+            PyList_SET_ITEM(parts, 1 + i, piece);
+        }
+        note = PyUnicode_Join(state->JSON_EmptyUnicode, parts);
+        Py_DECREF(parts);
+    }
+
+    if (note != NULL) {
+        result = PyObject_CallMethodObjArgs(exc_value,
+                                            state->JSON_attr_add_note,
+                                            note, NULL);
+        Py_DECREF(note);
+        if (result == NULL)
+            PyErr_Clear();
+        else
+            Py_DECREF(result);
+    }
+    else {
+        PyErr_Clear();
+    }
+    PyErr_Restore(exc_type, exc_value, exc_tb);
+}
+#endif
 
 /* Helper for the for_json / _asdict paths in encoder_listencode_obj.
  * Steals the reference to `newobj` (returned by _call_json_method),
@@ -3129,13 +3310,13 @@ encoder_markers_check(PyEncoderObject *s, PyObject *obj)
 static int
 encoder_steal_encode(PyEncoderObject *s, JSON_Accu *rval,
                      PyObject *obj, PyObject *newobj, Py_ssize_t indent_level,
-                     int as_dict)
+                     int as_dict, PyObject *path)
 {
     int rv;
     PyObject *ident = NULL;
     if (newobj == NULL)
         return -1;
-    if (encoder_markers_push(s, obj, &ident)) {
+    if (encoder_markers_push(s, obj, &ident, path)) {
         Py_DECREF(newobj);
         return -1;
     }
@@ -3146,7 +3327,7 @@ encoder_steal_encode(PyEncoderObject *s, JSON_Accu *rval,
     }
     if (as_dict) {
         if (JSON_AnyDict_Check(newobj)) {
-            rv = encoder_listencode_dict(s, rval, newobj, indent_level);
+            rv = encoder_listencode_dict(s, rval, newobj, indent_level, path);
         } else {
             PyErr_Format(PyExc_TypeError,
                          "_asdict() must return a dict, not %.80s",
@@ -3154,7 +3335,7 @@ encoder_steal_encode(PyEncoderObject *s, JSON_Accu *rval,
             rv = -1;
         }
     } else {
-        rv = encoder_listencode_obj(s, rval, newobj, indent_level);
+        rv = encoder_listencode_obj(s, rval, newobj, indent_level, path);
     }
     Py_DECREF(newobj);
     Py_LeaveRecursiveCall();
@@ -3176,16 +3357,22 @@ encoder_steal_encode(PyEncoderObject *s, JSON_Accu *rval,
  *      obj itself (not its iterator, which may be fresh on every
  *      visit) is the circular-reference marker, and the recursion
  *      depth is tracked.
- *   3. default(obj) — call the user-supplied default hook and recurse
- *      on its result, with circular-reference tracking via markers.
+ *   3. transform(obj, path) or default(obj) — call the user-supplied
+ *      hook and recurse on its result, with circular-reference tracking
+ *      via markers. transform is preferred when configured; its result is
+ *      re-encoded from scratch at the same path, so it may itself contain
+ *      values that need transforming. Nothing is memoized by object id, so
+ *      the same object reached at different paths is transformed per path.
  * Returns 0 on success, -1 on error. */
 static int
 encoder_listencode_default(PyEncoderObject *s, JSON_Accu *rval,
-                           PyObject *obj, Py_ssize_t indent_level)
+                           PyObject *obj, Py_ssize_t indent_level,
+                           PyObject *path)
 {
     _speedups_state *state = get_speedups_state(s->module_ref);
     PyObject *ident = NULL;
     PyObject *newobj;
+    PyObject *hook;
     int raw;
     int rv;
 
@@ -3202,7 +3389,7 @@ encoder_listencode_default(PyEncoderObject *s, JSON_Accu *rval,
     if (s->iterable_as_array) {
         /* Reject a revisited iterable before its __iter__ runs again;
          * encoder_listencode_list pushes the marker for obj. */
-        if (encoder_markers_check(s, obj))
+        if (encoder_markers_check(s, obj, path))
             return -1;
         newobj = PyObject_GetIter(obj);
         if (newobj == NULL) {
@@ -3214,20 +3401,25 @@ encoder_listencode_default(PyEncoderObject *s, JSON_Accu *rval,
                 Py_DECREF(newobj);
                 return -1;
             }
-            rv = encoder_listencode_list(s, rval, newobj, obj, indent_level);
+            rv = encoder_listencode_list(s, rval, newobj, obj,
+                                         indent_level, path);
             Py_LeaveRecursiveCall();
             Py_DECREF(newobj);
             return rv;
         }
     }
 
-    if (encoder_markers_push(s, obj, &ident))
+    if (encoder_markers_push(s, obj, &ident, path))
         return -1;
     if (Py_EnterRecursiveCall(" while encoding a JSON object")) {
         encoder_markers_discard(s, ident);
         return -1;
     }
-    newobj = PyObject_CallOneArg(s->defaultfn, obj);
+    hook = (s->transformfn != Py_None) ? s->transformfn : s->defaultfn;
+    if (hook == s->transformfn)
+        newobj = PyObject_CallFunctionObjArgs(hook, obj, path, NULL);
+    else
+        newobj = PyObject_CallOneArg(hook, obj);
     if (newobj == NULL) {
 #if PY_VERSION_HEX >= 0x030B0000
         /* Annotate before unwinding; the "when serializing X object"
@@ -3241,11 +3433,15 @@ encoder_listencode_default(PyEncoderObject *s, JSON_Accu *rval,
         encoder_markers_discard(s, ident);
         return -1;
     }
-    rv = encoder_listencode_obj(s, rval, newobj, indent_level);
+    /* Re-encode the replacement from scratch at the same path so a
+     * transform result may itself need transforming. The marker pushed
+     * above makes a replacement that reaches back into the document fail
+     * with a located circular-reference error instead of looping. */
+    rv = encoder_listencode_obj(s, rval, newobj, indent_level, path);
     Py_LeaveRecursiveCall();
     if (rv) {
 #if PY_VERSION_HEX >= 0x030B0000
-        /* default() succeeded but encoding its return value failed; in
+        /* The hook succeeded but encoding its return value failed; in
          * the Python encoder `o` has been rebound to newobj at this
          * point, so the note reflects that type. */
         encoder_annotate_exception(state,
@@ -3263,7 +3459,8 @@ encoder_listencode_default(PyEncoderObject *s, JSON_Accu *rval,
 }
 
 static int
-encoder_listencode_obj(PyEncoderObject *s, JSON_Accu *rval, PyObject *obj, Py_ssize_t indent_level)
+encoder_listencode_obj(PyEncoderObject *s, JSON_Accu *rval, PyObject *obj,
+                       Py_ssize_t indent_level, PyObject *path)
 {
     /* Encode Python object obj to a JSON term, rval is a PyList */
     _speedups_state *state = get_speedups_state(s->module_ref);
@@ -3323,21 +3520,23 @@ encoder_listencode_obj(PyEncoderObject *s, JSON_Accu *rval, PyObject *obj, Py_ss
             rv = _steal_accumulate(state, rval, encoded);
     }
     else if (s->for_json && _call_json_method(obj, state->JSON_attr_for_json, &newobj)) {
-        rv = encoder_steal_encode(s, rval, obj, newobj, indent_level, /*as_dict=*/0);
+        rv = encoder_steal_encode(s, rval, obj, newobj, indent_level,
+                                  /*as_dict=*/0, path);
     }
     else if (s->namedtuple_as_object && _call_json_method(obj, state->JSON_attr_asdict, &newobj)) {
-        rv = encoder_steal_encode(s, rval, obj, newobj, indent_level, /*as_dict=*/1);
+        rv = encoder_steal_encode(s, rval, obj, newobj, indent_level,
+                                  /*as_dict=*/1, path);
     }
     else if (PyList_Check(obj) || (s->tuple_as_array && PyTuple_Check(obj))) {
         if (Py_EnterRecursiveCall(" while encoding a JSON object"))
             return rv;
-        rv = encoder_listencode_list(s, rval, obj, obj, indent_level);
+        rv = encoder_listencode_list(s, rval, obj, obj, indent_level, path);
         Py_LeaveRecursiveCall();
     }
     else if (JSON_AnyDict_Check(obj)) {
         if (Py_EnterRecursiveCall(" while encoding a JSON object"))
             return rv;
-        rv = encoder_listencode_dict(s, rval, obj, indent_level);
+        rv = encoder_listencode_dict(s, rval, obj, indent_level, path);
         Py_LeaveRecursiveCall();
     }
     else if (s->use_decimal && PyObject_TypeCheck(obj, (PyTypeObject *)s->Decimal)) {
@@ -3346,7 +3545,7 @@ encoder_listencode_obj(PyEncoderObject *s, JSON_Accu *rval, PyObject *obj, Py_ss
             rv = _steal_accumulate(state, rval, encoded);
     }
     else {
-        rv = encoder_listencode_default(s, rval, obj, indent_level);
+        rv = encoder_listencode_default(s, rval, obj, indent_level, path);
     }
     return rv;
 }
@@ -3494,7 +3693,8 @@ encoder_annotate_exception(_speedups_state *state, const char *format, ...)
 #endif
 
 static int
-encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct, Py_ssize_t indent_level)
+encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct,
+                        Py_ssize_t indent_level, PyObject *path)
 {
     /* Encode Python dict dct a JSON term */
     _speedups_state *state = get_speedups_state(s->module_ref);
@@ -3502,6 +3702,7 @@ encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct, Py_s
     PyObject *encoded = NULL;
     PyObject *iter = NULL;
     PyObject *item = NULL;
+    PyObject *child_path = NULL;
     /* When s->indent is not Py_None, each inter-item boundary is emitted
      * as s->item_separator + '\n' + (s->indent * inner_indent_level) via
      * multiple JSON_Accu_Accumulate calls; no combined PyObject is
@@ -3520,7 +3721,7 @@ encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct, Py_s
             return -1;
     }
 
-    if (encoder_markers_push(s, dct, &ident))
+    if (encoder_markers_push(s, dct, &ident, path))
         goto bail;
 
     if (JSON_Accu_Accumulate(state, rval, state->JSON_open_dict))
@@ -3597,7 +3798,13 @@ encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct, Py_s
             if (JSON_Accu_Accumulate(state, rval, s->key_separator)) {
                 Py_DECREF(key); Py_DECREF(value); err = 1; break;
             }
-            if (encoder_listencode_obj(s, rval, value, inner_indent_level)) {
+            child_path = encoder_dict_child_path(s, path, key);
+            if (child_path == NULL && path != NULL) {
+                Py_DECREF(key); Py_DECREF(value); err = 1; break;
+            }
+            if (encoder_listencode_obj(s, rval, value, inner_indent_level,
+                                       child_path)) {
+                Py_CLEAR(child_path);
 #if PY_VERSION_HEX >= 0x030B0000
                 encoder_annotate_exception(state,
                     "when serializing %s item %R",
@@ -3605,6 +3812,7 @@ encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct, Py_s
 #endif
                 Py_DECREF(key); Py_DECREF(value); err = 1; break;
             }
+            Py_CLEAR(child_path);
             Py_DECREF(key);
             Py_DECREF(value);
             idx++;
@@ -3662,7 +3870,12 @@ encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct, Py_s
             Py_CLEAR(encoded);
             if (JSON_Accu_Accumulate(state, rval, s->key_separator))
                 goto bail;
-            if (encoder_listencode_obj(s, rval, value, inner_indent_level)) {
+            child_path = encoder_dict_child_path(s, path, key);
+            if (child_path == NULL && path != NULL)
+                goto bail;
+            if (encoder_listencode_obj(s, rval, value, inner_indent_level,
+                                       child_path)) {
+                Py_CLEAR(child_path);
 #if PY_VERSION_HEX >= 0x030B0000
                 encoder_annotate_exception(state,
                     "when serializing %s item %R",
@@ -3670,6 +3883,7 @@ encoder_listencode_dict(PyEncoderObject *s, JSON_Accu *rval, PyObject *dct, Py_s
 #endif
                 goto bail;
             }
+            Py_CLEAR(child_path);
             Py_CLEAR(item);
             idx++;
         }
@@ -3696,6 +3910,7 @@ bail:
     Py_XDECREF(encoded);
     Py_XDECREF(item);
     Py_XDECREF(iter);
+    Py_CLEAR(child_path);
     encoder_markers_discard(s, ident);
     return -1;
 }
@@ -3703,7 +3918,8 @@ bail:
 
 static int
 encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
-                        PyObject *origin, Py_ssize_t indent_level)
+                        PyObject *origin, Py_ssize_t indent_level,
+                        PyObject *path)
 {
     /* Encode the items of seq as a JSON array. origin is the object
      * being encoded: seq itself for a list or tuple, or the iterable
@@ -3713,6 +3929,7 @@ encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
     PyObject *ident = NULL;
     PyObject *iter = NULL;
     PyObject *obj = NULL;
+    PyObject *child_path = NULL;
     /* See encoder_listencode_dict: inter-item indent prefixes are
      * written piece-by-piece via encoder_accumulate_newline_indent,
      * no intermediate PyObject is materialized. */
@@ -3744,7 +3961,7 @@ encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
         is_exact_fast = 0;
     }
 
-    if (encoder_markers_push(s, origin, &ident))
+    if (encoder_markers_push(s, origin, &ident, path))
         goto bail;
 
     if (is_exact_fast) {
@@ -3790,7 +4007,13 @@ encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
                     Py_DECREF(item); err = 1; break;
                 }
             }
-            if (encoder_listencode_obj(s, rval, item, inner_indent_level)) {
+            child_path = encoder_list_child_path(path, i);
+            if (child_path == NULL && path != NULL) {
+                Py_DECREF(item); err = 1; break;
+            }
+            if (encoder_listencode_obj(s, rval, item, inner_indent_level,
+                                       child_path)) {
+                Py_CLEAR(child_path);
 #if PY_VERSION_HEX >= 0x030B0000
                 encoder_annotate_exception(state,
                     "when serializing %s item %zd",
@@ -3798,6 +4021,7 @@ encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
 #endif
                 Py_DECREF(item); err = 1; break;
             }
+            Py_CLEAR(child_path);
             Py_DECREF(item);
         }
         Py_END_CRITICAL_SECTION();
@@ -3838,7 +4062,12 @@ encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
                                     s, state, rval, inner_indent_level))
                     goto bail;
             }
-            if (encoder_listencode_obj(s, rval, obj, inner_indent_level)) {
+            child_path = encoder_list_child_path(path, i);
+            if (child_path == NULL && path != NULL)
+                goto bail;
+            if (encoder_listencode_obj(s, rval, obj, inner_indent_level,
+                                       child_path)) {
+                Py_CLEAR(child_path);
 #if PY_VERSION_HEX >= 0x030B0000
                 encoder_annotate_exception(state,
                     "when serializing %s item %zd",
@@ -3846,6 +4075,7 @@ encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
 #endif
                 goto bail;
             }
+            Py_CLEAR(child_path);
             i++;
             Py_CLEAR(obj);
         }
@@ -3878,6 +4108,7 @@ encoder_listencode_list(PyEncoderObject *s, JSON_Accu *rval, PyObject *seq,
 bail:
     Py_XDECREF(obj);
     Py_XDECREF(iter);
+    Py_CLEAR(child_path);
     encoder_markers_discard(s, ident);
     return -1;
 }

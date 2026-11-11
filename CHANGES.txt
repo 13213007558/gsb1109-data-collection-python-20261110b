@@ -1,3 +1,17 @@
+Unreleased
+
+* Add a ``transform(obj, path)`` option to ``dumps``/``dump`` and
+  ``JSONEncoder``. Like ``default``, it is called for values the encoder
+  cannot natively serialize, but it also receives the value's location as a
+  tuple of dict keys and list indices (empty tuple at the root), letting one
+  type be encoded differently per field without copying the whole record.
+  The result is re-encoded from scratch so it may itself contain values that
+  need transforming; results are never memoized by identity, so the same
+  object reached through different fields is transformed separately for each
+  path. The one-argument ``default`` signature is unchanged. Circular
+  references now carry a PEP 678 note naming the concrete path when a
+  transform is configured. Available in both the C and pure-Python encoders.
+
 Version 4.2.0 released 2026-10-02
 
 * Start building wheels for Python 3.15 and drop Python 3.8 support

@@ -159,7 +159,8 @@ Basic Usage
                    namedtuple_as_object=True, tuple_as_array=True, \
                    bigint_as_string=False, sort_keys=False, \
                    item_sort_key=None, for_json=None, ignore_nan=False, \
-                   int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                   int_as_string_bitcount=None, iterable_as_array=False, \
+                   transform=None, **kw)
 
     Serialize *obj* as a JSON formatted stream to *fp*
     (a ``.write()``-supporting file-like object) using this
@@ -190,7 +191,8 @@ Basic Usage
                     namedtuple_as_object=True, tuple_as_array=True, \
                     bigint_as_string=False, sort_keys=False, \
                     item_sort_key=None, for_json=None, ignore_nan=False, \
-                    int_as_string_bitcount=None, iterable_as_array=False, **kw)
+                    int_as_string_bitcount=None, iterable_as_array=False, \
+                    transform=None, **kw)
 
     Serialize *obj* to a JSON formatted :class:`str`.
 
@@ -257,6 +259,34 @@ Basic Usage
     *default(obj)* is a function that should return a serializable version of
     *obj* or raise :exc:`TypeError`. The default implementation always raises
     :exc:`TypeError`.
+
+    If specified, *transform(obj, path)* is like *default*, but it is also
+    handed the *path* locating *obj* inside the document: a tuple of dict
+    keys and list indices, empty for the root. Its return value is encoded in
+    place of *obj* and may itself contain values that need transforming, so a
+    single custom type can be rendered differently depending on where it
+    appears without the caller copying or rewriting the whole record:
+
+    .. code-block:: python
+
+        def transform(obj, path):
+            if isinstance(obj, datetime.date):
+                if path[-1] == 'display':
+                    return obj.strftime('%Y年%m月%d日')
+                return obj.isoformat()  # the 'normalized' field
+            raise TypeError('not serializable')
+
+        dumps({'display': d, 'normalized': d}, transform=transform)
+        # '{"display": "...", "normalized": "2026-11-11"}'
+
+    Unlike a result keyed on the object itself, nothing is memoized by
+    identity: the same object reached through different fields is transformed
+    separately for each *path*. The one-argument *default* signature is
+    unchanged and is used when *transform* is not given; when both are given,
+    *transform* takes precedence. With *check_circular* enabled, a transform
+    result that reaches back into a container already being encoded raises
+    :class:`ValueError`, and on Python 3.11+ the error note names the path at
+    which the cycle was detected.
 
     To use a custom :class:`JSONEncoder` subclass (e.g. one that overrides the
     :meth:`default` method to serialize additional types), specify it with the
