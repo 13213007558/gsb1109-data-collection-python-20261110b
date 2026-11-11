@@ -18,6 +18,7 @@ __all__ = [
     "RequestHandler",
     "RequestMatcher",
     "RequestMatcherKwargs",
+    "SegmentedResponse",
     "URIPattern",
     "WaitingSettings",
 ]
@@ -38,3 +39,4 @@ from .httpserver import RequestMatcher
 from .httpserver import RequestMatcherKwargs
 from .httpserver import URIPattern
 from .httpserver import WaitingSettings
+from .streaming import SegmentedResponse

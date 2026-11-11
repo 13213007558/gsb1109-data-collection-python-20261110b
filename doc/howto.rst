@@ -347,6 +347,33 @@ completion.
     the server.
 
 
+Sending a response in controllable segments
+-------------------------------------------
+Sometimes a test must observe the client while only part of the response body
+has arrived, for example to verify that a CSV collector does not commit rows
+before the download finished. :py:class:`pytest_httpserver.SegmentedResponse`
+splits the body into segments and gives the test explicit, event-based control
+over when each segment is sent.
+
+The first segment is sent as soon as the request is handled. Every further
+segment is held back until ``release()`` or ``release_all()`` is called, and
+the test waits for delivery with ``wait_until_sent()`` instead of sleeping for
+a fixed number of seconds. Because there is no ``Content-Length`` header, the
+body is delivered using chunked transfer encoding.
+
+If the client closes the connection while a segment is still held, the
+response notices the disconnect and stops producing data, so the handler
+thread cannot block forever. The same happens when the server is stopped or
+cleared while a response is held back, which keeps fixture teardown safe even
+when the test fails with an assertion before releasing the rest of the body.
+
+A :py:class:`~pytest_httpserver.SegmentedResponse` serves a single request, so
+register it on a oneshot handler and create a new instance per request.
+
+.. literalinclude :: ../tests/examples/test_howto_segmented_response.py
+   :language: python
+
+
 Using custom request matcher
 ----------------------------
 In the case when you want to extend or modify the request matcher in

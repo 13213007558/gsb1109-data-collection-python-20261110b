@@ -1,0 +1,12 @@
+---
+features:
+  - |
+    Add ``SegmentedResponse`` for serving a response body in explicitly
+    controlled segments. The first segment is sent immediately while the
+    remaining ones are held back until ``release()`` or ``release_all()`` is
+    called, and tests synchronize with ``wait_until_sent()`` instead of
+    sleeping. A client disconnect, ``abort()``, or server ``stop()``/``clear()``
+    unblocks every held segment, so fixture teardown cannot hang on a response
+    the test never released. This makes it deterministic to verify that a
+    client does not process a partial response (for example committing a CSV
+    download before it finished).

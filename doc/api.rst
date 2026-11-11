@@ -24,6 +24,14 @@ RequestHandler
         :inherited-members:
 
 
+SegmentedResponse
+~~~~~~~~~~~~~~~~~
+
+    .. autoclass:: SegmentedResponse
+        :members:
+        :inherited-members:
+
+
 RequestMatcherKwargs
 ~~~~~~~~~~~~~~~~~~~~
 

@@ -33,6 +33,7 @@ from werkzeug.datastructures import MultiDict
 from werkzeug.serving import make_server
 
 from .bake import BakedHTTPServer
+from .streaming import SegmentedResponse
 
 if TYPE_CHECKING:
     import sys
@@ -736,6 +737,7 @@ class HTTPServerBase(abc.ABC):  # pylint: disable=too-many-instance-attributes
         self.ssl_context = ssl_context
         self.threaded = threaded
         self.no_handler_status_code = 500
+        self._active_segmented_responses: set[SegmentedResponse] = set()
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} host={self.host} port={self.port}>"
@@ -747,6 +749,7 @@ class HTTPServerBase(abc.ABC):  # pylint: disable=too-many-instance-attributes
         This method is useful when the object needs to be re-used but stopping the server is not feasible.
 
         """
+        self._abort_active_segmented_responses()
         self.clear_assertions()
         self.clear_handler_errors()
         self.clear_log()
@@ -874,6 +877,9 @@ class HTTPServerBase(abc.ABC):  # pylint: disable=too-many-instance-attributes
         assert self.server_thread is not None
         if not self.is_running():
             raise HTTPServerError("Server is not running")
+        # Unblock any response that is still waiting for a segment so that
+        # shutdown() and the thread join cannot hang on a held-back response.
+        self._abort_active_segmented_responses()
         self.server.shutdown()
         self.server_thread.join()
         self.server = None
@@ -974,8 +980,18 @@ class HTTPServerBase(abc.ABC):  # pylint: disable=too-many-instance-attributes
         """
         request.get_data()
         response = self.dispatch(request)
+        self._register_response(response)
         self.log.append((request, response))
         return response
+
+    def _register_response(self, response: Response) -> None:
+        if isinstance(response, SegmentedResponse):
+            self._active_segmented_responses.add(response)
+            response.call_on_close(lambda: self._active_segmented_responses.discard(response))
+
+    def _abort_active_segmented_responses(self) -> None:
+        for response in tuple(self._active_segmented_responses):
+            response.abort()
 
     def __enter__(self) -> Self:
         """
