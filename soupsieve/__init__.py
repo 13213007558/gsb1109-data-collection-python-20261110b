@@ -32,11 +32,12 @@ from . import css_match as cm
 from . import css_types as ct
 from .util import DEBUG, NOCACHE, NOSTRICT, SelectorSyntaxError  # noqa: F401
 import bs4
-from typing import Any, Mapping, Iterator, Iterable, cast
+from typing import Any, Hashable, Mapping, Iterator, Iterable, cast
 
 __all__ = (
     'DEBUG', 'NOCACHE', 'NOSTRICT', 'SelectorSyntaxError', 'CustomSelectors', 'SoupSieve',
-    'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_one'
+    'closest', 'compile', 'filter', 'iselect', 'iselect_quotas', 'match', 'select', 'select_one',
+    'select_quotas'
 )
 
 SoupSieve = cm.SoupSieve
@@ -226,6 +227,88 @@ def iselect(
         max_selectors=max_selectors,
         **kwargs
     ).iselect(tag, limit)
+
+
+def iselect_quotas(
+    branches: Mapping[Hashable, tuple[str | SoupSieve, int]],
+    tag: bs4.Tag,
+    namespaces: dict[str, str] | None = None,
+    flags: int = 0,
+    *,
+    custom: Mapping[str, str | ct.SelectorList] | None = None,
+    ignore: Iterable[str] | None = None,
+    max_selectors: int = cp.SELECTOR_LIMIT,
+    **kwargs: Any
+) -> Iterator[tuple[bs4.Tag, tuple[Hashable, ...]]]:
+    """
+    Iterate tags matching quota-limited selector branches in a single pass.
+
+    `branches` maps a label to a `(selector, limit)` pair. Each branch is
+    evaluated independently against every tag in document order and claims
+    at most `limit` tags (a limit less than 1 means no quota). A tag matched
+    by multiple branches is yielded only once, along with the labels of all
+    branches that claimed it. A branch whose quota is exhausted claims no
+    further tags, but never prevents other branches from claiming later
+    tags. Iteration stops once every branch has reached its quota.
+    """
+
+    active: dict[Hashable, list[Any]] = {}
+    for label, (pattern, limit) in branches.items():
+        sieve = compile(
+            pattern,
+            namespaces,
+            flags,
+            custom=custom,
+            ignore=ignore,
+            max_selectors=max_selectors,
+            **kwargs
+        )
+        matcher = cm.CSSMatch(sieve.selectors, tag, sieve.namespaces, sieve.flags)
+        active[label] = [matcher, limit if limit > 0 else None]
+
+    if not active:
+        return
+
+    walker = cast(cm.CSSMatch, next(iter(active.values()))[0])
+    for child in walker.get_tag_descendants(tag, template_contents=True):
+        hits = []
+        for label, (matcher, remaining) in active.items():
+            if matcher.match(child):
+                hits.append(label)
+                if remaining is not None:
+                    active[label][1] = remaining - 1
+        if hits:
+            yield child, tuple(hits)
+            for label in hits:
+                if active[label][1] is not None and active[label][1] < 1:
+                    del active[label]
+            if not active:
+                break
+
+
+def select_quotas(
+    branches: Mapping[Hashable, tuple[str | SoupSieve, int]],
+    tag: bs4.Tag,
+    namespaces: dict[str, str] | None = None,
+    flags: int = 0,
+    *,
+    custom: Mapping[str, str | ct.SelectorList] | None = None,
+    ignore: Iterable[str] | None = None,
+    max_selectors: int = cp.SELECTOR_LIMIT,
+    **kwargs: Any
+) -> list[tuple[bs4.Tag, tuple[Hashable, ...]]]:
+    """Select tags matching quota-limited selector branches in a single pass."""
+
+    return list(iselect_quotas(
+        branches,
+        tag,
+        namespaces,
+        flags,
+        custom=custom,
+        ignore=ignore,
+        max_selectors=max_selectors,
+        **kwargs
+    ))
 
 
 def escape(ident: str) -> str:

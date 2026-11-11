@@ -92,6 +92,105 @@ class TestSoupSieve(util.TestCase):
 
         self.assertEqual(sorted(['5']), sorted(ids))
 
+    def test_select_quotas(self):
+        """Test selecting with per-branch quotas."""
+
+        markup = """
+        <html>
+        <body>
+        <a id="1" class="download note" href="a.zip">1</a>
+        <a id="2" class="download" href="b.zip">2</a>
+        <a id="3" class="note" href="c.zip">3</a>
+        <a id="4" class="download note" href="d.zip">4</a>
+        <a id="5" class="note" href="e.zip">5</a>
+        <a id="6" class="download" href="f.zip">6</a>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+        results = sv.select_quotas(
+            {
+                'download': ('a.download', 2),
+                'note': ('a.note', 3)
+            },
+            soup
+        )
+
+        self.assertEqual(
+            [
+                ('1', ('download', 'note')),
+                ('2', ('download',)),
+                ('3', ('note',)),
+                ('4', ('note',))
+            ],
+            [(el.attrs['id'], labels) for el, labels in results]
+        )
+
+    def test_select_quotas_exhausted_branch_does_not_block(self):
+        """Test that an exhausted branch does not block other branches."""
+
+        markup = """
+        <html>
+        <body>
+        <a id="1" class="download note" href="a.zip">1</a>
+        <a id="2" class="download note" href="b.zip">2</a>
+        <a id="3" class="note" href="c.zip">3</a>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+        results = sv.select_quotas(
+            {
+                'download': ('a.download', 1),
+                'note': ('a.note', 0)
+            },
+            soup
+        )
+
+        self.assertEqual(
+            [
+                ('1', ('download', 'note')),
+                ('2', ('note',)),
+                ('3', ('note',))
+            ],
+            [(el.attrs['id'], labels) for el, labels in results]
+        )
+
+    def test_select_quotas_compiled(self):
+        """Test quota selection with pre-compiled patterns."""
+
+        markup = """
+        <html>
+        <body>
+        <a id="1" class="download" href="a.zip">1</a>
+        <a id="2" class="download" href="b.zip">2</a>
+        <a id="3" class="download" href="c.zip">3</a>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+        results = sv.select_quotas({'download': (sv.compile('a.download'), 2)}, soup)
+
+        self.assertEqual(['1', '2'], [el.attrs['id'] for el, _labels in results])
+
+    def test_select_quotas_empty(self):
+        """Test quota selection with no branches."""
+
+        markup = """
+        <html>
+        <body>
+        <a id="1" class="download" href="a.zip">1</a>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+        self.assertEqual([], sv.select_quotas({}, soup))
+        self.assertEqual([], list(sv.iselect_quotas({}, soup)))
+
     def test_select_one(self):
         """Test select one."""
 
