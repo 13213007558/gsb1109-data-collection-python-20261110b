@@ -4,6 +4,7 @@ Tests for the jsonlines library.
 
 import codecs
 import collections
+import functools
 import io
 import json
 import tempfile
@@ -253,6 +254,59 @@ def test_custom_dumps_bytes() -> None:
         writer.write(123)
 
     assert fp.getvalue() == b"some bytes\n"
+
+
+def test_writer_strict_rejects_multiline_str() -> None:
+    fp = io.StringIO()
+
+    def dumps(obj: object) -> str:
+        if obj == "bad":
+            return '{\n  "a": 1\n}'
+        return json.dumps(obj)
+
+    with jsonlines.Writer(fp, dumps=dumps, strict=True) as writer:
+        writer.write({"ok": 1})
+        with pytest.raises(ValueError, match="newline"):
+            writer.write("bad")
+        # The failed write must not touch the stream at all.
+        assert fp.getvalue() == '{"ok": 1}\n'
+        # Subsequent valid records must be written normally.
+        writer.write({"ok": 2})
+    assert fp.getvalue() == '{"ok": 1}\n{"ok": 2}\n'
+
+
+def test_writer_strict_rejects_multiline_bytes() -> None:
+    fp = io.BytesIO()
+
+    def dumps(obj: object) -> bytes:
+        if obj == "bad":
+            return b'{\n  "a": 1\n}'
+        return json.dumps(obj).encode()
+
+    with jsonlines.Writer(fp, dumps=dumps, strict=True) as writer:
+        writer.write({"ok": 1})
+        with pytest.raises(ValueError, match="newline"):
+            writer.write("bad")
+        assert fp.getvalue() == b'{"ok": 1}\n'
+        writer.write({"ok": 2})
+    assert fp.getvalue() == b'{"ok": 1}\n{"ok": 2}\n'
+
+
+def test_writer_strict_allows_escaped_newlines() -> None:
+    fp = io.StringIO()
+    with jsonlines.Writer(fp, strict=True) as writer:
+        writer.write({"text": "line one\nline two"})
+    assert fp.getvalue() == '{"text": "line one\\nline two"}\n'
+    with jsonlines.Reader(io.StringIO(fp.getvalue())) as reader:
+        assert reader.read() == {"text": "line one\nline two"}
+
+
+def test_writer_strict_disabled_by_default() -> None:
+    fp = io.StringIO()
+    indented_dumps = functools.partial(json.dumps, indent=2)
+    with jsonlines.Writer(fp, dumps=indented_dumps) as writer:
+        writer.write({"a": 1})
+    assert fp.getvalue() == '{\n  "a": 1\n}\n'
 
 
 def test_custom_loads() -> None:

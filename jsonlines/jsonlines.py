@@ -475,11 +475,19 @@ class Writer(ReaderWriterBase):
     When the `flush` argument is set to ``True``, the writer will call
     ``fp.flush()`` after each written line.
 
+    When the `strict` argument is set to ``True``, the writer will
+    validate the encoded line before writing it, and refuse to write
+    lines containing a literal newline character (which would break
+    the jsonlines format). Newlines escaped inside JSON strings are
+    not affected. This applies to both ``str`` and ``bytes`` output
+    produced by the `dumps` callable.
+
     :param fp: writable file-like object
     :param compact: whether to use a compact output format
     :param sort_keys: whether to sort object keys
     :param dumps: custom encoder callable
     :param flush: whether to flush the file-like object after writing each line
+    :param strict: whether to reject encoded lines containing literal newlines
     """
 
     _fp: Union[typing.IO[str], typing.IO[bytes]] = attr.ib(default=None)
@@ -487,6 +495,7 @@ class Writer(ReaderWriterBase):
     _compact: bool = attr.ib(default=False, kw_only=True)
     _sort_keys: bool = attr.ib(default=False, kw_only=True)
     _flush: bool = attr.ib(default=False, kw_only=True)
+    _strict: bool = attr.ib(default=False, kw_only=True)
     _dumps: DumpsCallable = attr.ib(default=default_dumps, kw_only=True)
     _dumps_result_conversion: DumpsResultConversion = attr.ib(
         default=DumpsResultConversion.LeaveAsIs, init=False
@@ -542,6 +551,14 @@ class Writer(ReaderWriterBase):
         elif self._dumps_result_conversion == DumpsResultConversion.DecodeToString:
             line = line.decode()  # type: ignore[union-attr]
 
+        if self._strict:
+            newline = b"\n" if isinstance(line, bytes) else "\n"
+            if newline in line:
+                raise ValueError(
+                    "dumps() result contains a literal newline character, "
+                    "which would produce invalid jsonlines output"
+                )
+
         fp = self._fp
         fp.write(line)  # type: ignore[arg-type]
         fp.write(b"\n" if self._fp_is_binary else "\n")  # type: ignore[call-overload]
@@ -583,6 +600,7 @@ def open(
     compact: Optional[bool] = ...,
     sort_keys: Optional[bool] = ...,
     flush: Optional[bool] = ...,
+    strict: Optional[bool] = ...,
 ) -> Writer:
     ...  # pragma: no cover
 
@@ -597,6 +615,7 @@ def open(
     compact: Optional[bool] = ...,
     sort_keys: Optional[bool] = ...,
     flush: Optional[bool] = ...,
+    strict: Optional[bool] = ...,
 ) -> Union[Reader, Writer]:
     ...  # pragma: no cover
 
@@ -610,6 +629,7 @@ def open(
     compact: Optional[bool] = None,
     sort_keys: Optional[bool] = None,
     flush: Optional[bool] = None,
+    strict: Optional[bool] = None,
 ) -> Union[Reader, Writer]:
     """
     Open a jsonlines file for reading or writing.
@@ -647,6 +667,7 @@ def open(
         compact=compact,
         sort_keys=sort_keys,
         flush=flush,
+        strict=strict,
     )
     kwargs = {key: value for key, value in kwargs.items() if value is not None}
     instance: Union[Reader, Writer] = cls(fp, **kwargs)
