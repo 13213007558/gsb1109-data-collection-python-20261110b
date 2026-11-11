@@ -131,8 +131,11 @@ class TreeWalker(base.NonRecursiveTreeWalker):
             self.fragmentChildren = set(tree)
             tree = FragmentRoot(tree)
         else:
-            self.fragmentChildren = set()
             tree = Root(tree)
+            # don't walk past the top of the tree we were given: when
+            # serializing a subtree, its ancestors are not part of the
+            # output
+            self.fragmentChildren = set(tree.children)
         base.NonRecursiveTreeWalker.__init__(self, tree)
         self.filter = _ihatexml.InfosetFilter()
 

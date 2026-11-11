@@ -7,6 +7,7 @@ from codecs import register_error, xmlcharrefreplace_errors
 
 from .constants import voidElements, booleanAttributes, spaceCharacters
 from .constants import rcdataElements, entities, xmlEntities
+from .constants import namespaces, unadjustForeignAttributes
 from . import treewalkers, _utils
 from xml.sax.saxutils import escape
 
@@ -99,6 +100,160 @@ def serialize(input, tree="etree", encoding=None, **serializer_opts):
     walker = treewalkers.getTreeWalker(tree)
     s = HTMLSerializer(**serializer_opts)
     return s.render(walker(input), encoding)
+
+
+def serializeFragment(input, tree="etree", container="div", encoding=None,
+                      **serializer_opts):
+    """Serializes the input tree as an HTML fragment for a given container
+
+    The output is intended to be parsed back with
+    :py:func:`html5lib.html5parser.parseFragment` using the same
+    ``container``: element names, attribute namespaces and attribute
+    order are preserved by the round-trip. This makes it suitable for
+    archiving a subtree (say, the product region of a page, a set of
+    table rows, or an SVG subtree) and later splicing it back into the
+    container it was taken from.
+
+    If the tree cannot be faithfully represented as an HTML fragment in
+    the given container context, a :py:class:`SerializeError` is raised
+    instead of silently emitting output that would parse back into a
+    different tree (or degenerate into a full document). This happens,
+    for example, when a ``<tr>`` element is serialized with a ``div``
+    container (the parser would drop the row), when the tree contains a
+    doctype, or when an attribute namespace has no HTML representation.
+
+    :arg input: the tree to serialize
+
+    :arg tree: the treewalker to use
+
+    :arg container: the name of the element the fragment will be
+        re-inserted into (the context element), e.g. ``"tbody"`` for a
+        set of table rows; the same container must be used when
+        re-parsing the output. Defaults to ``"div"``.
+
+    :arg encoding: the encoding to use
+
+    :arg serializer_opts: any options to pass to the
+        :py:class:`html5lib.serializer.HTMLSerializer` that gets created
+
+    :returns: the tree serialized as a string
+
+    :raises SerializeError: if the tree cannot be represented as an HTML
+        fragment in the given container context
+
+    Example:
+
+    >>> from html5lib.html5parser import parse, parseFragment
+    >>> from html5lib.serializer import serializeFragment
+    >>> doc = parse('<table><tbody><tr><td>Hi!</td></tr></tbody></table>')
+    >>> row = doc.find('.//{http://www.w3.org/1999/xhtml}tr')
+    >>> fragment = serializeFragment(row, container='tbody')
+    >>> parseFragment(fragment, container='tbody') is not None
+    True
+
+    """
+    if container is None:
+        container = "div"
+    walker = treewalkers.getTreeWalker(tree)
+    tokens = list(walker(input))
+    for token in tokens:
+        if token["type"] == "Doctype":
+            raise SerializeError(
+                "Fragments cannot contain a doctype; "
+                "serialize a subtree instead of a whole document")
+    serializer = HTMLSerializer(**serializer_opts)
+    serializer.strict = True
+    output = serializer.render(iter(tokens), encoding)
+    _verifyFragmentRoundTrip(tokens, output, container, encoding,
+                             serializer.resolve_entities)
+    return output
+
+
+def _verifyFragmentRoundTrip(tokens, output, container, encoding,
+                             resolve_entities):
+    """Checks that output re-parses to the same fragment in container
+
+    Parses ``output`` with :py:func:`html5lib.html5parser.parseFragment`
+    in the given ``container`` context and compares the resulting token
+    stream with the original one. Raises :py:class:`SerializeError`
+    describing the first difference if the trees don't match.
+
+    """
+    # imported here to avoid a circular import at module level
+    from .html5parser import parseFragment
+
+    if isinstance(output, bytes):
+        # re-read the fragment the way a consumer that honors the
+        # declared encoding would
+        output = output.decode(encoding)
+    reparsed = parseFragment(output, container=container)
+    reparsed_tokens = list(treewalkers.getTreeWalker("etree")(reparsed))
+    expected = _normalizeFragmentTokens(tokens, resolve_entities)
+    actual = _normalizeFragmentTokens(reparsed_tokens, resolve_entities)
+    if expected == actual:
+        return
+    for i, (expected_token, actual_token) in enumerate(zip(expected, actual)):
+        if expected_token != actual_token:
+            raise SerializeError(
+                "Fragment cannot be represented in container %r: token %d "
+                "re-parses as %r instead of %r; use the container the "
+                "fragment was taken from" %
+                (container, i, actual_token, expected_token))
+    raise SerializeError(
+        "Fragment cannot be represented in container %r: re-parsing "
+        "yields %d tokens instead of %d; use the container the fragment "
+        "was taken from" % (container, len(actual), len(expected)))
+
+
+def _normalizeFragmentTokens(tokens, resolve_entities=True):
+    """Normalizes a token stream for round-trip comparison
+
+    Reduces a treewalker token stream to a list of tuples that capture
+    exactly what must survive a serialize/parse round-trip: element
+    names and namespaces, attribute names, namespaces, order and
+    values, character data, and comments. Tokenizer-dependent artifacts
+    (character token boundaries, empty-tag style, entity spelling) are
+    smoothed out.
+
+    """
+    html_namespace = namespaces["html"]
+    normalized = []
+
+    def appendText(data):
+        if not data:
+            return
+        if normalized and normalized[-1][0] == "text":
+            normalized[-1][1] += data
+        else:
+            normalized.append(["text", data])
+
+    for token in tokens:
+        type = token["type"]
+        if type in ("Characters", "SpaceCharacters"):
+            appendText(token["data"])
+        elif type == "Entity":
+            # resolve exactly like HTMLSerializer does
+            key = token["name"] + ";"
+            if resolve_entities and key in entities and key not in xmlEntities:
+                appendText(entities[key])
+            else:
+                appendText("&%s;" % token["name"])
+        elif type in ("StartTag", "EmptyTag"):
+            namespace = token.get("namespace") or html_namespace
+            attrs = tuple(token["data"].items())
+            normalized.append(("start", namespace, token["name"], attrs))
+        elif type == "EndTag":
+            namespace = token.get("namespace") or html_namespace
+            if namespace == html_namespace and token["name"] in voidElements:
+                # void elements never serialize an end tag
+                continue
+            normalized.append(("end", namespace, token["name"]))
+        elif type == "Comment":
+            normalized.append(("comment", token["data"]))
+        else:
+            normalized.append((type, token.get("data")))
+    return [tuple(token) if isinstance(token, list) else token
+            for token in normalized]
 
 
 class HTMLSerializer(object):
@@ -298,9 +453,15 @@ class HTMLSerializer(object):
                     in_cdata = True
                 elif in_cdata:
                     self.serializeError("Unexpected child element of a CDATA element")
-                for (_, attr_name), attr_value in token["data"].items():
-                    # TODO: Add namespace support here
+                for (attr_namespace, attr_name), attr_value in token["data"].items():
                     k = attr_name
+                    if attr_namespace is not None:
+                        k = unadjustForeignAttributes.get((attr_namespace, attr_name))
+                        if k is None:
+                            self.serializeError("Attribute %s in namespace %s "
+                                                "cannot be represented in HTML" %
+                                                (attr_name, attr_namespace))
+                            k = attr_name
                     v = attr_value
                     yield self.encodeStrict(' ')
 
@@ -401,7 +562,7 @@ class HTMLSerializer(object):
         # XXX The idea is to make data mandatory.
         self.errors.append(data)
         if self.strict:
-            raise SerializeError
+            raise SerializeError(data)
 
 
 class SerializeError(Exception):

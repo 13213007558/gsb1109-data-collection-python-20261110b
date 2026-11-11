@@ -15,11 +15,23 @@ Features:
   you, Tom Most!) (#396)
 * The ``<ol reversed>`` and ``<ol start>`` attributes are now permitted by the
   sanitizer. (#321) (Thank you, Tom Most!)
+* Add ``html5lib.serializeFragment`` (also available as
+  ``html5lib.serializer.serializeFragment``) for serializing a subtree as an
+  HTML fragment within a given container context (e.g. ``container="tbody"``
+  for a set of table rows). The output is verified to parse back to an
+  equivalent tree with ``html5lib.parseFragment`` in the same container,
+  preserving element names, attribute namespaces, and attribute order;
+  combinations that cannot be represented as an HTML fragment raise
+  ``SerializeError`` instead of silently producing a full document.
+* The serializer now emits namespaced attributes (such as ``xlink:href`` and
+  ``xml:lang``) with their prefix instead of silently dropping the namespace.
 
 Bug fixes:
 
 * The sanitizer now permits ``<summary>`` tags. It used to allow ``<details>``
   already. (#423)
+* The lxml treewalker no longer emits end tags for the ancestors of a
+  subtree being walked.
 
 1.1
 ~~~

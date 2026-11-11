@@ -9,7 +9,7 @@ from .support import get_data_files
 
 from html5lib import constants
 from html5lib.filters.lint import Filter as Lint
-from html5lib.serializer import HTMLSerializer, serialize
+from html5lib.serializer import HTMLSerializer, serialize, serializeFragment, SerializeError
 from html5lib.treewalkers.base import TreeWalker
 
 # pylint:disable=wrong-import-position
@@ -224,3 +224,100 @@ def test_serializer(input, expected, options):
         assert expected[0] == result, "Expected:\n%s\nActual:\n%s\nOptions:\n%s" % (expected[0], result, str(options))
     elif result not in expected:
         assert False, "Expected: %s, Received: %s" % (expected, result)
+
+
+def testNamespacedAttributeSerialization():
+    input_ = [["StartTag", "http://www.w3.org/2000/svg", "use",
+               [{"namespace": "http://www.w3.org/1999/xlink", "name": "href", "value": "#a"},
+                {"namespace": "http://www.w3.org/XML/1998/namespace", "name": "lang", "value": "en"},
+                {"namespace": None, "name": "class", "value": "x"}]],
+              ["EndTag", "http://www.w3.org/2000/svg", "use"]]
+    test_serializer(input_, ['<use class="x" xlink:href="#a" xml:lang="en"></use>'],
+                    {"quote_attr_values": "always"})
+
+
+def testUnrepresentableAttributeNamespace():
+    input_ = [["StartTag", "http://www.w3.org/1999/xhtml", "span",
+               [{"namespace": "http://example.com/ns", "name": "foo", "value": "bar"}]]]
+    serializer = HTMLSerializer()
+    serializer.strict = True
+    with pytest.raises(SerializeError):
+        serializer.render(Lint(JsonWalker(input_), False))
+
+
+def _xhtml(name):
+    return "{http://www.w3.org/1999/xhtml}%s" % name
+
+
+def testSerializeFragmentTableRow():
+    from html5lib import parse, parseFragment
+    doc = parse("<table><tbody><tr id='r1'><td class='c'>Hi!</td></tr></tbody></table>")
+    row = doc.find(".//" + _xhtml("tr"))
+    fragment = serializeFragment(row, container="tbody")
+    reparsed = parseFragment(fragment, container="tbody")
+    row2 = reparsed.find(_xhtml("tr"))
+    assert row2 is not None
+    assert row2.get("id") == "r1"
+    cell = row2.find(_xhtml("td"))
+    assert cell is not None
+    assert cell.get("class") == "c"
+    assert cell.text == "Hi!"
+
+
+def testSerializeFragmentTableRowWrongContainer():
+    from html5lib import parse
+    doc = parse("<table><tbody><tr><td>Hi!</td></tr></tbody></table>")
+    row = doc.find(".//" + _xhtml("tr"))
+    with pytest.raises(SerializeError):
+        serializeFragment(row, container="div")
+
+
+def testSerializeFragmentSvg():
+    from html5lib import parse, parseFragment
+    doc = parse("<html><body><svg viewBox='0 0 10 10'>"
+                "<use xlink:href='#a' xml:lang='en' fill='red'/></svg></body></html>")
+    svg = doc.find(".//{http://www.w3.org/2000/svg}svg")
+    fragment = serializeFragment(svg, container="div")
+    reparsed = parseFragment(fragment, container="div")
+    svg2 = reparsed.find("{http://www.w3.org/2000/svg}svg")
+    assert svg2 is not None
+    assert svg2.get("viewBox") == "0 0 10 10"
+    use = svg2.find("{http://www.w3.org/2000/svg}use")
+    assert use is not None
+    assert use.get("{http://www.w3.org/1999/xlink}href") == "#a"
+    assert use.get("{http://www.w3.org/XML/1998/namespace}lang") == "en"
+    assert use.get("fill") == "red"
+
+
+def testSerializeFragmentAttributeOrder():
+    from html5lib import parseFragment
+    fragment = parseFragment("<div zeta='1' alpha='2' beta='3'></div>")
+    output = serializeFragment(fragment, container="div")
+    reparsed = parseFragment(output, container="div")
+    div = reparsed.find(_xhtml("div"))
+    assert list(div.attrib.items()) == [("zeta", "1"), ("alpha", "2"), ("beta", "3")]
+
+
+def testSerializeFragmentWholeDocumentFails():
+    from html5lib import parse
+    doc = parse("<!DOCTYPE html><html><body><p>Hi!</p></body></html>",
+                treebuilder="dom")
+    with pytest.raises(SerializeError) as excinfo:
+        serializeFragment(doc, tree="dom")
+    assert "doctype" in str(excinfo.value)
+
+
+def testSerializeFragmentDoctypeFreeDocumentFails():
+    from html5lib import parse
+    doc = parse("<html><body><p>Hi!</p></body></html>")
+    with pytest.raises(SerializeError):
+        serializeFragment(doc)
+
+
+def testSerializeFragmentEncoding():
+    from html5lib import parseFragment
+    fragment = parseFragment("<p>Hi!</p>")
+    output = serializeFragment(fragment, container="div", encoding="utf-8")
+    assert isinstance(output, bytes)
+    reparsed = parseFragment(output, container="div")
+    assert reparsed.find(_xhtml("p")) is not None

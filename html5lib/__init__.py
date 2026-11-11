@@ -18,6 +18,7 @@ For convenience, this module re-exports the following names:
 * :func:`~.treebuilders.getTreeBuilder`
 * :func:`~.treewalkers.getTreeWalker`
 * :func:`~.serializer.serialize`
+* :func:`~.serializer.serializeFragment`
 """
 
 from __future__ import absolute_import, division, unicode_literals
@@ -25,10 +26,10 @@ from __future__ import absolute_import, division, unicode_literals
 from .html5parser import HTMLParser, parse, parseFragment
 from .treebuilders import getTreeBuilder
 from .treewalkers import getTreeWalker
-from .serializer import serialize
+from .serializer import serialize, serializeFragment
 
 __all__ = ["HTMLParser", "parse", "parseFragment", "getTreeBuilder",
-           "getTreeWalker", "serialize"]
+           "getTreeWalker", "serialize", "serializeFragment"]
 
 # this has to be at the top level, see how setup.py parses this
 #: Distribution version number.
