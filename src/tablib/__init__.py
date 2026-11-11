@@ -13,10 +13,14 @@ except ImportError:
 from .core import (  # noqa: F401
     Databook,
     Dataset,
+    DuplicateHeaders,
+    HeadersNeeded,
     InvalidDatasetType,
     InvalidDimensions,
+    UnexpectedColumns,
     UnsupportedFormat,
     detect_format,
     import_book,
     import_set,
 )
+from .utils import MISSING  # noqa: F401

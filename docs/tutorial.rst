@@ -326,6 +326,51 @@ Using chaining you can get a filter type and. ::
 
 It's that simple. The original :class:`Dataset` is untouched.
 
+.. _merging:
+
+-----------------
+Merging Datasets
+-----------------
+
+When several sources share the same columns but arrange them in a different
+order (and only some sources provide every column), :meth:`Dataset.merge`
+combines them by matching **header names**, rather than by column position.
+
+Suppose two vendors both export ``sku``, ``name`` and ``price`` in different
+orders, and only one of them reports ``stock``::
+
+    >>> first = tablib.Dataset(headers=('sku', 'name', 'price'))
+    >>> first.append(('A-1', 'Widget', 9.9))
+    >>> second = tablib.Dataset(headers=('price', 'name', 'sku', 'stock'))
+    >>> second.append((4.9, 'Gizmo', 'B-1', 100))
+    >>> first.merge(second)
+    <dataset object>
+    >>> first.headers
+    ['sku', 'name', 'price', 'stock']
+    >>> first[0]
+    ('A-1', 'Widget', 9.9, <MISSING>)
+    >>> first[1]
+    ('B-1', 'Gizmo', 4.9, 100)
+
+Cells whose column does not exist in a source are filled with the
+:data:`tablib.MISSING` sentinel. It is deliberately distinct from ``None``:
+``None`` means the column exists but the value itself is empty, while
+``MISSING`` means the source had no such column at all. Both values are kept
+as-is, so the difference stays visible to downstream business logic.
+
+New columns from the incoming dataset are appended by default. Pass
+``new_columns='reject'`` to refuse them instead; this raises
+:class:`tablib.UnexpectedColumns`. Both datasets must have headers with no
+repeated names — a repeated header raises :class:`tablib.DuplicateHeaders`
+and is left for the caller to rename or remove, since Tablib cannot guess
+which column was intended.
+
+The rows of the target dataset keep their original order and column
+positions, followed by the incoming rows in their own order; row tags are
+preserved as well. The new combined rows are built before the target is
+touched, so if anything raises, the prepared target dataset remains
+completely unchanged.
+
 Open an Excel Workbook and read first sheet
 -------------------------------------------
 

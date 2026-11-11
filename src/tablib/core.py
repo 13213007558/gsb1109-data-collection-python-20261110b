@@ -19,14 +19,16 @@ from copy import copy
 from operator import itemgetter
 
 from .exceptions import (
+    DuplicateHeaders,
     HeadersNeeded,
     InvalidDatasetIndex,
     InvalidDatasetType,
     InvalidDimensions,
+    UnexpectedColumns,
     UnsupportedFormat,
 )
 from .formats import registry
-from .utils import normalize_input
+from .utils import MISSING, normalize_input
 
 __title__ = 'tablib'
 __author__ = 'Kenneth Reitz'
@@ -805,6 +807,108 @@ class Dataset:
         _dset.headers = new_headers
 
         return _dset
+
+    def merge(self, other, new_columns='keep'):
+        """Merge the rows of another :class:`Dataset` into this one, aligning
+        columns by their header names rather than by position.
+
+        This is useful when sources expose the same fields (e.g. ``sku``,
+        ``name``, ``price``) in different column orders, or when only some
+        sources carry a given column (e.g. ``stock``).
+
+        Both datasets must have headers, and no header may appear more than
+        once in either dataset; duplicate header names raise
+        :class:`~tablib.exceptions.DuplicateHeaders` and are left for the
+        caller to resolve.
+
+        A cell whose column is missing in a source is filled with the
+        :data:`tablib.MISSING` sentinel. It is distinct from ``None``, which
+        is preserved as-is and represents a column that exists but holds an
+        empty value.
+
+        :param other: the :class:`Dataset` whose rows are merged in.
+        :param new_columns: ``'keep'`` (the default) appends columns from
+            ``other`` that this dataset does not have; ``'reject'`` raises
+            :class:`~tablib.exceptions.UnexpectedColumns` instead. The target
+            dataset is never modified when an exception is raised.
+        :returns: this :class:`Dataset`, with the rows of ``other`` appended.
+        """
+
+        if not isinstance(other, Dataset):
+            raise TypeError("'other' must be a Dataset instance")
+        if new_columns not in ('keep', 'reject'):
+            raise ValueError(
+                "new_columns must be 'keep' or 'reject', "
+                f"got {new_columns!r}"
+            )
+        if self.headers is None or other.headers is None:
+            raise HeadersNeeded
+
+        self._check_unique_headers(self.headers)
+        self._check_unique_headers(other.headers)
+
+        extra_headers = [
+            header for header in other.headers if header not in self.headers
+        ]
+        if extra_headers and new_columns == 'reject':
+            raise UnexpectedColumns(
+                f"Unexpected columns in incoming dataset: {extra_headers}"
+            )
+
+        # Build the merged dataset before touching self, so a failure leaves
+        # the prepared target dataset untouched.
+        merged_headers = list(self.headers) + extra_headers
+        merged = Dataset(headers=merged_headers, title=self.title)
+
+        target_index = {
+            header: index for index, header in enumerate(merged_headers)
+        }
+        self_index = {
+            header: index for index, header in enumerate(self.headers)
+        }
+        other_index = {
+            header: index for index, header in enumerate(other.headers)
+        }
+
+        for row in self._data:
+            merged_row = [MISSING] * len(merged_headers)
+            for header, position in self_index.items():
+                merged_row[target_index[header]] = row[position]
+            merged.append(merged_row, tags=row.tags)
+
+        for row in other._data:
+            merged_row = [MISSING] * len(merged_headers)
+            for header, position in other_index.items():
+                merged_row[target_index[header]] = row[position]
+            merged.append(merged_row, tags=row.tags)
+
+        merged._separators = list(self._separators)
+        merged._formatters = list(self._formatters)
+
+        self._data = merged._data
+        # merged is already dimensionally consistent, so set headers directly
+        # (the setter would validate against the stale width when both sides
+        # contain no rows).
+        self.__headers = merged_headers
+        self._separators = merged._separators
+        self._formatters = merged._formatters
+        # Dynamic columns have been materialized as regular cells above.
+        self._dynamic_columns = {}
+        return self
+
+    @staticmethod
+    def _check_unique_headers(headers):
+        seen = set()
+        duplicates = []
+        for header in headers:
+            if header in seen and header not in duplicates:
+                duplicates.append(header)
+            seen.add(header)
+        if duplicates:
+            raise DuplicateHeaders(
+                f"Duplicate header names must be resolved by the caller: "
+                f"{duplicates}"
+            )
 
     def remove_duplicates(self):
         """Removes all duplicate rows from the :class:`Dataset` object

@@ -13,6 +13,8 @@ import tablib
 def serialize_objects_handler(obj):
     if isinstance(obj, (decimal.Decimal, UUID)):
         return str(obj)
+    elif obj is tablib.MISSING:
+        return str(obj)
     elif hasattr(obj, 'isoformat'):
         return obj.isoformat()
     else:

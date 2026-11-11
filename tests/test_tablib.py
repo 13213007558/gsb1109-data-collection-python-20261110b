@@ -757,6 +757,206 @@ class TablibTestCase(BaseTestCase):
         self.assertTrue(john.has_tag(["tag2", "tag1"]))
 
 
+class DatasetMergeTests(BaseTestCase):
+    """Tests for header-name based Dataset.merge()."""
+
+    def _vendor_a(self):
+        vendor = tablib.Dataset(headers=('sku', 'name', 'price'))
+        vendor.append(('A-1', 'Widget', 9.9))
+        vendor.append(('A-2', 'Gadget', 19.9))
+        return vendor
+
+    def _vendor_b(self):
+        # Same fields, different column order, plus an explicit empty price.
+        vendor = tablib.Dataset(headers=('price', 'name', 'sku'))
+        vendor.append((29.9, 'Gizmo', 'B-1'))
+        vendor.append((None, 'Doohickey', 'B-2'))
+        return vendor
+
+    def _vendor_c(self):
+        # Only this vendor reports stock.
+        vendor = tablib.Dataset(headers=('name', 'sku', 'price', 'stock'))
+        vendor.append(('Thingamajig', 'C-1', 4.9, 100))
+        return vendor
+
+    def test_merge_aligns_columns_by_name_across_orders(self):
+        target = self._vendor_a()
+        target.merge(self._vendor_b())
+
+        self.assertEqual(
+            target.headers, ['sku', 'name', 'price']
+        )
+        self.assertEqual(target[0], ('A-1', 'Widget', 9.9))
+        self.assertEqual(target[2], ('B-1', 'Gizmo', 29.9))
+        self.assertEqual(target[3], ('B-2', 'Doohickey', None))
+
+    def test_merge_distinguishes_missing_column_from_empty_value(self):
+        target = self._vendor_a()
+        target.merge(self._vendor_c())
+
+        self.assertEqual(
+            target.headers, ['sku', 'name', 'price', 'stock']
+        )
+        # Rows from vendor A have no stock column at all -> MISSING.
+        self.assertIs(target['stock'][0], tablib.MISSING)
+        self.assertIs(target['stock'][1], tablib.MISSING)
+        # Vendor C row keeps its real values.
+        self.assertEqual(target[-1], ('C-1', 'Thingamajig', 4.9, 100))
+
+        # Vendor B has an explicit empty price but no stock column.
+        target.merge(self._vendor_b())
+        b2_row = [row for row in target.dict if row['sku'] == 'B-2'][0]
+        self.assertIsNone(b2_row['price'])
+        self.assertIs(b2_row['stock'], tablib.MISSING)
+        self.assertFalse(tablib.MISSING)
+        self.assertEqual(repr(tablib.MISSING), '<MISSING>')
+
+    def test_merge_keeps_row_order_within_each_source(self):
+        target = self._vendor_a()
+        original_headers = list(target.headers)
+        original_rows = target[:]
+
+        target.merge(self._vendor_b())
+        target.merge(self._vendor_c())
+
+        skus = [row[0] for row in target]
+        self.assertEqual(skus, ['A-1', 'A-2', 'B-1', 'B-2', 'C-1'])
+        # Target rows keep their original column positions and order.
+        self.assertEqual(target.headers[:3], original_headers)
+        self.assertEqual(
+            [tuple(row[:3]) for row in target[:2]],
+            list(original_rows),
+        )
+
+    def test_merge_appends_new_columns_by_default(self):
+        target = self._vendor_a()
+        target.merge(self._vendor_c())
+        self.assertEqual(target.headers[-1], 'stock')
+        self.assertEqual(target['stock'][-1], 100)
+
+    def test_merge_reject_new_columns_raises_and_keeps_target(self):
+        target = self._vendor_a()
+        snapshot_headers = list(target.headers)
+        snapshot_rows = list(target.dict)
+
+        with self.assertRaises(tablib.UnexpectedColumns):
+            target.merge(self._vendor_c(), new_columns='reject')
+
+        self.assertEqual(target.headers, snapshot_headers)
+        self.assertEqual(list(target.dict), snapshot_rows)
+        self.assertEqual(target.height, 2)
+
+    def test_merge_keep_without_new_columns_is_allowed(self):
+        target = self._vendor_a()
+        target.merge(self._vendor_b(), new_columns='reject')
+        self.assertEqual(target.height, 4)
+        self.assertEqual(target.headers, ['sku', 'name', 'price'])
+
+    def test_merge_rejects_duplicate_headers_in_either_dataset(self):
+        target = self._vendor_a()
+        duplicated = tablib.Dataset(headers=('sku', 'name', 'name'))
+        duplicated.append(('D-1', 'One', 'Two'))
+
+        with self.assertRaises(tablib.DuplicateHeaders):
+            target.merge(duplicated)
+        self.assertEqual(target.height, 2)
+
+        target_with_dup = tablib.Dataset(headers=('sku', 'sku'))
+        target_with_dup.append(('D-1', 'D-2'))
+        with self.assertRaises(tablib.DuplicateHeaders):
+            target_with_dup.merge(self._vendor_b())
+
+    def test_merge_requires_headers_on_both_sides(self):
+        target = self._vendor_a()
+        headerless = tablib.Dataset()
+        headerless.append(('x', 'y', 'z'))
+        with self.assertRaises(tablib.HeadersNeeded):
+            target.merge(headerless)
+
+        headerless_target = tablib.Dataset()
+        headerless_target.append(('x', 'y', 'z'))
+        with self.assertRaises(tablib.HeadersNeeded):
+            headerless_target.merge(self._vendor_a())
+
+    def test_merge_rejects_non_dataset_and_bad_option(self):
+        target = self._vendor_a()
+        with self.assertRaises(TypeError):
+            target.merge('not a dataset')
+        with self.assertRaises(ValueError):
+            target.merge(self._vendor_b(), new_columns='maybe')
+
+    def test_merge_failure_leaves_prepared_target_untouched(self):
+        target = self._vendor_a()
+        target.append_separator()
+        target.add_formatter('price', lambda value: value)
+        snapshot = target.dict
+
+        with self.assertRaises(tablib.UnexpectedColumns):
+            target.merge(self._vendor_c(), new_columns='reject')
+
+        self.assertEqual(target.dict, snapshot)
+        self.assertEqual(target.headers, ['sku', 'name', 'price'])
+        self.assertEqual(target._separators, [(3, '-')])
+        self.assertEqual(len(target._formatters), 1)
+
+    def test_merge_preserves_row_tags(self):
+        target = self._vendor_a()
+        other = self._vendor_b()
+        other._data[0].tags.append('vendor-b')
+
+        target.merge(other)
+
+        merged_row = [row for row in target._data if row.has_tag('vendor-b')]
+        self.assertEqual(len(merged_row), 1)
+        self.assertEqual(merged_row[0].tuple, ('B-1', 'Gizmo', 29.9))
+
+    def test_merge_returns_same_dataset_instance(self):
+        target = self._vendor_a()
+        self.assertIs(target.merge(self._vendor_b()), target)
+
+    def test_merge_handles_empty_datasets_with_different_headers(self):
+        target = tablib.Dataset(headers=('a',))
+        other = tablib.Dataset(headers=('b',))
+        target.merge(other)
+        self.assertEqual(target.headers, ['a', 'b'])
+        self.assertEqual(target.width, 2)
+        self.assertEqual(target.height, 0)
+
+        populated = tablib.Dataset(headers=('a', 'b'))
+        populated.append((1, 2))
+        target.merge(populated)
+        self.assertEqual(target[0], (1, 2))
+
+    def test_merge_missing_is_distinct_from_none_in_exports(self):
+        target = tablib.Dataset(headers=('sku', 'stock'))
+        target.append(('A-1', tablib.MISSING))
+        target.append(('A-2', None))
+
+        self.assertEqual(
+            json.loads(target.export('json')),
+            [
+                {'sku': 'A-1', 'stock': '<MISSING>'},
+                {'sku': 'A-2', 'stock': None},
+            ],
+        )
+        yaml_rows = target.export('yaml').splitlines()
+        self.assertIn('stock: <MISSING>', yaml_rows[0])
+        self.assertIn('stock: null', yaml_rows[1])
+        self.assertEqual(
+            target.export('csv'),
+            'sku,stock\r\nA-1,<MISSING>\r\nA-2,\r\n',
+        )
+        # The binary spreadsheet formats must not raise.
+        target.export('xlsx')
+        target.export('xls')
+
+    def test_merge_missing_survives_pickle_roundtrip(self):
+        target = tablib.Dataset(headers=('sku', 'stock'))
+        target.append(('A-1', tablib.MISSING))
+        restored = pickle.loads(pickle.dumps(target))
+        self.assertIs(restored['stock'][0], tablib.MISSING)
+
+
 class HTMLTests(BaseTestCase):
     founders_html = (
         "<table>"

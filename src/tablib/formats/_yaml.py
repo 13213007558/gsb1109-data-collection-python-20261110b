@@ -8,6 +8,17 @@ import yaml
 import tablib
 
 
+class _TablibDumper(yaml.SafeDumper):
+    """SafeDumper that serializes the tablib.MISSING sentinel as a string,
+    keeping it distinct from empty (null) values."""
+
+
+_TablibDumper.add_representer(
+    type(tablib.MISSING),
+    lambda dumper, data: dumper.represent_str(str(data)),
+)
+
+
 class YAMLFormat:
     title = 'yaml'
     extensions = ('yaml', 'yml')
@@ -15,8 +26,9 @@ class YAMLFormat:
     @classmethod
     def export_set(cls, dataset):
         """Returns YAML representation of Dataset."""
-        return yaml.safe_dump(
+        return yaml.dump(
             dataset._package(),
+            Dumper=_TablibDumper,
             default_flow_style=None,
             allow_unicode=True,
             sort_keys=False,
@@ -25,8 +37,9 @@ class YAMLFormat:
     @classmethod
     def export_book(cls, databook):
         """Returns YAML representation of Databook."""
-        return yaml.safe_dump(
+        return yaml.dump(
             databook._package(),
+            Dumper=_TablibDumper,
             default_flow_style=None,
             allow_unicode=True,
             sort_keys=False,

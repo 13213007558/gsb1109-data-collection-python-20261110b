@@ -20,3 +20,14 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class DuplicateHeaders(TablibException, ValueError):
+    """The Dataset contains repeated header names, so columns cannot be
+    aligned by name. The caller must rename or remove the duplicates
+    first."""
+
+
+class UnexpectedColumns(TablibException, ValueError):
+    """The incoming Dataset declares columns that the target Dataset is
+    configured to reject."""

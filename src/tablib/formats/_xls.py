@@ -173,6 +173,8 @@ class XLSFormat:
                     ws.write(i, j, col, date_style)
                 elif isinstance(col, datetime.time):
                     ws.write(i, j, col, time_style)
+                elif col is tablib.MISSING:
+                    ws.write(i, j, str(col))
                 # wrap the rest
                 else:
                     try:
