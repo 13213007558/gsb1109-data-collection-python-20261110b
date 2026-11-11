@@ -281,16 +281,31 @@ class CacheMixin(MIXIN_BASE):
         response = super().send(request, **kwargs)
         actions.update_from_response(response)
 
-        if not actions.skip_write:
-            self.cache.save_response(response, actions.cache_key, actions.expires)
-        elif cached_response is not None and response.status_code == 304:
-            cached_response = actions.update_revalidated_response(
+        # A 304 without a matching cached entry carries no body. It must never be stored as a
+        # standalone response, since that would fabricate content from an empty revalidation.
+        if response.status_code == 304 and cached_response is None:
+            logger.debug(
+                f'Received 304 for URL {request.url} without a cached response; '
+                'returning it without writing to the cache'
+            )
+            return OriginalResponse.wrap_response(response, actions)
+
+        # A 304 for an existing cached response only refreshes its metadata; it never replaces the
+        # cached body. If the caller supplied its own validation headers, the 304 is returned as-is;
+        # cache-initiated revalidation keeps returning the refreshed cached response.
+        if response.status_code == 304 and cached_response is not None:
+            refreshed_response = actions.update_revalidated_response(
                 response, CachedResponse.from_response(cached_response)
             )
-            cached_response.cache_key = actions.cache_key
+            refreshed_response.cache_key = actions.cache_key
             if not actions.skip_write:
-                self.cache.save_response(cached_response, actions.cache_key, actions.expires)  # type: ignore[unreachable]
-            return cached_response
+                self.cache.save_response(refreshed_response, actions.cache_key, actions.expires)
+            if actions.has_caller_validation:
+                return OriginalResponse.wrap_response(response, actions)
+            return refreshed_response
+
+        if not actions.skip_write:
+            self.cache.save_response(response, actions.cache_key, actions.expires)
         else:
             logger.debug(f'Skipping cache write for URL: {request.url}')
 

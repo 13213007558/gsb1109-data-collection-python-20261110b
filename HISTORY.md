@@ -8,6 +8,8 @@
 * Recover stale-if-error and stale-while-revalidate directives from a previously cached response
 * Don't send a `stale-while-revalidate` refresh request when `only-if-cached` is also set
 * Set the type of the `headers` parameter of `CachedSession.request()` to `Mapping[str, str]` instead of `MutableMapping[str, str]`
+* Preserve caller-supplied `If-None-Match` and `If-Modified-Since` headers instead of replacing them with validators from a cached response, even when the values match; a `304` for the caller's own conditional request is now returned as-is while the cached entry is still revalidated
+* Never store a `304 Not Modified` received without a matching cached response, so an empty revalidation can no longer fabricate a cached response body; internal `304` revalidation also no longer overwrites the cached body when `304` is included in `allowable_codes`
 
 ## 1.3.3 (2026-07-03)
 * Add `CachedResponse.has_content_changed` to flag whether a refresh differs from the cache, when a reliable comparison is available.

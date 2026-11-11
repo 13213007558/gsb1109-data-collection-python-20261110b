@@ -82,10 +82,15 @@ class OriginalResponse(BaseResponse):
         bytes. Invalid JSON falls back to bytes. Large JSON bodies incur parsing and
         normalisation costs. This method never consumes an unbuffered stream.
         """
-        if cached_response is not None and self._content_consumed:
-            self.has_content_changed = _comparable_content(self) != _comparable_content(
-                cached_response
-            )
+        if cached_response is None or not self._content_consumed:
+            return
+        # A 304 never carries a body and means the selected representation is unchanged
+        if self.status_code == 304:
+            self.has_content_changed = False
+            return
+        self.has_content_changed = _comparable_content(self) != _comparable_content(
+            cached_response
+        )
 
 
 def _comparable_content(response: Response) -> Union[DecodedContent, bytes]:

@@ -224,6 +224,77 @@ def test_update_from_cached_response__no_revalidation():
     assert actions._validation_headers == {}
 
 
+def test_caller_validation_header_is_captured_and_preserved():
+    """A caller-supplied If-None-Match is tracked separately and never replaced by the cached
+    response's own ETag"""
+    request = Request(
+        method='GET', url=BASIC_REQUEST.url, headers={'If-None-Match': '"caller-etag"'}
+    ).prepare()
+    actions = CacheActions.from_request('key', request)
+    cached_response = CachedResponse(headers={'ETag': ETAG}, expires=utcnow() - timedelta(1))
+
+    actions.update_from_cached_response(cached_response)
+
+    assert actions.has_caller_validation is True
+    assert actions._caller_validation_headers == {'If-None-Match': '"caller-etag"'}
+    assert actions._validation_headers == {}
+
+    updated = actions.update_request(request.copy())
+    assert updated.headers['If-None-Match'] == '"caller-etag"'
+
+
+def test_caller_validation_header_same_value_is_not_conflated():
+    """Identical caller and cached validator values must still be treated as distinct sources"""
+    request = Request(
+        method='GET', url=BASIC_REQUEST.url, headers={'If-None-Match': ETAG}
+    ).prepare()
+    actions = CacheActions.from_request('key', request)
+    cached_response = CachedResponse(headers={'ETag': ETAG}, expires=utcnow() - timedelta(1))
+
+    actions.update_from_cached_response(cached_response)
+
+    assert actions.has_caller_validation is True
+    assert actions._validation_headers == {}
+    assert actions.update_request(request.copy()).headers['If-None-Match'] == ETAG
+
+
+def test_caller_and_internal_validation_headers_coexist():
+    """A caller If-Modified-Since stays intact while the cache adds its own If-None-Match"""
+    request = Request(
+        method='GET',
+        url=BASIC_REQUEST.url,
+        headers={'If-Modified-Since': 'Wed, 04 Jul 2012 12:00:00 GMT'},
+    ).prepare()
+    actions = CacheActions.from_request('key', request)
+    cached_response = CachedResponse(
+        headers={'ETag': ETAG, 'Last-Modified': LAST_MODIFIED},
+        expires=utcnow() - timedelta(1),
+    )
+
+    actions.update_from_cached_response(cached_response)
+
+    assert actions._caller_validation_headers == {
+        'If-Modified-Since': 'Wed, 04 Jul 2012 12:00:00 GMT'
+    }
+    assert actions._validation_headers == {'If-None-Match': ETAG}
+
+    updated = actions.update_request(request.copy())
+    assert updated.headers['If-Modified-Since'] == 'Wed, 04 Jul 2012 12:00:00 GMT'
+    assert updated.headers['If-None-Match'] == ETAG
+
+
+def test_no_caller_validation_uses_internal_headers():
+    """Without caller validation headers, cache-sourced validators are still applied"""
+    actions = CacheActions.from_request('key', BASIC_REQUEST)
+    cached_response = CachedResponse(headers={'ETag': ETAG}, expires=utcnow() - timedelta(1))
+
+    actions.update_from_cached_response(cached_response)
+
+    assert actions.has_caller_validation is False
+    assert actions.has_internal_validation is True
+    assert actions._validation_headers == {'If-None-Match': ETAG}
+
+
 def test_update_from_cached_response__504():
     settings = CacheSettings(only_if_cached=True)
     actions = CacheActions.from_request('key', BASIC_REQUEST, settings=settings)

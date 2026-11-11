@@ -33,6 +33,9 @@ METHOD_OVERRIDE_HEADERS = [
     'X-Method-Override',
 ]
 
+# Conditional request validators that a caller may supply to perform its own revalidation
+VALIDATION_HEADER_NAMES = ('If-None-Match', 'If-Modified-Since')
+
 logger = getLogger(__name__)
 
 
@@ -80,6 +83,9 @@ class CacheActions(RichMixin):
     _stale_if_error: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _stale_while_revalidate: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _validation_headers: Dict[str, str] = field(factory=dict, repr=False)
+    # Validation headers supplied by the caller on the outgoing request; these are always sent
+    # as-is and never replaced with validators derived from a cached response
+    _caller_validation_headers: Dict[str, str] = field(factory=dict, repr=False)
     _vary_matched: bool = field(default=True, repr=False)
 
     # Get session-level setting for stale_if_error and stale_while_revalidate, kept separate
@@ -151,6 +157,7 @@ class CacheActions(RichMixin):
             base_stale_if_error=stale_if_error,
             base_stale_while_revalidate=stale_while_revalidate,
         )
+        actions._caller_validation_headers = _get_caller_validation_headers(request)
         return actions
 
     @property
@@ -269,9 +276,23 @@ class CacheActions(RichMixin):
         _log_cache_criteria('write', write_criteria)
 
     def update_request(self, request: PreparedRequest) -> PreparedRequest:
-        """Apply validation headers (if any) before sending a request"""
+        """Apply validation headers (if any) before sending a request.
+
+        Only cache-sourced validation headers are added here. Caller-supplied ``If-None-Match``
+        and ``If-Modified-Since`` headers already live on the request and are never replaced.
+        """
         request.headers.update(self._validation_headers)
         return request
+
+    @property
+    def has_caller_validation(self) -> bool:
+        """Whether the caller supplied its own conditional request headers"""
+        return bool(self._caller_validation_headers)
+
+    @property
+    def has_internal_validation(self) -> bool:
+        """Whether validation headers derived from a cached response will be sent"""
+        return bool(self._validation_headers)
 
     def update_revalidated_response(
         self, response: Response, cached_response: 'CachedResponse'
@@ -343,11 +364,15 @@ class CacheActions(RichMixin):
             directives.no_cache or directives.must_revalidate
         )
 
-        # Add the appropriate validation headers, if needed
+        # Add the appropriate validation headers, if needed. Headers the caller already set on
+        # the request are left untouched, even if the values happen to be identical, so the two
+        # sources of validation can never be conflated.
         if revalidate or cc_revalidate:
-            if directives.etag:
+            if directives.etag and 'If-None-Match' not in self._caller_validation_headers:
                 self._validation_headers['If-None-Match'] = directives.etag
-            if directives.last_modified:
+            if directives.last_modified and (
+                'If-Modified-Since' not in self._caller_validation_headers
+            ):
                 self._validation_headers['If-Modified-Since'] = directives.last_modified
             self.send_request = False
             self.resend_request = True
@@ -448,6 +473,16 @@ def _is_method_allowed(request: PreparedRequest, settings: CacheSettings) -> boo
     methods = [headers.get(k) for k in METHOD_OVERRIDE_HEADERS]
     methods += [request.method]
     return any(m is not None and m in settings.allowable_methods for m in methods)
+
+
+def _get_caller_validation_headers(request: PreparedRequest) -> Dict[str, str]:
+    """Extract conditional request headers supplied by the caller, keyed by their canonical names.
+
+    These are tracked separately from cache-sourced validation headers so the cache never
+    overwrites a caller's own revalidation conditions, even when the values match.
+    """
+    headers = request.headers or CaseInsensitiveDict()
+    return {name: headers[name] for name in VALIDATION_HEADER_NAMES if name in headers}
 
 
 def _log_vary_diff(

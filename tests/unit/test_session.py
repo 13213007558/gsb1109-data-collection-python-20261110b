@@ -32,6 +32,8 @@ from requests_cache.policy import (
 from requests_cache.policy.actions import METHOD_OVERRIDE_HEADERS
 from requests_cache.session import OriginalSession
 from tests.conftest import (
+    ETAG,
+    LAST_MODIFIED,
     MOCKED_URL,
     MOCKED_URL_200_404,
     MOCKED_URL_404,
@@ -902,6 +904,127 @@ def test_304_not_modified(
 
     response = mock_session.get(url)
     assert response.from_cache is expected_from_cache
+
+
+def test_caller_validation_header_is_preserved(mock_session):
+    """A caller-supplied If-None-Match must reach the server unchanged, instead of being
+    replaced by the cached response's own ETag, and the resulting 304 must be visible to the
+    caller"""
+    url = f'{MOCKED_URL}/caller-validator'
+    mock_session.settings.expire_after = utcnow() - timedelta(1)
+    mock_session.mock_adapter.register_uri(
+        'GET', url, status_code=200, text='cached body', headers={'ETag': ETAG}
+    )
+    mock_session.get(url)
+    mock_session.mock_adapter.register_uri('GET', url, status_code=304)
+
+    response = mock_session.get(url, headers={'If-None-Match': '"caller-etag"'})
+    sent = mock_session.mock_adapter.request_history[-1].headers
+
+    assert sent['If-None-Match'] == '"caller-etag"'
+    assert response.status_code == 304
+    assert response.from_cache is False
+
+
+def test_caller_validation_header_same_value_is_not_conflated(mock_session):
+    """Even when the caller's validator and the cached ETag have identical values, the two
+    sources stay distinct: the caller still sees the 304 while the cached entry is revalidated"""
+    url = f'{MOCKED_URL}/same-validator'
+    mock_session.settings.expire_after = utcnow() - timedelta(1)
+    mock_session.mock_adapter.register_uri(
+        'GET', url, status_code=200, text='cached body', headers={'ETag': ETAG}
+    )
+    mock_session.get(url)
+    mock_session.mock_adapter.register_uri('GET', url, status_code=304)
+
+    response = mock_session.get(url, headers={'If-None-Match': ETAG})
+    cached = mock_session.cache.get_response(mock_session.cache.create_key(Request('GET', url)))
+
+    assert response.status_code == 304 and response.from_cache is False
+    assert mock_session.mock_adapter.request_history[-1].headers['If-None-Match'] == ETAG
+    assert cached.status_code == 200 and cached.text == 'cached body'
+
+
+def test_internal_revalidation_still_returns_cached_response(mock_session):
+    """Without caller validation headers, a cache-initiated 304 still refreshes and returns the
+    cached response as before"""
+    url = f'{MOCKED_URL}/internal-validator'
+    mock_session.settings.expire_after = utcnow() - timedelta(1)
+    mock_session.mock_adapter.register_uri(
+        'GET', url, status_code=200, text='cached body', headers={'ETag': ETAG}
+    )
+    mock_session.get(url)
+    mock_session.mock_adapter.register_uri('GET', url, status_code=304)
+
+    response = mock_session.get(url)
+    sent = mock_session.mock_adapter.request_history[-1].headers
+
+    assert response.status_code == 200 and response.from_cache is True
+    assert response.revalidated is True and response.text == 'cached body'
+    assert sent['If-None-Match'] == ETAG
+
+
+def test_caller_if_modified_since_preserved_with_mixed_validators(mock_session):
+    """A caller If-Modified-Since is preserved while the cache may still add its own
+    If-None-Match derived from the cached response"""
+    url = f'{MOCKED_URL}/mixed-validators'
+    mock_session.settings.expire_after = utcnow() - timedelta(1)
+    mock_session.mock_adapter.register_uri(
+        'GET',
+        url,
+        status_code=200,
+        text='cached body',
+        headers={'ETag': ETAG, 'Last-Modified': LAST_MODIFIED},
+    )
+    mock_session.get(url)
+    mock_session.mock_adapter.register_uri('GET', url, status_code=304)
+
+    response = mock_session.get(
+        url, headers={'If-Modified-Since': 'Wed, 04 Jul 2012 12:00:00 GMT'}
+    )
+    sent = mock_session.mock_adapter.request_history[-1].headers
+
+    assert response.status_code == 304 and response.from_cache is False
+    assert sent['If-Modified-Since'] == 'Wed, 04 Jul 2012 12:00:00 GMT'
+    assert sent['If-None-Match'] == ETAG
+
+
+@pytest.mark.parametrize('allowable_codes', [(200,), (200, 304)])
+def test_304_on_cache_miss_is_not_stored(allowable_codes, tmp_path):
+    """A 304 received without a matching cached entry has no body and must never be stored as a
+    standalone response, even when 304 is in allowable_codes"""
+    session = mount_mock_adapter(
+        CachedSession(tmp_path / 'cache', backend='memory', allowable_codes=allowable_codes)
+    )
+    url = f'{MOCKED_URL}/miss-304'
+    session.mock_adapter.register_uri('GET', url, status_code=304, headers={'ETag': ETAG})
+
+    response = session.get(url, headers={'If-None-Match': '"v1"'})
+
+    assert response.status_code == 304
+    assert not session.cache.contains(url=url)
+
+
+def test_304_with_allowable_codes_keeps_cached_body(tmp_path):
+    """With 304 in allowable_codes, an internal revalidation must still refresh the existing
+    entry rather than overwriting its body with the empty 304"""
+    session = mount_mock_adapter(
+        CachedSession(tmp_path / 'cache', backend='memory', allowable_codes=(200, 304))
+    )
+    session.settings.expire_after = utcnow() - timedelta(1)
+    url = f'{MOCKED_URL}/keep-body'
+    session.mock_adapter.register_uri(
+        'GET', url, status_code=200, text='important body', headers={'ETag': ETAG}
+    )
+    session.get(url)
+    session.mock_adapter.register_uri('GET', url, status_code=304)
+
+    response = session.get(url)
+    cached = session.cache.get_response(session.cache.create_key(Request('GET', url)))
+
+    assert response.status_code == 200 and response.from_cache is True
+    assert response.text == 'important body'
+    assert cached.status_code == 200 and cached.text == 'important body'
 
 
 def test_has_content_changed__without_new_content(mock_session):

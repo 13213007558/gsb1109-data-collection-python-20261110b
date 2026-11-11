@@ -26,6 +26,21 @@ requests-cache repo:
 True
 ```
 
+### Caller-supplied validation headers
+If you send your own `If-None-Match` or `If-Modified-Since` headers (for example, a sync program
+that tracks version numbers itself), those headers are always forwarded to the server exactly as
+you set them. requests-cache will not replace them with the validators of a cached response, even
+when the values happen to be identical.
+
+The two sources of validation stay independent:
+
+* A `304 Not Modified` returned for **your own** conditional request is passed back to you with its
+  `304` status, while the matching cached entry is still revalidated in the background.
+* A `304` produced by the cache's **own** revalidation (when you did not supply validation headers)
+  continues to return the refreshed cached response as usual.
+* If the server returns a `304` when there is no matching cached response, it is returned as-is and
+  is **not** stored, since a `304` has no body and cannot be turned into a cached representation.
+
 ```{note}
 Also see {ref}`stale-while-revalidate` for a variation of this behavior.
 ```
@@ -63,8 +78,10 @@ The following headers are currently supported:
   response instead of sending a new request. Note that this may return a stale response.
 - `Cache-Control: stale-if-error`: If an error occurs while refreshing a cached response, use it
   if it expired by no more than this many seconds ago
-- `If-None-Match`: Automatically added for revalidation, if an `ETag` is available
-- `If-Modified-Since`: Automatically added for revalidation, if `Last-Modified` is available
+- `If-None-Match`: Automatically added for revalidation, if an `ETag` is available. A value you set
+  yourself is always preserved and never replaced
+- `If-Modified-Since`: Automatically added for revalidation, if `Last-Modified` is available. A
+  value you set yourself is always preserved and never replaced
 
 **Response headers:**
 - `Cache-Control: immutable`: Cache the response with no expiration
