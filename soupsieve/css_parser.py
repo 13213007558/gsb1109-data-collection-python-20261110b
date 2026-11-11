@@ -7,7 +7,7 @@ from . import css_match as cm
 from . import css_types as ct
 from .util import SelectorSyntaxError
 import warnings
-from typing import Match, Any, Callable, Iterator, Iterable, Mapping, cast
+from typing import Match, Any, Callable, Iterator, Iterable, Mapping, NoReturn, cast
 from dataclasses import dataclass
 from collections import UserDict
 import threading
@@ -1541,3 +1541,124 @@ class CSSParser:
         """Process selectors."""
 
         return self.parse_selectors(self.selector_iter(self.pattern), index, flags)
+
+
+class _CustomDependencyRecorder(dict[str, ct.SelectorList]):
+    """
+    Record custom pseudo-class references while a custom selector rule is parsed.
+
+    Every referenced name is resolved to an empty placeholder selector list so
+    that parsing can continue without the referenced rules being available.
+    """
+
+    def __init__(self) -> None:
+        """Initialize."""
+
+        super().__init__()
+        self.dependencies: list[str] = []
+        self._placeholder = ct.SelectorList()
+
+    def get(self, key: str, default: Any = None) -> ct.SelectorList:
+        """Record the reference and resolve it to a placeholder."""
+
+        self.dependencies.append(key)
+        return self._placeholder
+
+
+def _format_custom_chain(chain: list[str], rules: Mapping[str, str]) -> str:
+    """Format a custom selector reference chain along with the original rules involved."""
+
+    lines = [f"  Reference chain: {' -> '.join(chain)}", '  Original rules:']
+    for name in dict.fromkeys(chain):
+        rule = rules.get(name)
+        if rule is not None:
+            lines.append(f'    {name}: {rule!r}')
+    return '\n'.join(lines)
+
+
+def _raise_undefined_custom(chain: list[str], dep: str, rules: Mapping[str, str]) -> NoReturn:
+    """Raise an error for an undefined custom selector reference."""
+
+    raise SelectorSyntaxError(
+        f"Undefined custom selector '{dep}'\n{_format_custom_chain(chain + [dep], rules)}"
+    )
+
+
+def _raise_circular_custom(chain: list[str], dep: str, rules: Mapping[str, str]) -> NoReturn:
+    """Raise an error for a circular custom selector reference."""
+
+    raise SelectorSyntaxError(
+        f"Circular reference to custom selector '{dep}'\n{_format_custom_chain(chain + [dep], rules)}"
+    )
+
+
+def validate_custom_selectors(*sources: Mapping[str, str]) -> None:
+    """
+    Validate a set of custom selector aliases offline.
+
+    Every alias found in the given sources is checked, even aliases that no
+    main selector currently references. Multiple mappings (e.g. one per file)
+    can be provided and are validated as a single combined set, so circular
+    references and undefined names are caught even when the aliases involved
+    are maintained in different sources.
+
+    Raises a `SelectorSyntaxError` describing the full reference chain and the
+    original rules involved when an alias references an undefined name or when
+    aliases circularly reference each other.
+    """
+
+    rules: dict[str, str] = {}
+    for source in sources:
+        if not isinstance(source, Mapping):
+            raise TypeError(f'Custom selector sources must be mappings, not {type(source)}')
+        for key, value in source.items():
+            if not isinstance(key, str):
+                raise TypeError('Custom selector keys must be strings')
+            name = util.lower(css_unescape(key))
+            if name in rules:
+                raise KeyError(f'Custom selector {name} was defined twice')
+            if RE_CUSTOM.match(name) is None:
+                raise SelectorSyntaxError(f"The name '{name}' is not a valid custom pseudo-class name")
+            if not isinstance(value, str):
+                raise TypeError(f'Custom selector values must be strings, not {type(value)}')
+            rules[name] = value
+
+    # Extract the custom selector dependencies of every alias. Rules are parsed
+    # with the real CSS parser, so text inside quoted values, such as
+    # `[data-name=":--alias"]`, is not mistaken for a dependency.
+    dependencies: dict[str, list[str]] = {}
+    for name, rule in rules.items():
+        recorder = _CustomDependencyRecorder()
+        try:
+            CSSParser(rule, custom=recorder).process_selectors(flags=FLG_PSEUDO)
+        except SelectorSyntaxError as error:
+            raise SelectorSyntaxError(f"Invalid rule for custom selector '{name}':\n{error}") from error
+        dependencies[name] = list(dict.fromkeys(recorder.dependencies))
+
+    # Walk the dependency graph of every alias, even ones nothing references.
+    # State: absent = unvisited, 1 = in the current chain, 2 = fully validated.
+    state: dict[str, int] = {}
+    for name in rules:
+        if state.get(name) == 2:
+            continue
+        chain = [name]
+        state[name] = 1
+        stack = [iter(dependencies[name])]
+        while stack:
+            descend = None
+            for dep in stack[-1]:
+                if dep not in rules:
+                    _raise_undefined_custom(chain, dep, rules)
+                dep_state = state.get(dep, 0)
+                if dep_state == 1:
+                    _raise_circular_custom(chain, dep, rules)
+                elif dep_state == 0:
+                    descend = dep
+                    break
+            if descend is None:
+                stack.pop()
+                state[chain.pop()] = 2
+            else:
+                state[descend] = 1
+                chain.append(descend)
+                stack.append(iter(dependencies[descend]))

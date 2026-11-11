@@ -148,3 +148,161 @@ class TestCustomSelectors(util.TestCase):
         """Test that a custom selector cannot match an already existing custom name."""
 
         self.assert_raises('div', KeyError, custom={":--parent": ":has(> *|*)", ":--PARENT": ":has(> *|*)"})
+
+
+class TestValidateCustomSelectors(util.TestCase):
+    """Test offline validation of custom selector aliases."""
+
+    def test_validate_ok(self):
+        """Test that a valid alias package passes, including aliases nothing references."""
+
+        sv.validate_custom_selectors({
+            ":--headers": "h1, h2, h3, h4, h5, h6",
+            ":--parent": ":has(> *|*)",
+            ":--parent-paragraph": "p:--parent",
+            ":--unused": "span:--headers"
+        })
+
+    def test_validate_no_sources(self):
+        """Test that validating no sources is a no-op."""
+
+        self.assertIsNone(sv.validate_custom_selectors())
+        self.assertIsNone(sv.validate_custom_selectors({}))
+
+    def test_validate_out_of_order_dependency(self):
+        """Test that definition order does not matter when validating a package."""
+
+        sv.validate_custom_selectors({
+            ":--parent-paragraph": "p:--parent",
+            ":--parent": ":has(> *|*)"
+        })
+
+    def test_validate_unreferenced_alias_checked(self):
+        """Test that a broken alias is caught even when no main rule references it."""
+
+        with self.assertRaises(sv.SelectorSyntaxError) as ctx:
+            sv.validate_custom_selectors({
+                ":--headers": "h1, h2",
+                ":--broken": "p:--missing"
+            })
+
+        message = str(ctx.exception)
+        self.assertIn(":--missing", message)
+        self.assertIn(":--broken -> :--missing", message)
+        self.assertIn("p:--missing", message)
+
+    def test_validate_undefined_chain(self):
+        """Test that an undefined name reports the full reference chain and original rules."""
+
+        with self.assertRaises(sv.SelectorSyntaxError) as ctx:
+            sv.validate_custom_selectors({
+                ":--alpha": "div:--beta",
+                ":--beta": "span:--missing",
+                ":--unrelated": "p"
+            })
+
+        message = str(ctx.exception)
+        self.assertIn("Undefined custom selector ':--missing'", message)
+        self.assertIn(":--alpha -> :--beta -> :--missing", message)
+        self.assertIn(":--alpha: 'div:--beta'", message)
+        self.assertIn(":--beta: 'span:--missing'", message)
+
+    def test_validate_circular(self):
+        """Test that a circular reference reports the full chain and original rules."""
+
+        with self.assertRaises(sv.SelectorSyntaxError) as ctx:
+            sv.validate_custom_selectors({
+                ":--a": ":--b",
+                ":--b": ":--c",
+                ":--c": ":--a"
+            })
+
+        message = str(ctx.exception)
+        self.assertIn("Circular reference to custom selector ':--a'", message)
+        self.assertIn(":--a -> :--b -> :--c -> :--a", message)
+        self.assertIn(":--b: ':--c'", message)
+
+    def test_validate_circular_across_sources(self):
+        """Test that cycles spanning aliases from different sources are caught."""
+
+        with self.assertRaises(sv.SelectorSyntaxError) as ctx:
+            sv.validate_custom_selectors(
+                {":--alpha": "div:--beta"},
+                {":--beta": "span:--alpha"}
+            )
+
+        message = str(ctx.exception)
+        self.assertIn(":--alpha -> :--beta -> :--alpha", message)
+        self.assertIn(":--alpha: 'div:--beta'", message)
+        self.assertIn(":--beta: 'span:--alpha'", message)
+
+    def test_validate_circular_self(self):
+        """Test that an alias referencing itself is caught."""
+
+        with self.assertRaises(sv.SelectorSyntaxError) as ctx:
+            sv.validate_custom_selectors({":--self": "p:--self"})
+
+        self.assertIn(":--self -> :--self", str(ctx.exception))
+
+    def test_validate_quoted_attribute_value_not_dependency(self):
+        """Test that text in a quoted attribute value does not count as a dependency."""
+
+        sv.validate_custom_selectors({
+            ":--alpha": '[data-ref=":--beta"]',
+            ":--gamma": "[data-ref=':--delta']"
+        })
+
+    def test_validate_quoted_contains_value_not_dependency(self):
+        """Test that text in a quoted `:-soup-contains` value does not count as a dependency."""
+
+        sv.validate_custom_selectors({":--alpha": 'p:-soup-contains(":--beta")'})
+
+    def test_validate_duplicate_across_sources(self):
+        """Test that a name defined in two sources fails."""
+
+        with self.assertRaises(KeyError):
+            sv.validate_custom_selectors({":--a": "div"}, {":--A": "span"})
+
+    def test_validate_invalid_name(self):
+        """Test that an invalid alias name fails."""
+
+        with self.assertRaises(sv.SelectorSyntaxError):
+            sv.validate_custom_selectors({":hover": "div"})
+
+    def test_validate_bad_key_type(self):
+        """Test that a non-string alias name fails."""
+
+        with self.assertRaises(TypeError):
+            sv.validate_custom_selectors({1: "div"})
+
+    def test_validate_bad_value_type(self):
+        """Test that a non-string rule fails."""
+
+        with self.assertRaises(TypeError):
+            sv.validate_custom_selectors({":--a": 1})
+
+    def test_validate_bad_source_type(self):
+        """Test that a non-mapping source fails."""
+
+        with self.assertRaises(TypeError):
+            sv.validate_custom_selectors([(":--a", "div")])
+
+    def test_validate_syntax_error_names_alias(self):
+        """Test that a malformed rule is reported along with the alias that defined it."""
+
+        with self.assertRaises(sv.SelectorSyntaxError) as ctx:
+            sv.validate_custom_selectors({":--bad": "div..x"})
+
+        self.assertIn(":--bad", str(ctx.exception))
+
+    def test_validate_does_not_change_default_behavior(self):
+        """Test that validation does not compile or alter the alias package for later use."""
+
+        custom = {":--headers": "h1, h2"}
+        sv.validate_custom_selectors(custom)
+        self.assertEqual(custom, {":--headers": "h1, h2"})
+
+        import bs4
+        soup = bs4.BeautifulSoup("<h1 id='1'></h1><h2 id='2'></h2><p id='3'></p>", 'html.parser')
+        tags = sv.select(':--headers', soup, custom=custom)
+        self.assertEqual([t['id'] for t in tags], ['1', '2'])

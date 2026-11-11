@@ -36,7 +36,7 @@ from typing import Any, Mapping, Iterator, Iterable, cast
 
 __all__ = (
     'DEBUG', 'NOCACHE', 'NOSTRICT', 'SelectorSyntaxError', 'CustomSelectors', 'SoupSieve',
-    'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_one'
+    'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_one', 'validate_custom_selectors'
 )
 
 SoupSieve = cm.SoupSieve
@@ -232,3 +232,18 @@ def escape(ident: str) -> str:
     """Escape identifier."""
 
     return cp.escape(ident)
+
+
+def validate_custom_selectors(*sources: Mapping[str, str]) -> None:
+    """
+    Validate custom selector aliases offline.
+
+    Every alias found in the given sources is checked, even aliases that no
+    main selector currently references. Multiple mappings (e.g. one per file)
+    can be provided and are validated as a single combined set. Raises a
+    `SelectorSyntaxError` with the full reference chain and the original rules
+    when an alias references an undefined name or aliases reference each other
+    circularly.
+    """
+
+    cp.validate_custom_selectors(*sources)
