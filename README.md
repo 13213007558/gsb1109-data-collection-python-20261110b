@@ -192,6 +192,12 @@ easier. We currently have the following helper functions:
 
 * [detect_dialect](https://clevercsv.readthedocs.io/en/latest/source/clevercsv.html#clevercsv.wrappers.detect_dialect): 
   takes a path to a CSV file and returns the detected dialect
+* [detect_multipart_dialect](https://clevercsv.readthedocs.io/en/latest/source/clevercsv.html#clevercsv.wrappers.detect_multipart_dialect): 
+  detects contiguous segments with different dialects in files that
+  concatenate exports from different systems (for instance a comma-delimited
+  part followed by a semicolon-delimited part), and returns the record and
+  character offsets and dialect of each segment. Returns ``None`` when no
+  reliable boundary can be established, leaving the file for manual review.
 * [read_table](https://clevercsv.readthedocs.io/en/latest/source/clevercsv.html#clevercsv.wrappers.read_table): 
   automatically detects the dialect and encoding of the file, and returns the 
   data as a list of rows. A version that returns a generator is also 
@@ -261,6 +267,7 @@ usage: clevercsv [-h] [-V] [-v] command ...
 Available commands:
   help         Display help information
   detect       Detect the dialect of a CSV file
+  segments     Detect contiguous dialect segments in a CSV file
   view         View the CSV file on the command line using TabView
   standardize  Convert a CSV file to one that conforms to RFC-4180
   code         Generate Python code to import a CSV file
@@ -324,6 +331,33 @@ delimiter = ,
 quotechar =
 escapechar = \
 ```
+
+#### Segments
+
+When a supplier concatenates exports from different systems, a file may use
+one dialect in its first part and another dialect later on (for example
+commas in the first part and semicolons in the second). The ``segments``
+command locates the boundary between such contiguous parts and reports the
+record and character offsets together with the dialect of each part, so that
+each part can be read separately. The boundary is always placed between
+complete records, so a record with a quoted field containing newlines is
+never split in the middle.
+
+```text
+$ clevercsv segments exports.csv
+Segment 1: rows 0-19, offsets 0-142, dialect: SimpleDialect(',', '"', '')
+          delimiter=',' quotechar='"' escapechar='' strict=False
+Segment 2: rows 20-39, offsets 143-267, dialect: SimpleDialect(';', '"', '')
+          delimiter=';' quotechar='"' escapechar='' strict=False
+```
+
+The ``--json`` flag emits the same information as a JSON array. The check is
+deliberately conservative: an occasional row that misses a column does not
+trigger a dialect change, and when no reliable boundary can be established
+the command exits with status 3 and leaves the file for manual review. The
+same functionality is available from Python through
+``clevercsv.detect_multipart`` (on a string) or
+``clevercsv.detect_multipart_dialect`` (on a file).
 
 #### Explore
 

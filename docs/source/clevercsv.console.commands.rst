@@ -28,6 +28,14 @@ clevercsv.console.commands.explore module
    :show-inheritance:
    :undoc-members:
 
+clevercsv.console.commands.segments module
+-------------------------------------------
+
+.. automodule:: clevercsv.console.commands.segments
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 clevercsv.console.commands.standardize module
 ---------------------------------------------
 

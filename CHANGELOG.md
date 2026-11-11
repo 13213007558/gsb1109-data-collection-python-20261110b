@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+* Add offline detection of files that concatenate exports with different
+  dialects. The new `clevercsv segments` command, the
+  `detect_multipart_dialect` wrapper, and the `detect_multipart` core
+  function locate the contiguous record segments and the dialect of each
+  segment. Boundaries are only placed between complete records (quoted
+  fields with embedded newlines are never split), rows missing a column do
+  not trigger a dialect change, and inconclusive files are returned as
+  `None` (exit status 3 on the command line) for manual review.
+
 ## Version 0.8.5
 
 * Fix reference counting bug in C extension 

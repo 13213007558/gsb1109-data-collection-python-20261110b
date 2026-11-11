@@ -725,3 +725,85 @@ with open("{tmpfname}", "r", newline="", encoding="ASCII") as fp:
         finally:
             os.unlink(tmpfname)
             os.unlink(tmpoutname)
+
+
+class SegmentsConsoleTestCase(unittest.TestCase):
+    def _build_raw_file(self, text: str) -> str:
+        tmpfd, tmpfname = tempfile.mkstemp(prefix="ccsv_", suffix=".csv")
+        with os.fdopen(tmpfd, "w", newline="", encoding="utf-8") as fid:
+            fid.write(text)
+        return tmpfname
+
+    def _multipart_text(self) -> str:
+        left = "\n".join("a,b,c" for _ in range(5))
+        right = "\n".join("a;b;c" for _ in range(5))
+        return left + "\n" + right
+
+    def test_segments_plain(self) -> None:
+        tmpfname = self._build_raw_file(self._multipart_text())
+        application = build_application()
+        tester = Tester(application)
+        try:
+            tester.test_command("segments", [tmpfname])
+            self.assertEqual(tester.get_return_code(), 0)
+            stdout = tester.get_stdout()
+            assert stdout is not None
+            self.assertIn("Segment 1", stdout)
+            self.assertIn("Segment 2", stdout)
+            self.assertIn("delimiter=','", stdout)
+            self.assertIn("delimiter=';'", stdout)
+        finally:
+            os.unlink(tmpfname)
+
+    def test_segments_json(self) -> None:
+        tmpfname = self._build_raw_file(self._multipart_text())
+        application = build_application()
+        tester = Tester(application)
+        try:
+            tester.test_command("segments", ["--json", tmpfname])
+            self.assertEqual(tester.get_return_code(), 0)
+            stdout = tester.get_stdout()
+            assert stdout is not None
+            payload = json.loads(stdout)
+            self.assertEqual(len(payload), 2)
+            self.assertEqual(payload[0]["start_row"], 0)
+            self.assertEqual(payload[0]["end_row"], 5)
+            self.assertEqual(payload[1]["start_row"], 5)
+            self.assertEqual(payload[1]["end_row"], 10)
+            self.assertEqual(
+                payload[0]["dialect"]["delimiter"],
+                ",",
+            )
+            self.assertEqual(
+                payload[1]["dialect"]["delimiter"],
+                ";",
+            )
+            self.assertLess(
+                payload[0]["end_offset"], payload[1]["start_offset"]
+            )
+        finally:
+            os.unlink(tmpfname)
+
+    def test_segments_inconclusive(self) -> None:
+        single = "\n".join("a,b,c" for _ in range(10))
+        tmpfname = self._build_raw_file(single)
+        application = build_application()
+        tester = Tester(application)
+        try:
+            tester.test_command("segments", [tmpfname])
+            self.assertEqual(tester.get_return_code(), 3)
+            stderr = tester.get_stderr()
+            assert stderr is not None
+            self.assertIn("manually", stderr)
+        finally:
+            os.unlink(tmpfname)
+
+    def test_segments_bad_tolerance(self) -> None:
+        tmpfname = self._build_raw_file(self._multipart_text())
+        application = build_application()
+        tester = Tester(application)
+        try:
+            tester.test_command("segments", ["--tolerance", "1.5", tmpfname])
+            self.assertEqual(tester.get_return_code(), 1)
+        finally:
+            os.unlink(tmpfname)

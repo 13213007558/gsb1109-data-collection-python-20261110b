@@ -15,8 +15,11 @@ from .dialect import unix_dialect
 from .dict_read_write import DictReader
 from .dict_read_write import DictWriter
 from .exceptions import Error
+from .multipart import CSVSegment
+from .multipart import detect_multipart
 from .read import reader
 from .wrappers import detect_dialect
+from .wrappers import detect_multipart_dialect
 from .wrappers import read_dataframe
 from .wrappers import read_dicts
 from .wrappers import read_table
@@ -40,8 +43,11 @@ __all__ = [
     "DictReader",
     "DictWriter",
     "Error",
+    "CSVSegment",
     "reader",
     "detect_dialect",
+    "detect_multipart",
+    "detect_multipart_dialect",
     "read_dataframe",
     "read_dicts",
     "read_table",

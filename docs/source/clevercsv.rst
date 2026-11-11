@@ -108,6 +108,14 @@ clevercsv.method module
    :show-inheritance:
    :undoc-members:
 
+clevercsv.multipart module
+---------------------------
+
+.. automodule:: clevercsv.multipart
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 clevercsv.normal\_form module
 -----------------------------
 

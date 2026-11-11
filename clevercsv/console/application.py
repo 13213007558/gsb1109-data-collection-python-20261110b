@@ -11,6 +11,7 @@ from .. import __version__
 from .commands import CodeCommand
 from .commands import DetectCommand
 from .commands import ExploreCommand
+from .commands import SegmentsCommand
 from .commands import StandardizeCommand
 from .commands import ViewCommand
 
@@ -36,6 +37,8 @@ class CleverCSVApplication(Application):
             "session\n\n"
             "clevercsv-standardize(1)\n"
             "\tConvert a messy CSV file to one that follows RFC-4180\n\n"
+            "clevercsv-segments(1)\n"
+            "\tDetect contiguous dialect segments in a CSV file\n\n"
             "clevercsv-view(1)\n"
             "\tDetect the dialect and open the CSV file using TabView"
         ),
@@ -90,6 +93,7 @@ class CleverCSVApplication(Application):
 def build_application() -> Application:
     app = CleverCSVApplication()
     app.add(DetectCommand())
+    app.add(SegmentsCommand())
     app.add(ViewCommand())
     app.add(StandardizeCommand())
     app.add(CodeCommand())

@@ -13,11 +13,13 @@ import warnings
 
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Dict
 from typing import Iterable
 from typing import Iterator
 from typing import List
 from typing import Mapping
 from typing import Optional
+from typing import Sequence
 from typing import TypeVar
 
 from ._optional import import_optional_dependency
@@ -27,6 +29,8 @@ from .dict_read_write import DictReader
 from .dict_read_write import DictWriter
 from .encoding import get_encoding
 from .exceptions import NoDetectionResult
+from .multipart import CSVSegment
+from .multipart import detect_multipart
 from .read import reader
 from .write import writer
 
@@ -399,6 +403,76 @@ def detect_dialect(
             data, verbose=verbose, method=method, skip=skip
         )
     return dialect
+
+
+def detect_multipart_dialect(
+    filename: "FileDescriptorOrPath",
+    encoding: Optional[str] = None,
+    delimiters: Optional[Sequence[str]] = None,
+    min_support: Optional[int] = None,
+    tolerance: Optional[float] = None,
+    verbose: bool = False,
+) -> Optional[List[CSVSegment]]:
+    """Detect contiguous dialect segments in a CSV file
+
+    This is a convenience wrapper around
+    :func:`clevercsv.multipart.detect_multipart` that reads the given file
+    (detecting its encoding if needed) and returns the readable segments and
+    the dialect of each segment. It is intended for files that concatenate
+    exports from different systems, where one part of the file uses a
+    different dialect than another part.
+
+    The check runs entirely offline and is deliberately conservative: when no
+    reliable single boundary can be established, ``None`` is returned so the
+    file can be reviewed manually or processed with the regular
+    single-dialect detection entry points.
+
+    Parameters
+    ----------
+    filename : str
+        The filename of the CSV file.
+
+    encoding : str
+        The file encoding of the CSV file. If None, it is detected.
+
+    delimiters : Optional[Sequence[str]]
+        Delimiters to consider for the two dialects. If None, comma and
+        semicolon are used.
+
+    min_support : Optional[int]
+        Minimum number of records clearly fitting each dialect. If None, the
+        default of :func:`clevercsv.multipart.detect_multipart` is used.
+
+    tolerance : Optional[float]
+        Maximum fraction of records on either side of the boundary that may
+        fail to fit the dialect of that side, for instance rows missing a
+        column. If None, the default tolerance is used.
+
+    verbose : bool
+        Enable verbose mode during detection.
+
+    Returns
+    -------
+    segments : Optional[List[CSVSegment]]
+        Ordered list of segments with their detected dialect, or ``None`` when
+        no reliable boundary can be established.
+
+    """
+    enc = encoding or get_encoding(filename)
+    kwargs: Dict[str, Any] = {}
+    if min_support is not None:
+        kwargs["min_support"] = min_support
+    if tolerance is not None:
+        kwargs["tolerance"] = tolerance
+    with open(filename, "r", newline="", encoding=enc) as fp:
+        data = fp.read()
+        segments = detect_multipart(
+            data,
+            delimiters=delimiters,
+            verbose=verbose,
+            **kwargs,
+        )
+    return segments
 
 
 def write_table(
