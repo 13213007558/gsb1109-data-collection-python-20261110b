@@ -1,0 +1,18 @@
+---
+features:
+  - |
+    When no handler matches a request, the assertion message now lists the
+    registered expectations whose URI is similar to the request and, for each
+    of them, describes every mismatching field separately (method, query,
+    headers, and the data/json/form body). When several expectations share the
+    same URI, all of them are reported instead of naming a single cause.
+    Expectations with an unrelated URI keep the previous full matcher listing.
+  - |
+    ``expect_request()``, ``expect_oneshot_request()``,
+    ``expect_ordered_request()``, ``RequestMatcher`` and
+    ``BlockingHTTPServer.assert_request()`` accept a new ``redact`` parameter.
+    Passing ``True`` hides all header values and body content in diagnostic
+    output; passing an iterable of header names hides only those header values
+    (case-insensitive). Redaction affects only messages and representations,
+    including the similar-request output of ``assert_request_made()``, never
+    request matching.

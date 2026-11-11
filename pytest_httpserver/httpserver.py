@@ -29,6 +29,7 @@ from typing import TypedDict
 from werkzeug import Request
 from werkzeug import Response
 from werkzeug.datastructures import Authorization
+from werkzeug.datastructures import Headers
 from werkzeug.datastructures import MultiDict
 from werkzeug.serving import make_server
 
@@ -53,6 +54,19 @@ METHOD_ALL = "__ALL"
 HEADERS_T = Mapping[str, str | Iterable[str]] | Iterable[tuple[str, str]]
 
 HVMATCHER_T = Callable[[str, str | None, str], bool]
+
+#: Placeholder rendered in diagnostic messages for redacted values.
+REDACTED = "<redacted>"
+
+DIFFERENCE_FIELD_LABELS = {
+    "uri": "uri",
+    "method": "method",
+    "query_string": "query",
+    "headers": "headers",
+    "data": "body (data)",
+    "json": "body (json)",
+    "data_form": "body (form fields)",
+}
 
 
 class Undefined:
@@ -340,6 +354,7 @@ class RequestMatcherKwargs(TypedDict, total=False):
     header_value_matcher: HVMATCHER_T | None
     json: Any
     data_form: Mapping[str, str] | None
+    redact: bool | Iterable[str]
 
 
 class RequestMatcher:
@@ -372,6 +387,11 @@ class RequestMatcher:
     :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
         A mapping matches the first value for each field; a ``MultiDict`` matches all values.
         Mutually exclusive with `data` and `json`.
+    :param redact: controls which values are hidden in diagnostic messages (such as the
+        assertion raised when no handler matches). When ``True``, all header values and the
+        request/expected body are hidden. When an iterable of header names is given, only the
+        values of those headers are hidden (matching is case-insensitive). Redaction never
+        affects matching, only the rendered failure message.
     """
 
     def __init__(
@@ -385,6 +405,7 @@ class RequestMatcher:
         header_value_matcher: HVMATCHER_T | None = None,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        redact: bool | Iterable[str] = False,  # noqa: FBT001
     ) -> None:
         if json is not UNDEFINED and data is not None:
             raise ValueError("data and json parameters are mutually exclusive")
@@ -413,20 +434,41 @@ class RequestMatcher:
         if header_value_matcher is not None:
             self.header_value_matcher = header_value_matcher
 
+        self.redact_all = redact is True
+        self.redacted_headers: frozenset[str] = frozenset()
+        if redact is not False and redact is not True:
+            if isinstance(redact, str):
+                raise TypeError("redact must be True, False or an iterable of header names, not a string")
+            self.redacted_headers = frozenset(name.lower() for name in redact)
+
+    def _format_repr_fields(self) -> str:
+        headers = self._redact_headers(self.headers)
+        data = REDACTED if self.redact_all and self.data is not None else self.data
+        json_value = REDACTED if self.redact_all and self.json is not UNDEFINED else self.json
+        retval = (
+            "uri={uri!r} method={method!r} query_string={query_string!r} "
+            "headers={headers!r} data={data!r} json={json!r}"
+        ).format(
+            uri=self.uri,
+            method=self.method,
+            query_string=self.query_string,
+            headers=headers,
+            data=data,
+            json=json_value,
+        )
+        if self.data_form is not None:
+            data_form = REDACTED if self.redact_all else self.data_form
+            retval += f" data_form={data_form!r}"
+        return retval
+
     def __repr__(self) -> str:
         """
         Returns the string representation of the object, with the known parameters.
-        """
 
-        class_name = self.__class__.__name__
-        retval = "<{} ".format(class_name)
-        retval += (
-            "uri={uri!r} method={method!r} query_string={query_string!r} "
-            "headers={headers!r} data={data!r} json={json!r}"
-        ).format_map(self.__dict__)
-        if self.data_form is not None:
-            retval += f" data_form={self.data_form!r}"
-        return retval + ">"
+        Values marked for redaction are replaced by a placeholder so the
+        representation can be used safely in assertion messages.
+        """
+        return f"<{self.__class__.__name__} {self._format_repr_fields()}>"
 
     def match_data(self, request: Request) -> bool:
         """
@@ -547,6 +589,55 @@ class RequestMatcher:
         difference = self.difference(request)
         return not difference
 
+    def _is_header_redacted(self, header_name: str) -> bool:
+        return self.redact_all or header_name.lower() in self.redacted_headers
+
+    def _redact_headers(self, headers: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            header_name: REDACTED if self._is_header_redacted(header_name) else value
+            for header_name, value in headers.items()
+        }
+
+    def redact_request_headers(self, headers: Headers) -> Headers:
+        """
+        Return a copy of the request headers with redacted values replaced.
+
+        The returned object keeps the werkzeug ``Headers`` representation so
+        diagnostic output looks unchanged apart from the hidden values.
+        """
+        rendered = Headers()
+        for header_name, value in headers.to_wsgi_list():
+            rendered.add(header_name, REDACTED if self._is_header_redacted(header_name) else value)
+        return rendered
+
+    def redact_body(self, body: Any) -> Any:
+        """Return the body, or a redaction placeholder when body hiding is on."""
+        return REDACTED if self.redact_all else body
+
+    def format_differences(self, request: Request) -> list[str]:
+        """
+        Format the differences between this matcher and the request.
+
+        The lines describe each mismatching field (method, query, headers or
+        the body) separately, showing the request's value and the expected
+        value. Redacted fields are replaced by a placeholder so secrets do not
+        appear in assertion messages. Matching itself is never affected by
+        redaction.
+        """
+        lines: list[str] = []
+        for field, actual, expected in self.difference(request):
+            actual_value: Any = actual
+            expected_value: Any = expected
+            if field == "headers":
+                actual_value = self._redact_headers(actual_value)
+                expected_value = self._redact_headers(expected_value)
+            elif self.redact_all and field in ("data", "json", "data_form"):
+                actual_value = REDACTED
+                expected_value = REDACTED
+            label = DIFFERENCE_FIELD_LABELS.get(field, field)
+            lines.append(f"    - {label}: request={actual_value!r} expected={expected_value!r}")
+        return lines
+
 
 class RequestHandlerBase(abc.ABC):
     """
@@ -657,15 +748,7 @@ class RequestHandler(RequestHandlerBase):
         self.request_handler = lambda request: response
 
     def __repr__(self) -> str:
-        class_name = self.__class__.__name__
-        retval = (
-            f"<{class_name} uri={self.matcher.uri!r} method={self.matcher.method!r} "
-            f"query_string={self.matcher.query_string!r} headers={self.matcher.headers!r} data={self.matcher.data!r} "
-            f"json={self.matcher.json!r}"
-        )
-        if self.matcher.data_form is not None:
-            retval += f" data_form={self.matcher.data_form!r}"
-        return retval + ">"
+        return f"<{self.__class__.__name__} {self.matcher._format_repr_fields()}>"  # noqa: SLF001
 
 
 class RequestHandlerList(list[RequestHandler]):
@@ -1148,6 +1231,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         handler_type: HandlerType = HandlerType.PERMANENT,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        redact: bool | Iterable[str] = False,  # noqa: FBT001
     ) -> RequestHandler:
         """
         Create and register a request handler.
@@ -1198,6 +1282,9 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param redact: ``True`` hides every header value and the body in diagnostic messages,
+            or an iterable of header names whose values are hidden (case-insensitive).
+            Matching is not affected, only the failure output.
 
         :return: Created and register :py:class:`RequestHandler`.
 
@@ -1213,6 +1300,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             query_string=query_string,
             header_value_matcher=header_value_matcher,
             json=json,
+            redact=redact,
             **({"data_form": data_form} if data_form is not None else {}),
         )
         request_handler = RequestHandler(matcher)
@@ -1235,6 +1323,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         header_value_matcher: HVMATCHER_T | None = None,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        redact: bool | Iterable[str] = False,  # noqa: FBT001
     ) -> RequestHandler:
         """
         Create and register a oneshot request handler.
@@ -1265,6 +1354,9 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param redact: ``True`` hides every header value and the body in diagnostic messages,
+            or an iterable of header names whose values are hidden (case-insensitive).
+            Matching is not affected, only the failure output.
 
         :return: Created and register :py:class:`RequestHandler`.
 
@@ -1281,6 +1373,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             header_value_matcher=header_value_matcher,
             handler_type=HandlerType.ONESHOT,
             json=json,
+            redact=redact,
             **({"data_form": data_form} if data_form is not None else {}),
         )
 
@@ -1295,6 +1388,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         header_value_matcher: HVMATCHER_T | None = None,
         json: Any = UNDEFINED,
         data_form: Mapping[str, str] | None = None,
+        redact: bool | Iterable[str] = False,  # noqa: FBT001
     ) -> RequestHandler:
         """
         Create and register a ordered request handler.
@@ -1325,6 +1419,9 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param redact: ``True`` hides every header value and the body in diagnostic messages,
+            or an iterable of header names whose values are hidden (case-insensitive).
+            Matching is not affected, only the failure output.
 
         :return: Created and register :py:class:`RequestHandler`.
 
@@ -1341,6 +1438,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             header_value_matcher=header_value_matcher,
             handler_type=HandlerType.ORDERED,
             json=json,
+            redact=redact,
             **({"data_form": data_form} if data_form is not None else {}),
         )
 
@@ -1372,6 +1470,91 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
 
         return "\n".join(lines)
 
+    def _iter_categorized_handlers(self) -> Iterable[tuple[str, RequestHandler]]:
+        yield from (("ordered", handler) for handler in self.ordered_handlers)
+        yield from (("oneshot", handler) for handler in self.oneshot_handlers)
+        yield from (("persistent", handler) for handler in self.handlers)
+
+    @staticmethod
+    def _uri_match_score(matcher: RequestMatcher, request: Request) -> int:
+        expected_uri = matcher.uri
+        if isinstance(expected_uri, URIPattern):
+            return 1 if expected_uri.match(request.path) else 0
+        if isinstance(expected_uri, re.compile("").__class__):
+            return 1 if expected_uri.match(request.path) else 0
+        if expected_uri in (URI_DEFAULT, request.path):
+            return 3
+        if isinstance(expected_uri, str) and (
+            expected_uri.rstrip("/") == request.path.rstrip("/")
+            or request.path.startswith(expected_uri)
+            or expected_uri.startswith(request.path)
+        ):
+            return 2
+        return 0
+
+    def find_similar_handlers(self, request: Request) -> list[tuple[str, RequestHandler]]:
+        """
+        Return the registered handlers whose URI is close to the request's path.
+
+        Each entry is a ``(category, handler)`` tuple where category is
+        ``ordered``, ``oneshot`` or ``persistent``. Handlers are ordered by how
+        close their URI is: exact matches first, then prefix or trailing-slash
+        variants, then URI patterns or regular expressions that accepted the
+        path. The first ordered handler always appears because it gates
+        dispatch, even when its URI does not resemble the request. Handlers
+        with an unrelated URI are otherwise excluded.
+        """
+        entries: list[tuple[int, int, str, RequestHandler]] = []
+        for order, (category, handler) in enumerate(self._iter_categorized_handlers()):
+            score = self._uri_match_score(handler.matcher, request)
+            is_ordered_gate = bool(self.ordered_handlers) and handler is self.ordered_handlers[0]
+            if score <= 0 and not is_ordered_gate:
+                continue
+            entries.append((score, order, category, handler))
+        entries.sort(key=lambda item: (-item[0], item[1]))
+        return [(category, handler) for _, _, category, handler in entries]
+
+    def format_nohandler_diagnosis(self, request: Request) -> str:
+        """
+        Build the diagnostic part of the 'no handler' assertion message.
+
+        For every registered handler whose URI resembles the request's path,
+        the per-field differences (method, query, headers, body) are listed and
+        the handler's category is shown. When several handlers share the same
+        URI, all of them are reported so a single close expectation is not
+        presented as the unique cause. When ordered expectations exist, the
+        message points at the next ordered request that must be consumed first.
+        When no handler has a similar URI, the full list of registered
+        matchers is returned instead.
+        """
+        similar_handlers = self.find_similar_handlers(request)
+        if not similar_handlers:
+            return self.format_matchers()
+
+        lines = ["Closest matching expectations:"]
+        for category, handler in similar_handlers:
+            differences = handler.matcher.format_differences(request)
+            if differences:
+                lines.append(f"  [{category}] {handler.matcher!r}")
+                lines.extend(differences)
+            else:
+                lines.append(f"  [{category}] {handler.matcher!r} (all checked fields match)")
+
+        same_uri = [handler for _, handler in similar_handlers if handler.matcher.uri == request.path]
+        if len(same_uri) > 1:
+            lines.append(
+                "  Note: {} expectations share this URI, so the request may have been rejected by any of them.".format(
+                    len(same_uri)
+                )
+            )
+        if self.ordered_handlers:
+            lines.append(
+                "  Note: ordered expectations are consumed in order; the next expected request is {!r}.".format(
+                    self.ordered_handlers[0].matcher
+                )
+            )
+        return "\n".join(lines)
+
     def respond_nohandler(self, request: Request, extra_message: str = "") -> Response:
         """
         Add a 'no handler' assertion.
@@ -1383,7 +1566,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         if self._waiting_settings.stop_on_nohandler:
             self._set_waiting_result(value=False)
 
-        return super().respond_nohandler(request, self.format_matchers() + extra_message)
+        return super().respond_nohandler(request, self.format_nohandler_diagnosis(request) + extra_message)
 
     def respond_permanent_failure(self) -> Response:
         """
@@ -1593,8 +1776,8 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
                             "--- Similar Request Start",
                             f"Path: {request.path}",
                             f"Method: {request.method}",
-                            f"Body: {request.get_data()!r}",
-                            f"Headers: {request.headers}",
+                            f"Body: {matcher.redact_body(request.get_data())!r}",
+                            f"Headers: {matcher.redact_request_headers(request.headers)}",
                             f"Query String: {request.query_string.decode('utf-8')!r}",
                             "--- Similar Request End",
                         )

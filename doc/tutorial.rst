@@ -439,15 +439,16 @@ your test will properly fail:
 This will also produce a (hopefully) helpful description about what went wrong::
 
     >           raise AssertionError(assertion)
-    E           AssertionError: No handler found for request <Request 'http://localhost:41085/foobaz' [GET]> with data b''.Ordered matchers:
-    E               <RequestMatcher uri='/foobar' method='__ALL' query_string=None headers={} data=None json=<UNDEFINED>>
-    E               <RequestMatcher uri='/foobaz' method='__ALL' query_string=None headers={} data=None json=<UNDEFINED>>
-    E
-    E           Oneshot matchers:
-    E               none
-    E
-    E           Persistent matchers:
-    E               none
+    E           AssertionError: No handler found for request <Request 'http://localhost:41085/foobaz' [GET]> with data b''.Closest matching expectations:
+    E             [ordered] <RequestMatcher uri='/foobaz' method='__ALL' query_string=None headers={} data=None json=<UNDEFINED>> (all checked fields match)
+    E             [ordered] <RequestMatcher uri='/foobar' method='__ALL' query_string=None headers={} data=None json=<UNDEFINED>>
+    E                 - uri: request='/foobaz' expected='/foobar'
+    E             Note: ordered expectations are consumed in order; the next expected request is <RequestMatcher uri='/foobar' method='__ALL' query_string=None headers={} data=None json=<UNDEFINED>>.
+
+When the request's URI does not resemble any expectation, the complete ordered,
+oneshot and persistent matcher listing is printed instead. See
+:doc:`howto` for the field-by-field diagnostics and for hiding sensitive
+header or body values.
 
 
 Calling ``check()`` for all tests

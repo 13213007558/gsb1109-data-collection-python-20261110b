@@ -839,3 +839,43 @@ All ``expect_request``, ``expect_oneshot_request``, and
 ``expect_ordered_request`` methods are available on the baked object. Other
 attributes such as ``url_for()`` and ``check_assertions()`` are delegated to
 the underlying server transparently.
+
+
+Diagnosing unmatched requests
+-----------------------------
+
+When an incoming request matches none of the registered expectations, the
+assertion raised by ``check_assertions()`` no longer only lists the matchers.
+It identifies the expectations whose URI is similar to the request and, for
+each of them, prints one line per mismatching field: the method, the query
+string, the headers and the body (as ``data``, ``json`` or form fields). This
+makes it possible to tell apart a missing pagination parameter from a wrong
+method or an unexpected content type:
+
+.. literalinclude :: ../tests/examples/test_howto_no_handler_diagnostics.py
+   :language: python
+
+Expectations whose URI has nothing in common with the request are not close
+enough to be useful, so in that case the complete ordered/oneshot/persistent
+matcher listing is kept. When several expectations share the request's URI,
+all of them are reported and the message notes that any of them may have
+rejected the request, instead of claiming a single unique cause.
+
+
+Hiding sensitive values from diagnostic messages
+-------------------------------------------------
+
+Expectations handling credentials or other secrets can mark values as
+redacted so they never appear in assertion messages or matcher
+representations. Pass an iterable of header names to hide only those header
+values (matching is case-insensitive), or pass ``True`` to hide every header
+value together with the request and expected body:
+
+.. literalinclude :: ../tests/examples/test_howto_redact_sensitive_values.py
+   :language: python
+
+Redaction is purely presentational: hidden values still participate normally
+in request matching, so a wrong token keeps causing a mismatch, and the
+diagnostic simply shows ``<redacted>`` instead of the actual value. The same
+parameter is accepted by ``RequestMatcher``, the three ``expect_*_request``
+methods and ``BlockingHTTPServer.assert_request()``.

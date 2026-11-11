@@ -5,6 +5,7 @@ This is package provides the main API for the pytest_httpserver package.
 
 __all__ = [
     "METHOD_ALL",
+    "REDACTED",
     "URI_DEFAULT",
     "BakedHTTPServer",
     "BlockingHTTPServer",
@@ -26,6 +27,7 @@ from .bake import BakedHTTPServer
 from .blocking_httpserver import BlockingHTTPServer
 from .blocking_httpserver import BlockingRequestHandler
 from .httpserver import METHOD_ALL
+from .httpserver import REDACTED
 from .httpserver import URI_DEFAULT
 from .httpserver import CaseInsensitiveHeaderValueMatcher
 from .httpserver import Error

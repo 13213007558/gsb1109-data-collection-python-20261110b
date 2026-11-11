@@ -14,6 +14,7 @@ from pytest_httpserver.httpserver import RequestHandlerBase
 from pytest_httpserver.httpserver import URIPattern
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Mapping
     from re import Pattern
     from ssl import SSLContext
@@ -81,6 +82,7 @@ class BlockingHTTPServer(HTTPServerBase):
         json: Any = UNDEFINED,
         timeout: int = 30,
         data_form: Mapping[str, str] | None = None,
+        redact: bool | Iterable[str] = False,  # noqa: FBT001
     ) -> BlockingRequestHandler:
         """
         Wait for an incoming request and check whether it matches according to the given parameters.
@@ -113,6 +115,9 @@ class BlockingHTTPServer(HTTPServerBase):
         :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
             A mapping matches the first value for each field; a ``MultiDict`` matches all values.
             Mutually exclusive with `data` and `json`.
+        :param redact: ``True`` hides every header value and the body in the assertion message,
+            or an iterable of header names whose values are hidden (case-insensitive).
+            Matching is not affected, only the failure output.
 
         :return: Created and registered :py:class:`BlockingRequestHandler`.
 
@@ -128,6 +133,7 @@ class BlockingHTTPServer(HTTPServerBase):
             query_string=query_string,
             header_value_matcher=header_value_matcher,
             json=json,
+            redact=redact,
             **({"data_form": data_form} if data_form is not None else {}),
         )
 
@@ -144,7 +150,8 @@ class BlockingHTTPServer(HTTPServerBase):
 
         if diff:
             request_handler.respond_with_response(self.respond_nohandler(request))
-            raise AssertionError(f"Request {matcher} does not match: {diff}")  # noqa: EM102
+            details = "\n".join(matcher.format_differences(request))
+            raise AssertionError(f"Request {matcher} does not match:\n{details}")  # noqa: EM102
 
         return request_handler
 
