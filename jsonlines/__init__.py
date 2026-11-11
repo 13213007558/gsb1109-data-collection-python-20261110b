@@ -6,15 +6,21 @@ Module for the jsonlines data format.
 from .jsonlines import (
     Error,
     InvalidLineError,
+    OversizedRecordError,
     Reader,
+    ShardInfo,
     Writer,
     open,
+    write_shards,
 )
 
 __all__ = [
     "Error",
     "InvalidLineError",
+    "OversizedRecordError",
     "Reader",
+    "ShardInfo",
     "Writer",
     "open",
+    "write_shards",
 ]

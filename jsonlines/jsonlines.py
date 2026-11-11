@@ -71,6 +71,14 @@ Openable = Union[str, bytes, int, os.PathLike]
 LoadsCallable = Callable[[Union[str, bytes]], Any]
 DumpsCallable = Callable[[Any], Union[str, bytes]]
 
+# Shard file naming for write_shards(): either a path (string) pattern
+# containing a ‘{shard}’ placeholder, or a callable producing a path.
+ShardPath = Union[
+    str,
+    "os.PathLike[str]",
+    Callable[[int], Union[str, "os.PathLike[str]"]],
+]
+
 # Currently, JSON structures cannot be typed properly:
 # - https://github.com/python/typing/issues/182
 # - https://github.com/python/mypy/issues/731
@@ -136,6 +144,40 @@ class InvalidLineError(Error, ValueError):
         self.line = line.rstrip()
         self.lineno = lineno
         super().__init__(f"{message} (line {lineno})")
+
+
+@attr.s(auto_exc=True, auto_attribs=True, init=False)
+class OversizedRecordError(Error, ValueError):
+    """
+    Error raised when a single record does not fit within the shard
+    size limit.
+
+    The record's position in the input iterable is stored on the
+    exception instance as the ``.index`` attribute (0-based), along
+    with its encoded ``.size`` in bytes (including the newline) and
+    the ``.max_bytes`` limit.
+
+    This class subclasses both ``jsonlines.Error`` and the built-in
+    ``ValueError``.
+    """
+
+    #: 0-based position of the record in the input iterable
+    index: int
+
+    #: encoded size of the record in bytes, including the newline
+    size: int
+
+    #: the shard size limit that was exceeded
+    max_bytes: int
+
+    def __init__(self, index: int, size: int, max_bytes: int) -> None:
+        self.index = index
+        self.size = size
+        self.max_bytes = max_bytes
+        super().__init__(
+            f"record {index} is {size} bytes, "
+            f"which exceeds the shard limit of {max_bytes} bytes"
+        )
 
 
 @attr.s(auto_attribs=True, repr=False)
@@ -562,6 +604,201 @@ class Writer(ReaderWriterBase):
 
     def _repr_for_wrapped(self) -> str:
         return repr_for_fp(self._fp)
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class ShardInfo:
+    """
+    Manifest entry describing a single completed shard file, as
+    produced by :py:func:`write_shards`.
+    """
+
+    #: path of the shard file
+    path: str
+
+    #: 0-based shard number
+    shard: int
+
+    #: 0-based index of the first record in this shard
+    first_index: int
+
+    #: 0-based index of the last record in this shard (inclusive)
+    last_index: int
+
+    #: number of records in this shard
+    record_count: int
+
+    #: actual size of the shard file in bytes
+    size_bytes: int
+
+
+def write_shards(
+    iterable: Iterable[Any],
+    path: ShardPath,
+    max_bytes: int,
+    *,
+    dumps: Optional[DumpsCallable] = None,
+    compact: bool = False,
+    sort_keys: bool = False,
+    on_oversized: str = "reject",
+    on_shard_complete: Optional[Callable[[ShardInfo], None]] = None,
+) -> List[ShardInfo]:
+    """
+    Encode objects and write them to multiple jsonlines shard files,
+    each no larger than `max_bytes` bytes.
+
+    Records are never split across files: a record is only added to
+    the current shard if it still fits, otherwise the current shard is
+    finalised and a new one is started. Sizes are measured after
+    encoding: the custom `dumps` output is converted to actual bytes
+    (UTF-8) first, and the terminating newline counts towards the
+    limit as well.
+
+    The `path` argument determines the shard file names. It is either
+    a callable accepting the 0-based shard number, or a path string
+    containing a ``{shard}`` placeholder (e.g.
+    ``"out/part-{shard:03d}.jsonl"``).
+
+    If a single encoded record (including its newline) exceeds
+    `max_bytes`, its 0-based position in the input is reported via
+    :py:exc:`OversizedRecordError` when `on_oversized` is ``"reject"``
+    (the default). When `on_oversized` is ``"separate"``, such a
+    record is instead written to a shard of its own (which then
+    exceeds the limit, as reflected in the manifest).
+
+    Each shard is written to a temporary file first and only moved to
+    its final path once it has been completed successfully, so every
+    completed shard is a valid jsonlines file that can be read
+    independently with :py:class:`Reader`. If writing a shard fails,
+    the partial file is removed and previously completed shards remain
+    deliverable.
+
+    A manifest describing the completed shards is returned as a list
+    of :py:class:`ShardInfo` instances, each recording the record
+    index range and the actual file size in bytes. The
+    `on_shard_complete` callback, if given, is invoked with each
+    manifest entry as soon as its shard has been finalised.
+
+    :param iterable: objects to encode and write
+    :param path: shard path pattern with ``{shard}`` placeholder, or a
+        callable mapping the shard number to a path
+    :param max_bytes: maximum size of each shard file in bytes
+    :param dumps: custom encoder callable
+    :param compact: whether to use a compact output format
+    :param sort_keys: whether to sort object keys
+    :param on_oversized: ``"reject"`` or ``"separate"``
+    :param on_shard_complete: callback invoked for each completed shard
+    :return: manifest of completed shards
+    """
+    if max_bytes < 1:
+        raise ValueError("'max_bytes' must be at least 1")
+    if on_oversized not in {"reject", "separate"}:
+        raise ValueError("'on_oversized' must be either 'reject' or 'separate'")
+    if not callable(path):
+        pattern = os.fspath(path)
+        if not isinstance(pattern, str) or "{shard" not in pattern:
+            raise ValueError(
+                "'path' must be a callable, or a path containing a "
+                "'{shard}' placeholder"
+            )
+
+    if dumps is None:
+        dumps = json.JSONEncoder(
+            ensure_ascii=False,
+            separators=(",", ":") if compact else (", ", ": "),
+            sort_keys=sort_keys,
+        ).encode
+
+    def resolve_path(shard_number: int) -> str:
+        if callable(path):
+            return os.fspath(path(shard_number))
+        return os.fspath(path).format(shard=shard_number)
+
+    manifest: List[ShardInfo] = []
+
+    shard_number = 0
+    fp: Optional[typing.IO[bytes]] = None
+    tmp_path = ""
+    final_path = ""
+    first_index = 0
+    last_index = -1
+    record_count = 0
+    shard_size = 0
+
+    def open_shard(index: int) -> typing.IO[bytes]:
+        nonlocal fp, tmp_path, final_path, first_index
+        final_path = resolve_path(shard_number)
+        tmp_path = final_path + ".part"
+        first_index = index
+        fp = builtins.open(tmp_path, "wb")
+        return fp
+
+    def finalize_shard() -> None:
+        nonlocal fp, shard_number, record_count, shard_size
+        assert fp is not None
+        fp.close()
+        os.replace(tmp_path, final_path)
+        info = ShardInfo(
+            path=final_path,
+            shard=shard_number,
+            first_index=first_index,
+            last_index=last_index,
+            record_count=record_count,
+            size_bytes=os.path.getsize(final_path),
+        )
+        fp = None
+        shard_number += 1
+        record_count = 0
+        shard_size = 0
+        manifest.append(info)
+        if on_shard_complete is not None:
+            on_shard_complete(info)
+
+    try:
+        for index, obj in enumerate(iterable):
+            encoded = dumps(obj)
+            if isinstance(encoded, str):
+                encoded = encoded.encode("utf-8")
+            record_size = len(encoded) + 1  # including the newline
+
+            if record_size > max_bytes:
+                if on_oversized == "reject":
+                    raise OversizedRecordError(index, record_size, max_bytes)
+                # 'separate': the record gets a shard of its own, which
+                # will exceed the limit; this shows up in the manifest.
+                if fp is not None:
+                    finalize_shard()
+                single_fp = open_shard(index)
+                single_fp.write(encoded)
+                single_fp.write(b"\n")
+                record_count = 1
+                shard_size = record_size
+                last_index = index
+                finalize_shard()
+                continue
+
+            if fp is not None and shard_size + record_size > max_bytes:
+                finalize_shard()
+            if fp is None:
+                fp = open_shard(index)
+            fp.write(encoded)
+            fp.write(b"\n")
+            shard_size += record_size
+            record_count += 1
+            last_index = index
+
+        if fp is not None:
+            finalize_shard()
+    except BaseException:
+        if fp is not None:
+            fp.close()
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
+    return manifest
 
 
 @overload

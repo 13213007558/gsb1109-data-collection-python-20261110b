@@ -171,10 +171,18 @@ API
    :members:
    :inherited-members:
 
+.. autofunction:: jsonlines.write_shards
+
+.. autoclass:: jsonlines.ShardInfo
+   :members:
+
 .. autoclass:: jsonlines.Error
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.OversizedRecordError
    :members:
 
 

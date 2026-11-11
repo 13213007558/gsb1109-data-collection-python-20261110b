@@ -6,10 +6,14 @@ import codecs
 import collections
 import io
 import json
+import os
+import pathlib
 import tempfile
 
 import jsonlines
 import pytest
+
+from typing import List
 
 
 SAMPLE_BYTES = b'{"a": 1}\n{"b": 2}\n'
@@ -311,3 +315,141 @@ def test_single_char_stripping() -> None:
     Sanity check that a helper constant actually contains single-char strings.
     """
     assert all(len(s) == 1 for s in jsonlines.jsonlines.SKIPPABLE_SINGLE_INITIAL_CHARS)
+
+
+def test_write_shards_splits_on_byte_limit(tmp_path: pathlib.Path) -> None:
+    # Each record encodes to '{"n": 0}' etc: 8 bytes + newline = 9 bytes.
+    records = [{"n": i} for i in range(10)]
+    pattern = str(tmp_path / "part-{shard}.jsonl")
+    manifest = jsonlines.write_shards(records, pattern, max_bytes=27)
+
+    assert [(m.first_index, m.last_index) for m in manifest] == [
+        (0, 2),
+        (3, 5),
+        (6, 8),
+        (9, 9),
+    ]
+    assert [m.record_count for m in manifest] == [3, 3, 3, 1]
+    assert [m.shard for m in manifest] == [0, 1, 2, 3]
+    for info in manifest:
+        assert info.size_bytes == os.path.getsize(info.path)
+        assert info.size_bytes <= 27
+        with jsonlines.open(info.path) as reader:
+            assert list(reader) == records[info.first_index : info.last_index + 1]
+
+
+def test_write_shards_exact_fit(tmp_path: pathlib.Path) -> None:
+    # A record that exactly fills the shard stays in it; the next one
+    # starts a new shard. '"ab"' is 4 bytes + newline = 5 bytes.
+    manifest = jsonlines.write_shards(
+        ["ab", "cd"], str(tmp_path / "s-{shard}.jsonl"), max_bytes=5
+    )
+    assert [(m.first_index, m.last_index, m.size_bytes) for m in manifest] == [
+        (0, 0, 5),
+        (1, 1, 5),
+    ]
+
+
+def test_write_shards_measures_encoded_bytes(tmp_path: pathlib.Path) -> None:
+    # Sizes are measured on the encoded bytes, not the text: 'é' takes
+    # two bytes in UTF-8, so '"é"' plus newline is 5 bytes.
+    manifest = jsonlines.write_shards(
+        ["é", "é"], str(tmp_path / "s-{shard}.jsonl"), max_bytes=5
+    )
+    assert [m.size_bytes for m in manifest] == [5, 5]
+    with jsonlines.open(manifest[0].path) as reader:
+        assert list(reader) == ["é"]
+
+
+def test_write_shards_custom_dumps_bytes(tmp_path: pathlib.Path) -> None:
+    # A custom dumps callable returning bytes (e.g. orjson) is measured
+    # as-is, with the newline counted on top.
+    manifest = jsonlines.write_shards(
+        [{"a": 1}, {"a": 2}],
+        str(tmp_path / "s-{shard}.jsonl"),
+        max_bytes=9,
+        dumps=lambda obj: json.dumps(obj).encode("utf-8"),
+    )
+    assert [m.size_bytes for m in manifest] == [9, 9]
+    with jsonlines.open(manifest[0].path) as reader:
+        assert list(reader) == [{"a": 1}]
+
+
+def test_write_shards_oversized_reject(tmp_path: pathlib.Path) -> None:
+    records = ["ab", "cd", "ef", "x" * 100]
+    pattern = str(tmp_path / "s-{shard}.jsonl")
+    with pytest.raises(jsonlines.OversizedRecordError) as excinfo:
+        jsonlines.write_shards(records, pattern, max_bytes=10)
+    exc = excinfo.value
+    assert exc.index == 3
+    assert exc.size == 103  # 100 chars + 2 quotes + newline
+    assert exc.max_bytes == 10
+    # The shard completed before the oversized record is deliverable.
+    with jsonlines.open(str(tmp_path / "s-0.jsonl")) as reader:
+        assert list(reader) == ["ab", "cd"]
+    # The incomplete shard was cleaned up.
+    assert not (tmp_path / "s-1.jsonl").exists()
+    assert not (tmp_path / "s-1.jsonl.part").exists()
+
+
+def test_write_shards_oversized_separate(tmp_path: pathlib.Path) -> None:
+    records = ["ab", "x" * 100, "cd"]
+    manifest = jsonlines.write_shards(
+        records,
+        str(tmp_path / "s-{shard}.jsonl"),
+        max_bytes=10,
+        on_oversized="separate",
+    )
+    assert [(m.first_index, m.last_index) for m in manifest] == [(0, 0), (1, 1), (2, 2)]
+    assert manifest[1].size_bytes == 103  # exceeds the limit, as documented
+    for info in manifest:
+        with jsonlines.open(info.path) as reader:
+            assert list(reader) == [records[info.first_index]]
+
+
+def test_write_shards_failed_shard_keeps_completed(tmp_path: pathlib.Path) -> None:
+    records = [{"n": i} for i in range(10)]
+    completed: List[jsonlines.ShardInfo] = []
+
+    def make_path(shard: int) -> str:
+        if shard == 1:
+            return str(tmp_path / "nonexistent-dir" / "s-1.jsonl")
+        return str(tmp_path / f"s-{shard}.jsonl")
+
+    with pytest.raises(OSError):
+        jsonlines.write_shards(
+            records,
+            make_path,
+            max_bytes=27,
+            on_shard_complete=completed.append,
+        )
+    # The first shard was completed before the failure and is deliverable.
+    assert len(completed) == 1
+    assert completed[0].first_index == 0
+    assert completed[0].last_index == 2
+    with jsonlines.open(completed[0].path) as reader:
+        assert list(reader) == [{"n": 0}, {"n": 1}, {"n": 2}]
+
+
+def test_write_shards_empty_input(tmp_path: pathlib.Path) -> None:
+    manifest = jsonlines.write_shards(
+        [], str(tmp_path / "s-{shard}.jsonl"), max_bytes=10
+    )
+    assert manifest == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_write_shards_path_without_placeholder(tmp_path: pathlib.Path) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        jsonlines.write_shards([1], str(tmp_path / "out.jsonl"), max_bytes=10)
+    assert "{shard}" in str(excinfo.value)
+
+
+def test_write_shards_path_format_spec(tmp_path: pathlib.Path) -> None:
+    manifest = jsonlines.write_shards(
+        [1, 2], str(tmp_path / "part-{shard:03d}.jsonl"), max_bytes=2
+    )
+    assert [os.path.basename(m.path) for m in manifest] == [
+        "part-000.jsonl",
+        "part-001.jsonl",
+    ]
