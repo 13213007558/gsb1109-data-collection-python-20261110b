@@ -3,7 +3,7 @@
 from __future__ import absolute_import
 import re
 import sys
-from .compat import PY3, unichr
+from .compat import PY3, integer_types, unichr
 from .scanner import make_scanner, JSONDecodeError
 
 
@@ -325,7 +325,7 @@ class JSONDecoder(object):
     def __init__(self, encoding=None, object_hook=None, parse_float=None,
             parse_int=None, parse_constant=None, strict=True,
             object_pairs_hook=None, allow_nan=False,
-            array_hook=None):
+            array_hook=None, max_nesting_depth=None):
         """
         *encoding* determines the encoding used to interpret any
         :class:`str` objects decoded by this instance (``'utf-8'`` by
@@ -371,9 +371,26 @@ class JSONDecoder(object):
         ``True`` means that unescaped control characters are parse errors, if
         ``False`` then control characters will be allowed in strings.
 
+        *max_nesting_depth*, if given, caps how many JSON objects and arrays
+        may be nested inside one another (the outermost container is depth
+        1; objects and arrays are counted against the same limit). Inputs up
+        to that depth decode normally; a deeper document raises
+        :class:`~simplejson.JSONNestedError` reporting the position and depth
+        of the offending opening bracket. Bracket characters that appear
+        inside strings do not count. It defaults to ``None``, which imposes
+        no limit and leaves the default decoding behavior unchanged. The
+        check is local to this decoder and never changes the process-wide
+        recursion limit.
+
         """
         if encoding is None:
             encoding = DEFAULT_ENCODING
+        if (max_nesting_depth is not None and (
+                not isinstance(max_nesting_depth, integer_types) or
+                isinstance(max_nesting_depth, bool) or
+                max_nesting_depth < 1)):
+            raise TypeError(
+                "max_nesting_depth must be a positive integer or None")
         self.encoding = encoding
         self.object_hook = object_hook
         self.object_pairs_hook = object_pairs_hook
@@ -384,6 +401,7 @@ class JSONDecoder(object):
         self.parse_constant = parse_constant
         self.strict = strict
         self.array_hook = array_hook
+        self.max_nesting_depth = max_nesting_depth
         self.parse_object = JSONObject
         self.parse_array = JSONArray
         self.parse_string = scanstring

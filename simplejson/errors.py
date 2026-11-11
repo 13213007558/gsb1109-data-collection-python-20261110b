@@ -1,6 +1,6 @@
 """Error classes used by simplejson
 """
-__all__ = ['JSONDecodeError']
+__all__ = ['JSONDecodeError', 'JSONNestedError']
 
 
 def linecol(doc, pos):
@@ -51,3 +51,30 @@ class JSONDecodeError(ValueError):
 
     def __reduce__(self):
         return self.__class__, (self.msg, self.doc, self.pos, self.end)
+
+
+class JSONNestedError(JSONDecodeError):
+    """Subclass of :class:`JSONDecodeError` raised when a document nests
+    objects or arrays deeper than the decoder's configured limit.
+
+    Additional properties:
+
+    depth: the 1-based nesting depth of the object or array whose opening
+        bracket exceeded the limit (the first container is depth 1)
+    limit: the maximum nesting depth configured on the decoder
+
+    As with :class:`JSONDecodeError`, *pos* (and *lineno*/*colno*) points at
+    the opening ``{`` or ``[`` bracket of the offending container. Bracket
+    characters inside JSON strings are ordinary string contents and do not
+    count, so only structural nesting is measured.
+    """
+
+    def __init__(self, doc, pos, depth, limit):
+        msg = ("Nesting level %d exceeds the maximum allowed nesting "
+               "depth of %d" % (depth, limit))
+        JSONDecodeError.__init__(self, msg, doc, pos)
+        self.depth = depth
+        self.limit = limit
+
+    def __reduce__(self):
+        return self.__class__, (self.doc, self.pos, self.depth, self.limit)

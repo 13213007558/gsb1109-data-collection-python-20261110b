@@ -327,7 +327,8 @@ Basic Usage
 .. function:: load(fp, encoding='utf-8', cls=None, object_hook=None, \
                    parse_float=None, parse_int=None, \
                    parse_constant=None, object_pairs_hook=None, \
-                   use_decimal=None, allow_nan=False, **kw)
+                   use_decimal=None, allow_nan=False, \
+                   max_nesting_depth=None, **kw)
 
    Deserialize *fp* (a ``.read()``-supporting file-like object containing a JSON
    document) to a Python object using this
@@ -370,7 +371,8 @@ Basic Usage
 .. function:: loads(s, encoding='utf-8', cls=None, object_hook=None, \
                     parse_float=None, parse_int=None, \
                     parse_constant=None, object_pairs_hook=None, \
-                    use_decimal=None, allow_nan=False, **kw)
+                    use_decimal=None, allow_nan=False, \
+                    max_nesting_depth=None, **kw)
 
     Deserialize *s* (a :class:`str` or :class:`unicode` instance containing a JSON
     document) to a Python object. :exc:`JSONDecodeError` will be
@@ -457,13 +459,26 @@ Basic Usage
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
 
+    *max_nesting_depth*, if given, must be a positive integer. It limits how
+    deeply JSON objects and arrays may be nested: the outermost container is
+    depth 1 and objects and arrays are counted against the same limit. A
+    document that stays within the limit decodes normally; one that nests
+    deeper raises :exc:`JSONNestedError` (a subclass of
+    :exc:`JSONDecodeError`) whose *pos* points at the opening bracket of the
+    offending container and whose *depth* and *limit* report the measured
+    depth and the configured limit. Brackets that appear inside JSON strings
+    are string contents and do not count. It defaults to ``None``, which
+    imposes no limit, leaves the default decoding behavior unchanged, and
+    never modifies the process recursion limit.
+
 
 Encoders and decoders
 ---------------------
 
 .. class:: JSONDecoder(encoding='utf-8', object_hook=None, parse_float=None, \
                        parse_int=None, parse_constant=None, \
-                       object_pairs_hook=None, strict=True, allow_nan=False)
+                       object_pairs_hook=None, strict=True, allow_nan=False, \
+                       max_nesting_depth=None)
 
    Simple JSON decoder.
 
@@ -549,6 +564,15 @@ Encoders and decoders
         This argument was added to make it behave closer to the spec by
         default. The previous behavior can be restored by setting this to
         False.
+
+   *max_nesting_depth*, if given, is a positive integer that caps how many
+   JSON objects and arrays may be nested (the outermost container is depth
+   1; both container kinds share the same count). Inputs within the limit
+   decode normally; deeper input raises :exc:`JSONNestedError`, which
+   reports the position of the offending opening bracket and the measured
+   *depth* alongside the configured *limit*. Brackets inside strings do not
+   count. ``None`` (the default) means no limit, preserves the default
+   decoding behavior, and does not touch the process recursion limit.
 
    .. method:: decode(s)
 
@@ -817,6 +841,23 @@ Exceptions
 
         The column corresponding to end (may be ``None``)
 
+.. exception:: JSONNestedError(doc, pos, depth, limit)
+
+    Subclass of :exc:`JSONDecodeError` raised by a decoder configured with
+    *max_nesting_depth* when the document nests objects or arrays more
+    deeply than that limit. The message and the inherited *pos*, *lineno*
+    and *colno* describe the opening bracket (``{`` or ``[``) of the
+    container that exceeded the limit.
+
+    .. attribute:: depth
+
+        The 1-based nesting depth of the offending container; the outermost
+        object or array in the document is depth 1.
+
+    .. attribute:: limit
+
+        The maximum nesting depth configured on the decoder.
+
 
 Standard Compliance and Interoperability
 ----------------------------------------
@@ -935,7 +976,10 @@ Some JSON deserializer implementations may set limits on:
 * the content and maximum length of JSON strings
 
 This module does not impose any such limits beyond those of the relevant
-Python datatypes themselves or the Python interpreter itself.
+Python datatypes themselves or the Python interpreter itself. The single
+exception is nesting depth, which stays unlimited by default but can be
+capped per decode via the *max_nesting_depth* argument to :func:`loads`,
+:func:`load`, and :class:`JSONDecoder`.
 
 When serializing to JSON, beware any such limitations in applications that may
 consume your JSON.  In particular, it is common for JSON numbers to be

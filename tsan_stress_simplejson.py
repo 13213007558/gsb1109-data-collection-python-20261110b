@@ -127,6 +127,7 @@ class _ScanCtx:
     __slots__ = (
         "encoding", "strict", "object_hook", "object_pairs_hook",
         "array_hook", "parse_float", "parse_int", "parse_constant", "memo",
+        "max_nesting_depth",
     )
 
     def __init__(self):
@@ -139,6 +140,7 @@ class _ScanCtx:
         self.parse_int = int
         self.parse_constant = float
         self.memo = {}
+        self.max_nesting_depth = None
 
 
 def _make_shared_scanner():

@@ -1,7 +1,7 @@
 """JSON token scanner
 """
 import re
-from .errors import JSONDecodeError
+from .errors import JSONDecodeError, JSONNestedError
 
 def _import_c_make_scanner():
     try:
@@ -11,7 +11,7 @@ def _import_c_make_scanner():
         return None
 c_make_scanner = _import_c_make_scanner()
 
-__all__ = ['make_scanner', 'JSONDecodeError']
+__all__ = ['make_scanner', 'JSONDecodeError', 'JSONNestedError']
 
 NUMBER_RE = re.compile(
     r'(-?(?:0|[1-9][0-9]*))(\.[0-9]+)?([eE][-+]?[0-9]+)?',
@@ -32,6 +32,7 @@ def py_make_scanner(context):
     object_pairs_hook = context.object_pairs_hook
     array_hook = context.array_hook
     memo = context.memo
+    max_nesting_depth = context.max_nesting_depth
 
     def _scan_once(string, idx):
         errmsg = 'Expecting value'
@@ -42,11 +43,29 @@ def py_make_scanner(context):
 
         if nextchar == '"':
             return parse_string(string, idx + 1, encoding, strict)
-        elif nextchar == '{':
-            return parse_object((string, idx + 1), encoding, strict,
-                _scan_once, object_hook, object_pairs_hook, memo)
-        elif nextchar == '[':
-            return parse_array((string, idx + 1), _scan_once, array_hook)
+        elif nextchar == '{' or nextchar == '[':
+            # Both objects and arrays count toward the same nesting depth;
+            # only structural brackets reach here, so brackets inside
+            # strings are never counted.
+            tracking = max_nesting_depth is not None
+            if tracking:
+                depth = _scan_once._nesting_depth + 1
+                if depth > max_nesting_depth:
+                    raise JSONNestedError(string, idx, depth,
+                                          max_nesting_depth)
+                _scan_once._nesting_depth = depth
+            try:
+                if nextchar == '{':
+                    rval = parse_object(
+                        (string, idx + 1), encoding, strict,
+                        _scan_once, object_hook, object_pairs_hook, memo)
+                else:
+                    rval = parse_array(
+                        (string, idx + 1), _scan_once, array_hook)
+            finally:
+                if tracking:
+                    _scan_once._nesting_depth -= 1
+            return rval
         elif nextchar == 'n' and string[idx:idx + 4] == 'null':
             return None, idx + 4
         elif nextchar == 't' and string[idx:idx + 4] == 'true':
@@ -70,6 +89,8 @@ def py_make_scanner(context):
             return parse_constant('-Infinity'), idx + 9
         else:
             raise JSONDecodeError(errmsg, string, idx)
+
+    _scan_once._nesting_depth = 0
 
     def scan_once(string, idx):
         if idx < 0:

@@ -140,6 +140,7 @@ typedef struct {
     PyObject *JSON_attr_add_note;     /* "add_note" (PEP 678, 3.11+) */
     PyObject *RawJSONType;
     PyObject *JSONDecodeError;
+    PyObject *JSONNestedError;
 } _speedups_state;
 
 #if PY_VERSION_HEX >= 0x030D0000
@@ -245,6 +246,11 @@ typedef struct _PyScannerObject {
     PyObject *parse_int;
     PyObject *parse_constant;
     PyObject *memo;
+    /* -1 means no nesting limit; otherwise the maximum allowed nesting
+     * depth, mirrored from JSONDecoder.max_nesting_depth. A plain C field
+     * so the recursive scanner can track depth without any per-level
+     * Python allocations or a change to the process recursion limit. */
+    Py_ssize_t max_nesting_depth;
 } PyScannerObject;
 
 /* X-macro listing every PyObject* field in PyScannerObject that must
@@ -375,18 +381,21 @@ py_encode_basestring(PyObject* self UNUSED, PyObject *pystr);
 static PyObject *
 join_list_string(_speedups_state *state, PyObject *lst);
 static PyObject *
-scan_once_str(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx, Py_ssize_t *next_idx_ptr);
+scan_once_str(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx,
+              Py_ssize_t nesting_depth, Py_ssize_t *next_idx_ptr);
 static PyObject *
 scanstring_str(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                const char *encoding, int strict, Py_ssize_t *next_end_ptr);
 static PyObject *
-_parse_object_str(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx, Py_ssize_t *next_idx_ptr);
+_parse_object_str(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx,
+                  Py_ssize_t nesting_depth, Py_ssize_t *next_idx_ptr);
 #endif
 static PyObject *
 scanstring_unicode(_speedups_state *state, PyObject *pystr, Py_ssize_t end,
                    int strict, Py_ssize_t *next_end_ptr);
 static PyObject *
-scan_once_unicode(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx, Py_ssize_t *next_idx_ptr);
+scan_once_unicode(PyScannerObject *s, PyObject *pystr, Py_ssize_t idx,
+                  Py_ssize_t nesting_depth, Py_ssize_t *next_idx_ptr);
 static PyObject *
 _build_rval_index_tuple(PyObject *rval, Py_ssize_t idx)
 {
@@ -424,6 +433,9 @@ static PyObject *
 _encoded_const(_speedups_state *state, PyObject *obj);
 static void
 raise_errmsg(_speedups_state *state, const char *msg, PyObject *s, Py_ssize_t end);
+static void
+raise_nesting_error(PyScannerObject *s, PyObject *pystr, Py_ssize_t pos,
+                    Py_ssize_t depth);
 static PyObject *
 encoder_encode_string(PyEncoderObject *s, PyObject *obj);
 static int
@@ -1296,6 +1308,25 @@ raise_errmsg(_speedups_state *state, const char *msg, PyObject *s, Py_ssize_t en
     PyObject *exc = PyObject_CallFunction(JSONDecodeError, "(zOn)", msg, s, end);
     if (exc) {
         PyErr_SetObject(JSONDecodeError, exc);
+        Py_DECREF(exc);
+    }
+}
+
+/* Raise JSONNestedError(doc, pos, depth, limit) for a container whose
+ * opening bracket goes past the decoder's max_nesting_depth. The Python
+ * exception builds its own formatted message, so the C side only supplies
+ * the position and the depth/limit integers. */
+static void
+raise_nesting_error(PyScannerObject *s, PyObject *pystr, Py_ssize_t pos,
+                    Py_ssize_t depth)
+{
+    _speedups_state *state = get_speedups_state(s->module_ref);
+    PyObject *JSONNestedError = state->JSONNestedError;
+    PyObject *exc = PyObject_CallFunction(JSONNestedError, "(Onnn)",
+                                          pystr, pos, depth,
+                                          s->max_nesting_depth);
+    if (exc) {
+        PyErr_SetObject(JSONNestedError, exc);
         Py_DECREF(exc);
     }
 }
@@ -2402,11 +2433,11 @@ scanner_call(PyObject *self, PyObject *args, PyObject *kwds)
     Py_BEGIN_CRITICAL_SECTION(self);
 
     if (PyUnicode_Check(pystr)) {
-        rval = scan_once_unicode(s, pystr, idx, &next_idx);
+        rval = scan_once_unicode(s, pystr, idx, 0, &next_idx);
     }
 #if PY_MAJOR_VERSION < 3
     else {
-        rval = scan_once_str(s, pystr, idx, &next_idx);
+        rval = scan_once_str(s, pystr, idx, 0, &next_idx);
     }
 #endif /* PY_MAJOR_VERSION < 3 */
     PyDict_Clear(s->memo);
@@ -2448,6 +2479,7 @@ scanner_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     static char *kwlist[] = {"context", NULL};
     PyScannerObject *s;
     PyObject *encoding;
+    PyObject *limit_obj;
 
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:make_scanner", kwlist, &ctx))
         return NULL;
@@ -2455,6 +2487,9 @@ scanner_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     s = (PyScannerObject *)type->tp_alloc(type, 0);
     if (s == NULL)
         return NULL;
+    /* -1 means "no nesting limit"; overwritten below from the decoder
+     * context when max_nesting_depth is configured. */
+    s->max_nesting_depth = -1;
 
 #if PY_VERSION_HEX >= 0x030D0000
     s->module_ref = PyType_GetModuleByDef(type, &moduledef);
@@ -2501,6 +2536,24 @@ scanner_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     LOAD_ATTR(parse_constant, "parse_constant");
 
 #undef LOAD_ATTR
+
+    /* max_nesting_depth is None (unlimited) or a positive Python int;
+     * JSONDecoder.__init__ has already validated the type/range, so here
+     * we only translate None -> -1 and fold the value into a Py_ssize_t. */
+    limit_obj = PyObject_GetAttrString(ctx, "max_nesting_depth");
+    if (limit_obj == NULL)
+        goto bail;
+    if (limit_obj == Py_None) {
+        s->max_nesting_depth = -1;
+        Py_DECREF(limit_obj);
+    }
+    else {
+        Py_ssize_t limit = PyLong_AsSsize_t(limit_obj);
+        Py_DECREF(limit_obj);
+        if (limit == -1 && PyErr_Occurred())
+            goto bail;
+        s->max_nesting_depth = limit;
+    }
 
     return (PyObject *)s;
 
@@ -4049,6 +4102,7 @@ reset_speedups_state_constants(_speedups_state *state)
     Py_CLEAR(state->JSON_attr_add_note);
     Py_CLEAR(state->RawJSONType);
     Py_CLEAR(state->JSONDecodeError);
+    Py_CLEAR(state->JSONNestedError);
 }
 
 /* Shared initializer for per-module state. Called from module_exec
@@ -4124,6 +4178,9 @@ init_speedups_state(_speedups_state *state, PyObject *module)
         return -1;
     state->JSONDecodeError = import_dependency("simplejson.errors", "JSONDecodeError");
     if (state->JSONDecodeError == NULL)
+        return -1;
+    state->JSONNestedError = import_dependency("simplejson.errors", "JSONNestedError");
+    if (state->JSONNestedError == NULL)
         return -1;
 
     {
@@ -4241,6 +4298,7 @@ speedups_traverse(PyObject *m, visitproc visit, void *arg)
     Py_VISIT(state->JSON_attr_encoded_json);
     Py_VISIT(state->RawJSONType);
     Py_VISIT(state->JSONDecodeError);
+    Py_VISIT(state->JSONNestedError);
     return 0;
 }
 

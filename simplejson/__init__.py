@@ -121,7 +121,7 @@ from __future__ import absolute_import
 __version__ = '4.2.0'
 __all__ = [
     'dump', 'dumps', 'load', 'loads',
-    'JSONDecoder', 'JSONDecodeError', 'JSONEncoder',
+    'JSONDecoder', 'JSONDecodeError', 'JSONNestedError', 'JSONEncoder',
     'OrderedDict', 'simple_first', 'RawJSON'
 ]
 
@@ -129,7 +129,7 @@ __author__ = 'Bob Ippolito <bob@redivi.com>'
 
 from decimal import Decimal
 
-from .errors import JSONDecodeError
+from .errors import JSONDecodeError, JSONNestedError
 from .raw_json import RawJSON
 from .decoder import JSONDecoder
 from .encoder import JSONEncoder, JSONEncoderForHTML
@@ -402,7 +402,8 @@ _default_decoder = JSONDecoder()
 
 def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_int=None, parse_constant=None, object_pairs_hook=None,
-        use_decimal=False, allow_nan=False, array_hook=None, **kw):
+        use_decimal=False, allow_nan=False, array_hook=None,
+        max_nesting_depth=None, **kw):
     """Deserialize ``fp`` (a ``.read()``-supporting file-like object containing
     a JSON document as `str` or `bytes`) to a Python object.
 
@@ -456,12 +457,13 @@ def load(fp, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_float=parse_float, parse_int=parse_int,
         parse_constant=parse_constant, object_pairs_hook=object_pairs_hook,
         use_decimal=use_decimal, allow_nan=allow_nan,
-        array_hook=array_hook, **kw)
+        array_hook=array_hook, max_nesting_depth=max_nesting_depth, **kw)
 
 
 def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
         parse_int=None, parse_constant=None, object_pairs_hook=None,
-        use_decimal=False, allow_nan=False, array_hook=None, **kw):
+        use_decimal=False, allow_nan=False, array_hook=None,
+        max_nesting_depth=None, **kw):
     """Deserialize ``s`` (a ``str`` or ``unicode`` instance containing a JSON
     document) to a Python object.
 
@@ -505,6 +507,16 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
 
+    *max_nesting_depth*, if given, is a positive integer that limits how
+    deeply nested JSON objects and arrays may be (the outermost container is
+    depth 1, with objects and arrays counted together). Documents within the
+    limit decode normally; a document nesting deeper raises
+    :class:`JSONNestedError`, a subclass of :class:`JSONDecodeError`,
+    reporting the position and depth of the offending opening bracket.
+    Brackets inside strings do not count. It defaults to ``None`` (no limit),
+    never changes the process recursion limit, and when unset leaves the
+    default decoding behavior unchanged.
+
     To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
     kwarg. NOTE: You should use *object_hook* or *object_pairs_hook* instead
     of subclassing whenever possible.
@@ -513,7 +525,7 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     if (cls is None and encoding is None and object_hook is None and
             parse_int is None and parse_float is None and
             parse_constant is None and object_pairs_hook is None
-            and array_hook is None
+            and array_hook is None and max_nesting_depth is None
             and not use_decimal and not allow_nan and not kw):
         return _default_decoder.decode(s)
     if cls is None:
@@ -524,6 +536,8 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
         kw['object_pairs_hook'] = object_pairs_hook
     if array_hook is not None:
         kw['array_hook'] = array_hook
+    if max_nesting_depth is not None:
+        kw['max_nesting_depth'] = max_nesting_depth
     if parse_float is not None:
         kw['parse_float'] = parse_float
     if parse_int is not None:

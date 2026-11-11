@@ -1,3 +1,16 @@
+Unreleased
+
+* Add an optional ``max_nesting_depth`` argument to ``loads``, ``load``,
+  and ``JSONDecoder``. When set to a positive integer it caps how deeply
+  JSON objects and arrays may be nested (counted together, the outermost
+  container being depth 1); documents within the limit decode normally and
+  deeper documents raise the new ``JSONNestedError`` (a ``JSONDecodeError``
+  subclass) reporting the position, depth, and configured limit. Brackets
+  inside strings do not count. The default of ``None`` imposes no limit,
+  does not change the process recursion limit, and leaves ordinary
+  decoding behavior unchanged. Both the C scanner and the pure-Python
+  scanner enforce it identically.
+
 Version 4.2.0 released 2026-10-02
 
 * Start building wheels for Python 3.15 and drop Python 3.8 support

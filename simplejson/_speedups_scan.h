@@ -170,7 +170,8 @@ JSON_SCAN_FN(_match_number)(PyScannerObject *s, PyObject *pystr,
 
 static PyObject *
 JSON_SCAN_FN(_parse_object)(PyScannerObject *s, PyObject *pystr,
-                            Py_ssize_t idx, Py_ssize_t *next_idx_ptr)
+                            Py_ssize_t idx, Py_ssize_t nesting_depth,
+                            Py_ssize_t *next_idx_ptr)
 {
     /* Read a JSON object from pystr.
        idx is the index of the first character after the opening curly brace.
@@ -238,8 +239,11 @@ JSON_SCAN_FN(_parse_object)(PyScannerObject *s, PyObject *pystr,
             idx++;
             SKIP_WHITESPACE();
 
-            /* read any JSON term */
-            val = JSON_SCAN_FN(scan_once)(s, pystr, idx, &next_idx);
+            /* read any JSON term. nesting_depth is this object's own
+             * level; a child container is measured one level deeper by
+             * scan_once itself when it hits the child's bracket. */
+            val = JSON_SCAN_FN(scan_once)(s, pystr, idx,
+                                          nesting_depth, &next_idx);
             if (val == NULL)
                 goto bail;
 
@@ -337,7 +341,8 @@ bail:
 
 static PyObject *
 JSON_SCAN_FN(_parse_array)(PyScannerObject *s, PyObject *pystr,
-                           Py_ssize_t idx, Py_ssize_t *next_idx_ptr)
+                           Py_ssize_t idx, Py_ssize_t nesting_depth,
+                           Py_ssize_t *next_idx_ptr)
 {
     /* Read a JSON array from pystr.
        idx is the index of the first character after the opening brace.
@@ -361,7 +366,8 @@ JSON_SCAN_FN(_parse_array)(PyScannerObject *s, PyObject *pystr,
         while (idx <= end_idx) {
             trailing_delimiter = 0;
             /* read any JSON term and de-tuplefy the (rval, idx) */
-            val = JSON_SCAN_FN(scan_once)(s, pystr, idx, &next_idx);
+            val = JSON_SCAN_FN(scan_once)(s, pystr, idx,
+                                          nesting_depth, &next_idx);
             if (val == NULL) {
                 goto bail;
             }
@@ -432,10 +438,14 @@ bail:
 
 static PyObject *
 JSON_SCAN_FN(scan_once)(PyScannerObject *s, PyObject *pystr,
-                        Py_ssize_t idx, Py_ssize_t *next_idx_ptr)
+                        Py_ssize_t idx, Py_ssize_t nesting_depth,
+                        Py_ssize_t *next_idx_ptr)
 {
     /* Read one JSON term (of any kind) from pystr.
        idx is the index of the first character of the term.
+       nesting_depth is the depth of the innermost object/array already
+       open around this term (0 at the document root); scan_once of a
+       child container therefore runs one level deeper.
        *next_idx_ptr is a return-by-reference index to the first character
        after the term. */
     _speedups_state *state = get_speedups_state(s->module_ref);
@@ -454,18 +464,33 @@ JSON_SCAN_FN(scan_once)(PyScannerObject *s, PyObject *pystr,
             break;
         case '{':
             /* object */
+            /* Objects and arrays share one nesting counter; the check is
+             * here, at the structural bracket, so brackets inside strings
+             * never count. max_nesting_depth == -1 means unlimited. */
+            if (s->max_nesting_depth >= 0 &&
+                    nesting_depth + 1 > s->max_nesting_depth) {
+                raise_nesting_error(s, pystr, idx, nesting_depth + 1);
+                return NULL;
+            }
             if (Py_EnterRecursiveCall(" while decoding a JSON object "
                                       "from a string"))
                 return NULL;
-            rval = JSON_SCAN_FN(_parse_object)(s, pystr, idx + 1, next_idx_ptr);
+            rval = JSON_SCAN_FN(_parse_object)(s, pystr, idx + 1,
+                                               nesting_depth + 1, next_idx_ptr);
             Py_LeaveRecursiveCall();
             break;
         case '[':
             /* array */
+            if (s->max_nesting_depth >= 0 &&
+                    nesting_depth + 1 > s->max_nesting_depth) {
+                raise_nesting_error(s, pystr, idx, nesting_depth + 1);
+                return NULL;
+            }
             if (Py_EnterRecursiveCall(" while decoding a JSON array "
                                       "from a string"))
                 return NULL;
-            rval = JSON_SCAN_FN(_parse_array)(s, pystr, idx + 1, next_idx_ptr);
+            rval = JSON_SCAN_FN(_parse_array)(s, pystr, idx + 1,
+                                              nesting_depth + 1, next_idx_ptr);
             Py_LeaveRecursiveCall();
             break;
         case 'n':
