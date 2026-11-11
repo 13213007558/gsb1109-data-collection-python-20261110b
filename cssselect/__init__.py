@@ -12,22 +12,44 @@ See AUTHORS for more details.
 
 from cssselect.parser import (
     FunctionalPseudoElement,
+    LenientParse,
+    ParsedBranch,
+    ParseFailure,
     Selector,
     SelectorError,
     SelectorSyntaxError,
+    SourceRange,
     parse,
+    parse_lenient,
+    split_selector_groups,
 )
-from cssselect.xpath import ExpressionError, GenericTranslator, HTMLTranslator
+from cssselect.xpath import (
+    BranchReport,
+    ExpressionError,
+    GenericTranslator,
+    HTMLTranslator,
+    TranslationIssue,
+    ValidationReport,
+)
 
 __all__ = (
+    "BranchReport",
     "ExpressionError",
     "FunctionalPseudoElement",
     "GenericTranslator",
     "HTMLTranslator",
+    "LenientParse",
+    "ParseFailure",
+    "ParsedBranch",
     "Selector",
     "SelectorError",
     "SelectorSyntaxError",
+    "SourceRange",
+    "TranslationIssue",
+    "ValidationReport",
     "parse",
+    "parse_lenient",
+    "split_selector_groups",
 )
 
 VERSION = "1.6.0"

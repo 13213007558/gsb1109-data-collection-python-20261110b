@@ -1,6 +1,39 @@
 Changelog
 =========
 
+Version 1.7.0
+-------------
+
+Unreleased.
+
+*   Added an editor-oriented, non-raising preflight API for validating a
+    whole group of selectors in one pass.
+    :meth:`GenericTranslator.validate_css` (also available on
+    :class:`HTMLTranslator`) returns a :class:`~cssselect.ValidationReport`
+    with one :class:`~cssselect.BranchReport` per comma-separated branch:
+    branches that translate carry their XPath expression, while the others
+    carry a :class:`~cssselect.TranslationIssue` whose ``range`` marks the
+    offending text in the original source and whose ``kind`` distinguishes a
+    grammar mistake (``"syntax"``) from a construct the XPath backend does
+    not support (``"unsupported"``). The existing :meth:`css_to_xpath`
+    interface still raises on the first error, unchanged.
+
+*   Added :func:`parse_lenient`, which parses a group of selectors without
+    raising: valid branches expose their parsed :class:`Selector` and
+    invalid ones expose a :class:`~cssselect.ParseFailure` with a source
+    range. Source that cannot even be tokenized (an unclosed string) is
+    reported separately as :class:`~cssselect.SourceRange` objects, so that
+    callers know which parts have not been checked.
+
+*   Added :func:`split_selector_groups`, which splits a group of selectors
+    on commas at the top level only, never inside attribute values, strings
+    or functional pseudo-class arguments.
+
+*   Parsed objects (:class:`Selector`, the parsed tree nodes and
+    :class:`FunctionalPseudoElement`) now expose the source range they came
+    from when produced by the parser. Objects built by hand leave that range
+    set to ``None``.
+
 Version 1.6.0
 -------------
 

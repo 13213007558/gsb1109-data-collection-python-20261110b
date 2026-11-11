@@ -14,8 +14,9 @@ See AUTHORS for more details.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from string import ascii_lowercase, ascii_uppercase
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Literal, Self, cast
 
 from cssselect.parser import (
     Attrib,
@@ -26,15 +27,18 @@ from cssselect.parser import (
     Hash,
     Matching,
     Negation,
+    ParsedBranch,
     Pseudo,
     PseudoElement,
     Relation,
     Selector,
     SelectorError,
+    SourceRange,
     SpecificityAdjustment,
     Tree,
     ascii_lower,
     parse,
+    parse_lenient,
     parse_series,
 )
 
@@ -43,7 +47,68 @@ if TYPE_CHECKING:
 
 
 class ExpressionError(SelectorError, RuntimeError):
-    """Unknown or unsupported selector (eg. pseudo-class)."""
+    """Unknown or unsupported selector (eg. pseudo-class).
+
+    When the error is raised while translating a parsed tree, :attr:`node`
+    holds the offending parsed node (and therefore its source range) and
+    :attr:`range` may hold an explicit range. Both stay ``None`` when no
+    location is available, so the strict execution API behaves exactly as
+    before.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        node: Tree | None = None,
+        range_: SourceRange | None = None,
+    ) -> None:
+        super().__init__(*args)
+        self.node = node
+        self.range = range_
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationIssue:
+    """A problem found while checking a single selector branch.
+
+    :attr:`kind` is ``"syntax"`` when the branch does not match the CSS
+    grammar (the user made a typo), and ``"unsupported"`` when it parses
+    but cannot be translated to XPath 1.0 (an unknown pseudo-class, a
+    pseudo-element, a wildcard ``*-of-type`` pseudo-class, ...).
+    :attr:`range` marks the offending text in the original source and
+    :attr:`css` is that text.
+    """
+
+    kind: Literal["syntax", "unsupported"]
+    message: str
+    range: SourceRange
+    css: str
+
+
+@dataclass(frozen=True, slots=True)
+class BranchReport:
+    """The preflight result for one comma-separated selector branch.
+
+    Exactly one of :attr:`xpath` and :attr:`issue` is populated.
+    """
+
+    text: str
+    range: SourceRange
+    xpath: str | None
+    issue: TranslationIssue | None
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationReport:
+    """The result of :meth:`GenericTranslator.validate_css`.
+
+    :attr:`branches` holds one :class:`BranchReport` per comma-separated
+    branch and :attr:`unparsed` ranges cover source that could not even be
+    tokenized (e.g. an unclosed string) and has therefore not been checked.
+    """
+
+    branches: tuple[BranchReport, ...]
+    unparsed: tuple[SourceRange, ...]
 
 
 #### XPath Helpers
@@ -235,6 +300,97 @@ class GenericTranslator:
             for selector in parse(css)
         )
 
+    def validate_css(
+        self, css: str, prefix: str = "descendant-or-self::"
+    ) -> ValidationReport:
+        """Check a *group of selectors* without raising on errors.
+
+        This is the preflight counterpart of :meth:`css_to_xpath`, meant for
+        editors and other tools that validate user input. Every
+        comma-separated branch is checked independently and reported as a
+        :class:`BranchReport`: branches that translate carry their XPath
+        expression, the others carry a :class:`TranslationIssue` whose
+        :attr:`~TranslationIssue.kind` says whether the CSS is misspelled
+        (``"syntax"``) or uses a construct the XPath backend does not
+        support (``"unsupported"``) and whose :attr:`~TranslationIssue.range`
+        marks the offending text.
+
+        Commas inside attribute values, strings and functional pseudo-class
+        arguments are not treated as branch separators. Source that cannot
+        even be tokenized (an unclosed string) is returned in
+        :attr:`ValidationReport.unparsed` instead of being blamed on a
+        branch, so callers know which parts have not been checked.
+
+        :meth:`css_to_xpath` keeps its original, raising behavior; this
+        method never raises for invalid CSS.
+        """
+        parsed = parse_lenient(css)
+        branches: list[BranchReport] = []
+        for branch in parsed.branches:
+            if branch.error is not None:
+                issue = TranslationIssue(
+                    kind="syntax",
+                    message=branch.error.message,
+                    range=branch.error.range,
+                    css=branch.error.range.css(css),
+                )
+                branches.append(
+                    BranchReport(
+                        text=branch.text,
+                        range=branch.range,
+                        xpath=None,
+                        issue=issue,
+                    )
+                )
+                continue
+            assert branch.selector is not None
+            branches.append(
+                self._validate_branch(branch.selector, branch, css, prefix)
+            )
+        return ValidationReport(tuple(branches), parsed.unparsed)
+
+    def _validate_branch(
+        self,
+        selector: Selector,
+        branch: ParsedBranch,
+        css: str,
+        prefix: str,
+    ) -> BranchReport:
+        try:
+            xpath = self.selector_to_xpath(
+                selector, prefix, translate_pseudo_elements=True
+            )
+        except ExpressionError as ex:
+            issue = self._issue_from_expression_error(ex, selector, css)
+            return BranchReport(
+                text=branch.text, range=branch.range, xpath=None, issue=issue
+            )
+        return BranchReport(text=branch.text, range=branch.range, xpath=xpath, issue=None)
+
+    def _issue_from_expression_error(
+        self, ex: ExpressionError, selector: Selector, css: str
+    ) -> TranslationIssue:
+        range_ = ex.range
+        if range_ is None:
+            node = ex.node
+            node_range = getattr(node, "_source_range", None)
+            if node_range is not None:
+                range_ = node_range
+            elif selector.pseudo_element_range is not None:
+                range_ = selector.pseudo_element_range
+            elif selector.parsed_tree._source_range is not None:
+                range_ = selector.parsed_tree._source_range
+            else:
+                # A selector built by hand rather than parsed: no source
+                # location is available.
+                range_ = SourceRange(0, 0)
+        return TranslationIssue(
+            kind="unsupported",
+            message=str(ex),
+            range=range_,
+            css=range_.css(css),
+        )
+
     def selector_to_xpath(
         self,
         selector: Selector,
@@ -305,8 +461,19 @@ class GenericTranslator:
             getattr(self, f"xpath_{type_name.lower()}", None),
         )
         if method is None:
-            raise ExpressionError(f"{type_name} is not supported.")
-        return method(parsed_selector)
+            raise ExpressionError(
+                f"{type_name} is not supported.", node=parsed_selector
+            )
+        try:
+            return method(parsed_selector)
+        except ExpressionError as ex:
+            # Remember the node being translated when a deeper handler did
+            # not point at something more specific. The preflight API turns
+            # this into a source range; the raised exception itself is left
+            # unchanged for the strict execution API.
+            if ex.node is None:
+                ex.node = parsed_selector
+            raise
 
     # Dispatched by parsed object type
 

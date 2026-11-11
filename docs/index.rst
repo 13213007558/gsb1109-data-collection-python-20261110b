@@ -57,9 +57,54 @@ is a group of two selectors.
 .. autoclass:: FunctionalPseudoElement
 
 .. autoclass:: GenericTranslator
-    :members: css_to_xpath, selector_to_xpath
+    :members: css_to_xpath, selector_to_xpath, validate_css
 
 .. autoclass:: HTMLTranslator
+
+Preflight validation
+--------------------
+
+:meth:`~GenericTranslator.validate_css` is a non-raising counterpart of
+:meth:`~GenericTranslator.css_to_xpath` aimed at editors and other tools
+that check user-provided CSS. It validates a whole group of selectors in one
+pass and reports every comma-separated branch independently instead of
+stopping at the first error.
+
+.. sourcecode:: pycon
+
+    >>> report = GenericTranslator().validate_css("div, :lorem-ipsum, p")
+    >>> for branch in report.branches:
+    ...     if branch.issue:
+    ...         print(branch.issue.kind, branch.issue.css, branch.issue.message)
+    ...     else:
+    ...         print(branch.xpath)
+    descendant-or-self::div
+    unsupported :lorem-ipsum The pseudo-class :lorem-ipsum is unknown
+    descendant-or-self::p
+
+Each :class:`~cssselect.BranchReport` carries either an XPath expression or a
+:class:`~cssselect.TranslationIssue`. The issue ``kind`` is ``"syntax"`` when
+the branch does not match the CSS grammar and ``"unsupported"`` when it
+parses but cannot be translated to XPath 1.0; ``range`` marks the offending
+text in the original source. Commas inside attribute values, strings and
+functional pseudo-class arguments are not treated as separators. Source that
+cannot even be tokenized (an unclosed string) is returned in
+:attr:`~cssselect.ValidationReport.unparsed`, so the caller knows which
+parts have not been checked.
+
+The lower-level :func:`parse_lenient` and :func:`split_selector_groups`
+functions expose the same branch splitting and recovery without translating
+to XPath.
+
+.. autoclass:: SourceRange
+.. autoclass:: ParseFailure
+.. autoclass:: ParsedBranch
+.. autoclass:: LenientParse
+.. autofunction:: parse_lenient
+.. autofunction:: split_selector_groups
+.. autoclass:: TranslationIssue
+.. autoclass:: BranchReport
+.. autoclass:: ValidationReport
 
 Exceptions
 ----------

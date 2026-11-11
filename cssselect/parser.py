@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
     Literal,
     Protocol,
     Self,
@@ -49,6 +51,109 @@ class SelectorSyntaxError(SelectorError, SyntaxError):
     """Parsing a selector that does not match the grammar."""
 
 
+class _LocatedSyntaxError(SelectorSyntaxError):
+    """A :class:`SelectorSyntaxError` that remembers the offending token.
+
+    The strict parser raises it just like a :class:`SelectorSyntaxError`;
+    :func:`parse_lenient` uses the stored token to mark the precise source
+    range of the problem.
+    """
+
+    def __init__(self, message: str, token: Token) -> None:
+        super().__init__(message)
+        self.token = token
+
+
+def _syntax_error(message: str, token: Token) -> _LocatedSyntaxError:
+    return _LocatedSyntaxError(message, token)
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRange:
+    """A half-open range of character positions in the original CSS source.
+
+    :attr:`start` is the index of the first character of the range and
+    :attr:`end` the index just past its last character, so slicing the
+    original source with ``source[start:end]`` reconstructs the covered
+    text.
+    """
+
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if self.start < 0 or self.end < self.start:
+            raise ValueError(f"Invalid source range: {self!r}")
+
+    def __len__(self) -> int:
+        return self.end - self.start
+
+    def css(self, source: str) -> str:
+        """Return the part of *source* covered by this range."""
+        return source[self.start : self.end]
+
+
+@dataclass(frozen=True, slots=True)
+class ParseFailure:
+    """A parse error located in the original CSS source.
+
+    :attr:`range` covers the offending token (or, when its end cannot be
+    located, the remainder of the source), and :attr:`message` is the same
+    text a :class:`SelectorSyntaxError` would carry.
+    """
+
+    message: str
+    range: SourceRange
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedBranch:
+    """One comma-separated branch of a selector group.
+
+    Exactly one of :attr:`selector` and :attr:`error` is populated:
+    parsing succeeded for the former and failed for the latter.
+    """
+
+    text: str
+    range: SourceRange
+    comma: SourceRange | None
+    selector: Selector | None
+    error: ParseFailure | None
+
+
+@dataclass(frozen=True, slots=True)
+class LenientParse:
+    """The result of :func:`parse_lenient`.
+
+    :attr:`branches` lists every comma-separated branch, whether or not it
+    parsed, and :attr:`unparsed` ranges cover source fragments that could
+    not even be tokenized and therefore have not been checked at all.
+    """
+
+    branches: tuple[ParsedBranch, ...]
+    unparsed: tuple[SourceRange, ...]
+
+
+@overload
+def attach_source(tree: Tree, source_range: SourceRange | None) -> Tree: ...
+
+
+@overload
+def attach_source(
+    tree: FunctionalPseudoElement, source_range: SourceRange | None
+) -> FunctionalPseudoElement: ...
+
+
+def attach_source(tree: object, source_range: SourceRange | None) -> object:
+    """Associate *source_range* with a parsed node, in place.
+
+    The parser calls this on every node it creates. Nodes built by hand
+    rather than through the parser keep their range set to ``None``.
+    """
+    cast("Any", tree)._source_range = source_range
+    return tree
+
+
 #### Parsed objects
 
 Tree: TypeAlias = Union[
@@ -78,7 +183,12 @@ class Selector:
 
     """
 
-    def __init__(self, tree: Tree, pseudo_element: PseudoElement | None = None) -> None:
+    def __init__(
+        self,
+        tree: Tree,
+        pseudo_element: PseudoElement | None = None,
+        pseudo_element_range: SourceRange | None = None,
+    ) -> None:
         self.parsed_tree = tree
         if pseudo_element is not None and not isinstance(
             pseudo_element, FunctionalPseudoElement
@@ -105,6 +215,9 @@ class Selector:
         #:
         #: .. _Lists3: http://www.w3.org/TR/2011/WD-css3-lists-20110524/#marker-pseudoelement
         self.pseudo_element = pseudo_element
+        #: The source range of the pseudo-element, or ``None`` when the
+        #: selector has none or was built by hand rather than parsed.
+        self.pseudo_element_range = pseudo_element_range
 
     def __repr__(self) -> str:
         if isinstance(self.pseudo_element, FunctionalPseudoElement):
@@ -147,6 +260,8 @@ class Class:
     Represents selector.class_name
     """
 
+    _source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, class_name: str) -> None:
         self.selector = selector
         self.class_name = class_name
@@ -181,6 +296,8 @@ class FunctionalPseudoElement:
 
     """
 
+    _source_range: SourceRange | None = None
+
     def __init__(self, name: str, arguments: Sequence[Token]):
         self.name = ascii_lower(name)
         self.arguments = arguments
@@ -201,6 +318,8 @@ class Function:
     """
     Represents selector:name(expr)
     """
+
+    _source_range: SourceRange | None = None
 
     def __init__(self, selector: Tree, name: str, arguments: Sequence[Token]) -> None:
         self.selector = selector
@@ -229,6 +348,8 @@ class Pseudo:
     Represents selector:ident
     """
 
+    _source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, ident: str) -> None:
         self.selector = selector
         self.ident = ascii_lower(ident)
@@ -249,6 +370,8 @@ class Negation:
     """
     Represents selector:not(subselector)
     """
+
+    _source_range: SourceRange | None = None
 
     def __init__(self, selector: Tree, subselector: Tree) -> None:
         self.selector = selector
@@ -290,6 +413,8 @@ class Relation:
 
     """
 
+    _source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, arguments: Sequence[tuple[Token, Selector]]):
         self.selector = selector
         self.arguments = arguments
@@ -318,6 +443,8 @@ class Matching:
     """
     Represents selector:is(selector_list)
     """
+
+    _source_range: SourceRange | None = None
 
     def __init__(self, selector: Tree, selector_list: Iterable[Tree]):
         self.selector = selector
@@ -348,6 +475,8 @@ class SpecificityAdjustment:
     Represents selector:where(selector_list)
     Same as selector:is(selector_list), but its specificity is always 0
     """
+
+    _source_range: SourceRange | None = None
 
     def __init__(self, selector: Tree, selector_list: list[Tree]):
         self.selector = selector
@@ -380,6 +509,8 @@ class Attrib:
     *flag* is ``'i'`` for a case-insensitive value match, ``'s'`` for a
     case-sensitive one, and `None` when the selector sets neither.
     """
+
+    _source_range: SourceRange | None = None
 
     @overload
     def __init__(
@@ -462,6 +593,8 @@ class Element:
 
     """
 
+    _source_range: SourceRange | None = None
+
     def __init__(
         self, namespace: str | None = None, element: str | None = None
     ) -> None:
@@ -491,6 +624,8 @@ class Hash:
     Represents selector#id
     """
 
+    _source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, id: str) -> None:  # noqa: A002
         self.selector = selector
         self.id = id
@@ -508,6 +643,8 @@ class Hash:
 
 
 class CombinedSelector:
+    _source_range: SourceRange | None = None
+
     def __init__(self, selector: Tree, combinator: str, subselector: Tree) -> None:
         assert selector is not None
         self.selector = selector
@@ -565,19 +702,211 @@ def parse(css: str) -> list[Selector]:
     # Fast path for simple cases
     match = _el_re.match(css)
     if match:
-        return [Selector(Element(element=match.group(1)))]
+        element = Element(element=match.group(1))
+        attach_source(element, SourceRange(match.start(1), match.end(1)))
+        return [Selector(element)]
     match = _id_re.match(css)
     if match is not None:
-        return [Selector(Hash(Element(element=match.group(1) or None), match.group(2)))]
+        element = Element(element=match.group(1) or None)
+        hash_ = Hash(element, match.group(2))
+        element_start, hash_end = match.span(1)[0], match.end(2)
+        if match.group(1):
+            attach_source(element, SourceRange(match.start(1), match.end(1)))
+        else:
+            attach_source(element, SourceRange(element_start, element_start))
+        attach_source(hash_, SourceRange(element_start, hash_end))
+        return [Selector(hash_)]
     match = _class_re.match(css)
     if match is not None:
-        return [
-            Selector(Class(Element(element=match.group(1) or None), match.group(2)))
-        ]
+        element = Element(element=match.group(1) or None)
+        class_ = Class(element, match.group(2))
+        element_start, class_end = match.span(1)[0], match.end(2)
+        if match.group(1):
+            attach_source(element, SourceRange(match.start(1), match.end(1)))
+        else:
+            attach_source(element, SourceRange(element_start, element_start))
+        attach_source(class_, SourceRange(element_start, class_end))
+        return [Selector(class_)]
 
     stream = TokenStream(tokenize(css))
     stream.source = css
     return list(parse_selector_group(stream))
+
+
+def _string_end(source: str, pos: int) -> int:
+    """Return the position just past the string token opening at *pos*."""
+    quote = source[pos]
+    match = _match_string_by_quote[quote](source, pos=pos + 1)
+    assert match is not None
+    end_pos = match.end()
+    if end_pos < len(source) and source[end_pos] == quote:
+        return end_pos + 1
+    # An unclosed string runs to the end of the source.
+    return len(source)
+
+
+def _token_end(token: Token, source: str) -> int:
+    """Return the source position just past *token*.
+
+    Identifier, hash and string tokens are decoded while tokenizing, so
+    their value can be shorter than their source representation (escapes,
+    quotes); re-run the tokenizer's own patterns to measure the source
+    span instead of using the decoded value.
+    """
+    if token.type == "EOF":
+        return token.pos
+    if token.type == "IDENT":
+        match = _match_ident(source, pos=token.pos)
+        return match.end() if match else token.pos
+    if token.type == "HASH":
+        match = _match_hash(source, pos=token.pos)
+        return match.end() if match else token.pos
+    if token.type == "STRING":
+        return _string_end(source, token.pos)
+    end = token.pos + len(token.value or "")
+    return min(end, len(source))
+
+
+def _error_failure(stream: TokenStream, error: SelectorSyntaxError) -> ParseFailure:
+    """Build a :class:`ParseFailure` for *error*, locating it in the source."""
+    source = cast("str", stream.source)
+    token = getattr(error, "token", None)
+    if token is None:
+        token = stream.peek()
+    if token.type == "EOF":
+        range_ = SourceRange(token.pos, len(source))
+    else:
+        range_ = SourceRange(token.pos, _token_end(token, source))
+    return ParseFailure(str(error), range_)
+
+
+def parse_lenient(css: str) -> LenientParse:
+    """Parse a *group of selectors* without raising on syntax errors.
+
+    This is the lenient counterpart of :func:`parse`, meant for tools such
+    as editor preflight checks. Every comma-separated branch is reported
+    independently: valid branches carry their parsed :class:`Selector`
+    objects, invalid ones carry a :class:`ParseFailure` with the offending
+    source range and an error message. Comma characters are never split on
+    inside strings, attribute selectors or function arguments.
+
+    Source that cannot even be tokenized (currently, an unclosed string)
+    is reported as :attr:`LenientParse.unparsed` ranges rather than blamed
+    on any branch, so that callers know which parts have not been checked.
+    """
+    branches: list[ParsedBranch] = []
+    unparsed: list[SourceRange] = []
+    stream = TokenStream(tokenize_lenient(css, unparsed))
+    stream.source = css
+    stream.skip_whitespace()
+    while True:
+        start = stream.peek().pos
+        selector: Selector | None = None
+        error: ParseFailure | None = None
+        try:
+            selector = Selector(*parse_selector(stream))
+        except SelectorSyntaxError as ex:
+            error = _error_failure(stream, ex)
+        end, comma = _recover_to_comma(stream)
+        # Trim whitespace surrounding the branch text.
+        text = css[start:end]
+        stripped = text.strip()
+        text_start = start + (len(text) - len(text.lstrip()))
+        text_end = text_start + len(stripped)
+        branches.append(
+            ParsedBranch(
+                text=stripped,
+                range=SourceRange(text_start, text_end),
+                comma=comma,
+                selector=selector,
+                error=error,
+            )
+        )
+        if stream.peek().type == "EOF":
+            break
+        # Skip the comma the recovery stopped on.
+        stream.next()
+        stream.skip_whitespace()
+    return LenientParse(tuple(branches), tuple(unparsed))
+
+
+def _recover_to_comma(stream: TokenStream) -> tuple[int, SourceRange | None]:
+    """Skip tokens up to the next top-level comma or EOF after an error.
+
+    Parentheses and attribute brackets are balanced while scanning, so a
+    comma inside a function argument or an attribute value is not treated
+    as a branch separator. Returns the end position of the branch text and
+    the range of the terminating comma, if any. The terminating comma, if
+    any, is left peekable rather than consumed.
+    """
+    source = cast("str", stream.source)
+    end = stream.peek().pos
+    depth = 0
+    comma: SourceRange | None = None
+    while True:
+        token = stream.peek()
+        if token.type == "EOF":
+            if depth:
+                # Unclosed parenthesis/bracket: include everything left.
+                end = len(source)
+            break
+        if token.is_delim("(", "["):
+            depth += 1
+        elif token.is_delim(")", "]"):
+            if depth:
+                depth -= 1
+        elif token.is_delim(",") and depth == 0:
+            comma = SourceRange(token.pos, token.pos + 1)
+            end = token.pos
+            break
+        end = _token_end(token, source)
+        stream.next()
+    return end, comma
+
+
+def split_selector_groups(css: str) -> tuple[tuple[SourceRange, ...], tuple[SourceRange, ...]]:
+    """Split a *group of selectors* into its comma-separated branches.
+
+    The split follows the tokenizer rather than the raw text: a comma
+    inside an attribute value, a string or a functional pseudo-class
+    argument is not a separator. The first item holds one range per
+    branch, the second one the ranges of the separating commas.
+
+    Source that cannot be tokenized (an unclosed string) is skipped: the
+    surrounding branches are still returned, and the gap simply does not
+    appear in any range. Use :func:`parse_lenient` to learn about such
+    gaps explicitly.
+    """
+    unparsed: list[SourceRange] = []
+    stream = TokenStream(tokenize_lenient(css, unparsed))
+    stream.source = css
+    branch_ranges: list[SourceRange] = []
+    comma_ranges: list[SourceRange] = []
+    stream.skip_whitespace()
+    start = stream.peek().pos
+    depth = 0
+    while True:
+        token = stream.peek()
+        if token.type == "EOF":
+            break
+        if token.is_delim("(", "["):
+            depth += 1
+        elif token.is_delim(")", "]") and depth:
+            depth -= 1
+        elif token.is_delim(",") and depth == 0:
+            comma_pos = token.pos
+            text = css[start:comma_pos]
+            stripped = text.rstrip()
+            branch_ranges.append(SourceRange(start, start + len(stripped)))
+            comma_ranges.append(SourceRange(comma_pos, comma_pos + 1))
+            stream.next()
+            stream.skip_whitespace()
+            start = stream.peek().pos
+            continue
+        stream.next()
+    text = css[start:]
+    branch_ranges.append(SourceRange(start, start + len(text.rstrip())))
+    return tuple(branch_ranges), tuple(comma_ranges)
 
 
 #    except SelectorSyntaxError:
@@ -600,16 +929,21 @@ def parse_selector_group(stream: TokenStream) -> Iterator[Selector]:
             break
 
 
-def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
-    result, pseudo_element = parse_simple_selector(stream)
+def parse_selector(
+    stream: TokenStream,
+) -> tuple[Tree, PseudoElement | None, SourceRange | None]:
+    stream.skip_whitespace()
+    selector_start = stream.peek().pos
+    result, pseudo_element, pseudo_element_range = parse_simple_selector(stream)
     while 1:
         stream.skip_whitespace()
         peek = stream.peek()
         if peek in (("EOF", None), ("DELIM", ",")):
             break
         if pseudo_element:
-            raise SelectorSyntaxError(
-                f"Got pseudo-element ::{pseudo_element} not at the end of a selector"
+            raise _syntax_error(
+                f"Got pseudo-element ::{pseudo_element} not at the end of a selector",
+                stream.peek(),
             )
         if peek.is_delim("+", ">", "~"):
             # A combinator
@@ -619,9 +953,21 @@ def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
             # By exclusion, the last parse_simple_selector() ended
             # at peek == ' '
             combinator = " "
-        next_selector, pseudo_element = parse_simple_selector(stream)
+        next_selector, pseudo_element, pseudo_element_range = parse_simple_selector(
+            stream
+        )
         result = CombinedSelector(result, combinator, next_selector)
-    return result, pseudo_element
+    attach_source(result, SourceRange(selector_start, _last_used_end(stream)))
+    return result, pseudo_element, pseudo_element_range
+
+
+def _last_used_end(stream: TokenStream) -> int:
+    """Source position just past the last consumed non-whitespace token."""
+    source = cast("str", stream.source)
+    for token in reversed(stream.used):
+        if token.type != "S":
+            return _token_end(token, source)
+    return 0
 
 
 def parse_simple_selector(
@@ -629,9 +975,10 @@ def parse_simple_selector(
     inside_negation: bool = False,
     inside_selector_list: bool = False,
     inside_relative_selector: bool = False,
-) -> tuple[Tree, PseudoElement | None]:
+) -> tuple[Tree, PseudoElement | None, SourceRange | None]:
     stream.skip_whitespace()
     selector_start = len(stream.used)
+    selector_pos = stream.peek().pos
     # Whether the tokens preceding this compound selector (ignoring
     # whitespace) are the start of the input or a comma, for :scope.
     preceding = selector_start - 1
@@ -649,7 +996,7 @@ def parse_simple_selector(
             if peek.type == "IDENT" and namespace == "*":
                 # An escaped "*" (e.g. "\*|f") is a prefix named "*",
                 # not the namespace wildcard, and no XPath prefix can be "*".
-                raise SelectorSyntaxError(f"Expected namespace prefix, got {peek}")
+                raise _syntax_error(f"Expected namespace prefix, got {peek}", peek)
             stream.next()
             element = stream.next_ident_or_star()
         else:
@@ -660,51 +1007,73 @@ def parse_simple_selector(
     else:
         element = namespace = None
     result: Tree = Element(namespace, element)
+    element_end = _last_used_end(stream)
+    # An implicit universal selector (".foo", ":hover", ...) consumes no
+    # token: give its node a zero-width range at the compound start.
+    element_end = max(element_end, selector_pos)
+    attach_source(result, SourceRange(selector_pos, element_end))
     pseudo_element: PseudoElement | None = None
+    pseudo_element_range: SourceRange | None = None
     while 1:
         peek = stream.peek()
         if peek.type in ("S", "EOF") or peek.is_delim(",", "+", ">", "~", ")"):
             break
         if pseudo_element:
-            raise SelectorSyntaxError(
-                f"Got pseudo-element ::{pseudo_element} not at the end of a selector"
+            raise _syntax_error(
+                f"Got pseudo-element ::{pseudo_element} not at the end of a selector",
+                peek,
             )
         if peek.type == "HASH":
+            start = peek.pos
             result = Hash(result, cast("str", stream.next().value))
+            attach_source(result, SourceRange(start, _last_used_end(stream)))
         elif peek == ("DELIM", "."):
+            start = peek.pos
             stream.next()
             result = Class(result, stream.next_ident())
+            attach_source(result, SourceRange(start, _last_used_end(stream)))
         elif peek == ("DELIM", "|"):
             # The explicit "no namespace" syntax, e.g. |div: only valid at
             # the very start of a simple selector.
             if len(stream.used) != selector_start:
-                raise SelectorSyntaxError(f"Expected selector, got {peek}")
+                raise _syntax_error(f"Expected selector, got {peek}", peek)
             stream.next()
             element = stream.next_ident_or_star()
             # Unlike *, |* only matches elements with no namespace.
             result = Element("" if element is None else None, element)
+            attach_source(result, SourceRange(selector_pos, _last_used_end(stream)))
         elif peek == ("DELIM", "["):
+            start = peek.pos
             stream.next()
             result = parse_attrib(result, stream)
+            attach_source(result, SourceRange(start, _last_used_end(stream)))
         elif peek == ("DELIM", ":"):
+            start = peek.pos
             stream.next()
             if stream.peek() == ("DELIM", ":"):
                 stream.next()
                 pseudo_element = stream.next_ident()
                 if stream.peek() == ("DELIM", "("):
                     stream.next()
-                    pseudo_element = FunctionalPseudoElement(
+                    functional = FunctionalPseudoElement(
                         pseudo_element, parse_arguments(stream)
                     )
+                    attach_source(
+                        functional, SourceRange(start, _last_used_end(stream))
+                    )
+                    pseudo_element = functional
+                pseudo_element_range = SourceRange(start, _last_used_end(stream))
                 continue
             ident = stream.next_ident()
             if ident.lower() in ("first-line", "first-letter", "before", "after"):
                 # Special case: CSS 2.1 pseudo-elements can have a single ':'
                 # Any new pseudo-element must have two.
                 pseudo_element = str(ident)
+                pseudo_element_range = SourceRange(start, _last_used_end(stream))
                 continue
             if stream.peek() != ("DELIM", "("):
                 result = Pseudo(result, ident)
+                attach_source(result, SourceRange(start, _last_used_end(stream)))
                 # :scope is only supported at the start of a selector,
                 # i.e. never in :is()/:where()/:matches() or :has()
                 # arguments (where a preceding comma separates arguments,
@@ -716,20 +1085,22 @@ def parse_simple_selector(
                     or inside_relative_selector
                     or not at_selector_start
                 ):
-                    raise SelectorSyntaxError(
-                        'Got pseudo-class ":scope" not at the start of a selector'
+                    raise _syntax_error(
+                        'Got pseudo-class ":scope" not at the start of a selector',
+                        stream.used[-1],
                     )
                 continue
             stream.next()
             stream.skip_whitespace()
             if ident.lower() == "not":
                 if inside_selector_list:
-                    raise SelectorSyntaxError(
-                        ":not() is not supported inside :is(), :where() and :matches()"
+                    raise _syntax_error(
+                        ":not() is not supported inside :is(), :where() and :matches()",
+                        stream.used[-1],
                     )
                 if inside_negation:
-                    raise SelectorSyntaxError("Got nested :not()")
-                argument, argument_pseudo_element = parse_simple_selector(
+                    raise _syntax_error("Got nested :not()", stream.used[-1])
+                argument, argument_pseudo_element, _ = parse_simple_selector(
                     stream, inside_negation=True
                 )
                 while 1:
@@ -738,8 +1109,9 @@ def parse_simple_selector(
                     stream.skip_whitespace()
                     peek = stream.peek()
                     if argument_pseudo_element:
-                        raise SelectorSyntaxError(
-                            f"Got pseudo-element ::{argument_pseudo_element} inside :not() at {peek.pos}"
+                        raise _syntax_error(
+                            f"Got pseudo-element ::{argument_pseudo_element} inside :not() at {peek.pos}",
+                            peek,
                         )
                     if peek == ("DELIM", ")"):
                         stream.next()
@@ -749,31 +1121,40 @@ def parse_simple_selector(
                         stream.skip_whitespace()
                     elif peek.type == "EOF" or peek.is_delim(","):
                         # A selector list is not supported in :not().
-                        raise SelectorSyntaxError(f"Expected ')', got {peek}")
+                        raise _syntax_error(f"Expected ')', got {peek}", peek)
                     else:
                         argument_combinator = " "
-                    next_selector, argument_pseudo_element = parse_simple_selector(
-                        stream, inside_negation=True
-                    )
+                    (
+                        next_selector,
+                        argument_pseudo_element,
+                        _,
+                    ) = parse_simple_selector(stream, inside_negation=True)
                     argument = CombinedSelector(
                         argument, argument_combinator, next_selector
                     )
                 result = Negation(result, argument)
+                attach_source(result, SourceRange(start, _last_used_end(stream)))
             elif ident.lower() == "has":
                 result = Relation(result, parse_relative_selector(stream))
+                attach_source(result, SourceRange(start, _last_used_end(stream)))
             elif ident.lower() in ("matches", "is"):
                 selectors = parse_simple_selector_arguments(stream)
                 result = Matching(result, selectors)
+                attach_source(result, SourceRange(start, _last_used_end(stream)))
             elif ident.lower() == "where":
                 selectors = parse_simple_selector_arguments(stream)
                 result = SpecificityAdjustment(result, selectors)
+                attach_source(result, SourceRange(start, _last_used_end(stream)))
             else:
                 result = Function(result, ident, parse_arguments(stream))
+                attach_source(result, SourceRange(start, _last_used_end(stream)))
         else:
-            raise SelectorSyntaxError(f"Expected selector, got {peek}")
+            raise _syntax_error(f"Expected selector, got {peek}", peek)
     if len(stream.used) == selector_start:
-        raise SelectorSyntaxError(f"Expected selector, got {stream.peek()}")
-    return result, pseudo_element
+        raise _syntax_error(
+            f"Expected selector, got {stream.peek()}", stream.peek()
+        )
+    return result, pseudo_element, pseudo_element_range
 
 
 def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
@@ -789,7 +1170,7 @@ def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
         elif next_ == ("DELIM", ")"):
             return arguments
         else:
-            raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+            raise _syntax_error(f"Expected an argument, got {next_}", next_)
 
 
 def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]:
@@ -805,13 +1186,14 @@ def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]
             stream.skip_whitespace()
         else:
             combinator = Token("DELIM", " ", pos=peek.pos)
-        result, pseudo_element = parse_simple_selector(
+        result, pseudo_element, _ = parse_simple_selector(
             stream, inside_relative_selector=True
         )
         while 1:
             if pseudo_element:
-                raise SelectorSyntaxError(
-                    f"Got pseudo-element ::{pseudo_element} inside function"
+                raise _syntax_error(
+                    f"Got pseudo-element ::{pseudo_element} inside function",
+                    stream.peek(),
                 )
             # Whitespace before a comma or the closing parenthesis is not a
             # descendant combinator.
@@ -820,14 +1202,19 @@ def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]
             if peek.is_delim(",", ")"):
                 break
             if peek.type == "EOF":
-                raise SelectorSyntaxError(f"Expected ')', got {peek}")
+                raise _syntax_error(f"Expected ')', got {peek}", peek)
             if peek.is_delim("+", ">", "~"):
                 argument_combinator = cast("str", stream.next().value)
                 stream.skip_whitespace()
             else:
                 argument_combinator = " "
-            next_selector, pseudo_element = parse_simple_selector(stream)
+            next_selector, pseudo_element, _ = parse_simple_selector(stream)
+            combined_start = result._source_range.start if result._source_range else None
             result = CombinedSelector(result, argument_combinator, next_selector)
+            if combined_start is not None:
+                attach_source(
+                    result, SourceRange(combined_start, _last_used_end(stream))
+                )
         arguments.append((combinator, Selector(result)))
         if stream.next().is_delim(")"):
             break
@@ -837,12 +1224,13 @@ def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]
 def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
     arguments = []
     while 1:
-        result, pseudo_element = parse_simple_selector(
+        result, pseudo_element, _ = parse_simple_selector(
             stream, inside_selector_list=True
         )
         if pseudo_element:
-            raise SelectorSyntaxError(
-                f"Got pseudo-element ::{pseudo_element} inside function"
+            raise _syntax_error(
+                f"Got pseudo-element ::{pseudo_element} inside function",
+                stream.peek(),
             )
         stream.skip_whitespace()
         next_ = stream.next()
@@ -853,7 +1241,7 @@ def parse_simple_selector_arguments(stream: TokenStream) -> list[Tree]:
             arguments.append(result)
             break
         else:
-            raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+            raise _syntax_error(f"Expected an argument, got {next_}", next_)
     return arguments
 
 
@@ -871,7 +1259,7 @@ def parse_attrib(selector: Tree, stream: TokenStream) -> Attrib:
     else:
         attrib = stream.next_ident_or_star()
         if attrib is None and stream.peek() != ("DELIM", "|"):
-            raise SelectorSyntaxError(f"Expected '|', got {stream.peek()}")
+            raise _syntax_error(f"Expected '|', got {stream.peek()}", stream.peek())
         if stream.peek() == ("DELIM", "|"):
             stream.next()
             if attrib is not None and stream.peek() == ("DELIM", "="):
@@ -881,8 +1269,9 @@ def parse_attrib(selector: Tree, stream: TokenStream) -> Attrib:
             else:
                 if attrib == "*":
                     # An escaped "*" (e.g. "[\*|attr]"), not the wildcard.
-                    raise SelectorSyntaxError(
-                        f"Expected namespace prefix, got {stream.used[-2]}"
+                    raise _syntax_error(
+                        f"Expected namespace prefix, got {stream.used[-2]}",
+                        stream.used[-2],
                     )
                 namespace = "*" if attrib is None else attrib
                 attrib = stream.next_ident()
@@ -902,22 +1291,22 @@ def parse_attrib(selector: Tree, stream: TokenStream) -> Attrib:
             op = cast("str", next_.value) + "="
             stream.next()
         else:
-            raise SelectorSyntaxError(f"Operator expected, got {next_}")
+            raise _syntax_error(f"Operator expected, got {next_}", next_)
     stream.skip_whitespace()
     value = stream.next()
     if value.type not in ("IDENT", "STRING"):
-        raise SelectorSyntaxError(f"Expected string or ident, got {value}")
+        raise _syntax_error(f"Expected string or ident, got {value}", value)
     stream.skip_whitespace()
     next_ = stream.next()
     flag = None
     if next_.type == "IDENT":
         flag = ascii_lower(cast("str", next_.value))
         if flag not in ("i", "s"):
-            raise SelectorSyntaxError(f"Expected ']', got {next_}")
+            raise _syntax_error(f"Expected ']', got {next_}", next_)
         stream.skip_whitespace()
         next_ = stream.next()
     if next_ != ("DELIM", "]"):
-        raise SelectorSyntaxError(f"Expected ']', got {next_}")
+        raise _syntax_error(f"Expected ']', got {next_}", next_)
     return Attrib(selector, namespace, cast("str", attrib), op, value, flag)
 
 
@@ -1138,6 +1527,25 @@ def _serialize_ident(value: str) -> str:
 
 
 def tokenize(s: str) -> Iterator[Token]:
+    yield from _tokenize(s, lenient=False, unparsed=None)
+
+
+def tokenize_lenient(
+    s: str, unparsed: list[SourceRange] | None = None
+) -> Iterator[Token]:
+    """Tokenize *s* without raising on an invalid string.
+
+    The malformed string is recorded as an :class:`SourceRange` in
+    *unparsed* (when provided) and skipped, so that the rest of the source
+    can still be tokenized and checked. Everything else behaves like
+    :func:`tokenize`.
+    """
+    yield from _tokenize(s, lenient=True, unparsed=unparsed)
+
+
+def _tokenize(
+    s: str, lenient: bool, unparsed: list[SourceRange] | None
+) -> Iterator[Token]:
     # Preprocess the input stream (§3.3); the substitution is length-preserving.
     s = _sub_invalid_input_char("\N{REPLACEMENT CHARACTER}", s)
     pos = 0
@@ -1169,8 +1577,21 @@ def tokenize(s: str) -> Iterator[Token]:
             assert match, "Should have found at least an empty match"
             end_pos = match.end()
             if end_pos == len_s:
+                if lenient:
+                    if unparsed is not None:
+                        unparsed.append(SourceRange(pos, len_s))
+                    pos = len_s
+                    break
                 raise SelectorSyntaxError(f"Unclosed string at {pos}")
             if s[end_pos] != quote:
+                if lenient:
+                    # A raw control character (e.g. a newline) ended the
+                    # string: leave the offending character to be tokenized
+                    # again on the next iteration.
+                    if unparsed is not None:
+                        unparsed.append(SourceRange(pos, end_pos))
+                    pos = end_pos
+                    continue
                 raise SelectorSyntaxError(f"Invalid string at {pos}")
             value = _sub_string_escape(_replace_escape, match.group())
             yield Token("STRING", value, pos)
@@ -1215,21 +1636,32 @@ class TokenStream:
             assert self.peeked is not None
             self.used.append(self.peeked)
             return self.peeked
-        next_ = self.next_token()
+        next_ = self._pull()
         self.used.append(next_)
         return next_
 
     def peek(self) -> Token:
         if not self._peeking:
-            self.peeked = self.next_token()
+            self.peeked = self._pull()
             self._peeking = True
         assert self.peeked is not None
         return self.peeked
 
+    def _pull(self) -> Token:
+        # The tokenizer ends with a single EOF token: once it has been
+        # consumed and something peeks again (as lenient recovery does),
+        # keep returning an EOF at the end of the source instead of letting
+        # the exhausted iterator raise StopIteration.
+        try:
+            return self.next_token()
+        except StopIteration:
+            end = len(self.source) if self.source else 0
+            return EOFToken(end)
+
     def next_ident(self) -> str:
         next_ = self.next()
         if next_.type != "IDENT":
-            raise SelectorSyntaxError(f"Expected ident, got {next_}")
+            raise _syntax_error(f"Expected ident, got {next_}", next_)
         return cast("str", next_.value)
 
     def next_ident_or_star(self) -> str | None:
@@ -1238,7 +1670,7 @@ class TokenStream:
             return next_.value
         if next_ == ("DELIM", "*"):
             return None
-        raise SelectorSyntaxError(f"Expected ident or '*', got {next_}")
+        raise _syntax_error(f"Expected ident or '*', got {next_}", next_)
 
     def skip_whitespace(self) -> None:
         # A comment between two whitespace runs yields two consecutive
