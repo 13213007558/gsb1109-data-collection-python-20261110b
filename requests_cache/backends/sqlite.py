@@ -15,6 +15,8 @@ from pathlib import Path
 from tempfile import gettempdir
 from time import sleep, time
 from typing import Collection, Iterator, List, Optional, Tuple, Type
+from urllib.parse import quote
+from uuid import uuid4
 
 from platformdirs import user_cache_dir
 
@@ -188,6 +190,20 @@ class SQLiteCache(BaseCache):
             expired: Set to ``False`` to exclude expired responses
         """
         return self.responses.sorted(key, reversed, limit, expired)
+
+    def snapshot(self) -> 'SQLiteSnapshot':
+        """Open a read-only, point-in-time view of this cache.
+
+        At creation time the cache database is consistently copied into a private in-memory
+        database, so responses and redirect mappings stay fixed at the time of the call and are
+        unaffected by concurrent cache refreshes or deletions. Reads never fetch missing items
+        from the network: missing keys simply raise ``KeyError``.
+
+        Normal writes to the original cache can continue while a snapshot is open. Close the
+        snapshot with :py:meth:`SQLiteSnapshot.close` (or use it as a context manager) to release
+        the in-memory copy and its connections.
+        """
+        return SQLiteSnapshot(self)
 
 
 class SQLiteDict(BaseStorage):
@@ -454,6 +470,217 @@ class SQLiteDict(BaseStorage):
                     self._connection.commit()
                     self._active_transaction = False
                 self._connection.execute('VACUUM')
+
+
+class SQLiteSnapshotStorage(BaseStorage):
+    """Read-only view of a single table inside a snapshot's private in-memory database"""
+
+    def __init__(
+        self,
+        memory_uri: str,
+        table_name: str,
+        serializer: Optional[SerializerType] = None,
+        **kwargs,
+    ):
+        super().__init__(serializer=serializer)
+        connection_kwargs = get_valid_kwargs(sqlite_template, kwargs)
+        connection_kwargs['uri'] = True
+        connection_kwargs.setdefault('check_same_thread', False)
+        self.db_path = memory_uri
+        self.table_name = table_name
+        self._connection: Optional[sqlite3.Connection] = sqlite3.connect(
+            memory_uri, **connection_kwargs
+        )
+        self._closed = False
+
+    def _check_open(self):
+        if self._closed:
+            raise RuntimeError('Snapshot is closed')
+
+    def __getitem__(self, key):
+        self._check_open()
+        cur = self._connection.execute(
+            f'SELECT value FROM {self.table_name} WHERE key=?', (key,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            raise KeyError(key)
+        return self.deserialize(key, row[0])
+
+    def __setitem__(self, key, value):
+        raise TypeError('Cache snapshots are read-only')
+
+    def __delitem__(self, key):
+        raise TypeError('Cache snapshots are read-only')
+
+    def __iter__(self):
+        self._check_open()
+        for row in self._connection.execute(f'SELECT key FROM {self.table_name}'):
+            yield row[0]
+
+    def __len__(self):
+        self._check_open()
+        return self._connection.execute(
+            f'SELECT COUNT(key) FROM {self.table_name}'
+        ).fetchone()[0]
+
+    def __contains__(self, key):
+        self._check_open()
+        return self._connection.execute(
+            f'SELECT 1 FROM {self.table_name} WHERE key=? LIMIT 1', (key,)
+        ).fetchone() is not None
+
+    def clear(self):
+        raise TypeError('Cache snapshots are read-only')
+
+    def close(self):
+        """Close this storage's connection to the snapshot database"""
+        if not self._closed:
+            self._connection.close()
+            self._connection = None
+            self._closed = True
+
+    def __del__(self):
+        try:
+            self.close()
+        except AttributeError:
+            pass
+
+
+class SQLiteSnapshot(BaseCache):
+    """Read-only, point-in-time snapshot of a :py:class:`SQLiteCache`.
+
+    Create one with :py:meth:`SQLiteCache.snapshot`. At creation time the cache database is copied
+    into a private in-memory database, so both cached responses and redirect mappings stay frozen
+    at that moment and are unaffected by concurrent refreshes or deletions in the original cache.
+    The copy is made with SQLite's online backup API, which produces a consistent snapshot even if
+    another process is writing to the cache.
+
+    Snapshot reads never make network requests; keys missing from the snapshot raise ``KeyError``
+    (or return the default from :py:meth:`get_response`). Normal writes to the original cache can
+    continue while a snapshot is open. Supports use as a context manager, which closes the snapshot
+    and releases its in-memory copy on exit::
+
+        >>> with backend.snapshot() as snapshot:
+        ...     response = snapshot.get_response(cache_key)
+    """
+
+    def __init__(self, cache: 'SQLiteCache'):
+        super().__init__(cache_name=cache.cache_name)
+        self._settings = cache._settings
+        self._source_path = cache.db_path
+        memory_uri = f'file:requests_cache_snapshot_{uuid4().hex}?mode=memory&cache=shared'
+        connection_kwargs = dict(cache.responses.connection_kwargs)
+        connection_kwargs['uri'] = True
+        connection_kwargs.setdefault('check_same_thread', False)
+        # This connection keeps the shared in-memory database alive until the snapshot is closed
+        self._keeper = sqlite3.connect(memory_uri, **connection_kwargs)
+        self.responses = SQLiteSnapshotStorage(
+            memory_uri,
+            cache.responses.table_name,
+            serializer=cache.responses.serializer,
+            **connection_kwargs,
+        )
+        self.redirects = SQLiteSnapshotStorage(
+            memory_uri,
+            cache.redirects.table_name,
+            serializer=None,
+            **connection_kwargs,
+        )
+        self._closed = False
+        self._copy_database(cache)
+
+    def _copy_database(self, cache: 'SQLiteCache'):
+        """Copy the source cache into the private in-memory database in consistent steps"""
+        path = str(cache.db_path)
+        if 'cache=shared' in path or 'mode=memory' in path:
+            # A shared in-memory database holds both tables behind one connection; hold the shared
+            # backend lock so in-process writes cannot interleave with the copy
+            with cache.responses._lock:
+                cache.responses._connection.backup(self._keeper)
+        elif ':memory:' in path:
+            # A plain ':memory:' path gives each storage its own private database, which cannot be
+            # backed up or attached from another connection, so copy tables individually
+            with cache.responses._lock:
+                for source in self._source_connections(cache):
+                    self._copy_tables(source)
+        else:
+            # A one-shot backup pins a single point in time; chunked backups could interleave
+            # writes and lose point-in-time consistency
+            source = self._open_source(cache)
+            try:
+                source.backup(self._keeper)
+            finally:
+                source.close()
+        # Release locks on the shared in-memory database so snapshot storage connections can read
+        self._keeper.commit()
+
+    def _copy_tables(self, source: sqlite3.Connection):
+        tables = [
+            row[0]
+            for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        ]
+        for table in tables:
+            ddl = source.execute(
+                'SELECT sql FROM sqlite_master WHERE type="table" AND name=?', (table,)
+            ).fetchone()[0]
+            self._keeper.execute(ddl)
+            columns = [row[1] for row in source.execute(f'PRAGMA table_info({table})')]
+            marks = ','.join('?' * len(columns))
+            rows = source.execute(f'SELECT {",".join(columns)} FROM {table}').fetchall()
+            self._keeper.executemany(
+                f'INSERT INTO {table} ({",".join(columns)}) VALUES ({marks})', rows
+            )
+        for (ddl,) in source.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+        ):
+            self._keeper.execute(ddl.replace('CREATE INDEX', 'CREATE INDEX IF NOT EXISTS', 1))
+
+    @staticmethod
+    def _source_connections(cache: 'SQLiteCache') -> List[sqlite3.Connection]:
+        connections = []
+        for storage in (cache.responses, cache.redirects):
+            if not any(storage._connection is existing for existing in connections):
+                connections.append(storage._connection)
+        return connections
+
+    def _open_source(self, cache: 'SQLiteCache') -> sqlite3.Connection:
+        connection_kwargs = dict(cache.responses.connection_kwargs)
+        connection_kwargs['uri'] = True
+        connection_kwargs.setdefault('check_same_thread', False)
+        return sqlite3.connect(_readonly_uri(cache.db_path), **connection_kwargs)
+
+    @property
+    def db_path(self) -> StrOrPath:
+        return self._source_path
+
+    def close(self):
+        """Close snapshot connections and release the in-memory copy"""
+        if self._closed:
+            return
+        self.responses.close()
+        self.redirects.close()
+        self._keeper.close()
+        self._closed = True
+
+    def __enter__(self) -> 'SQLiteSnapshot':
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except AttributeError:
+            pass
+
+
+def _readonly_uri(db_path: StrOrPath) -> str:
+    """Build a read-only SQLite URI for a file-based database path"""
+    path = Path(db_path).expanduser().absolute()
+    return f'file:{quote(path.as_posix(), safe="/")}?mode=ro'
 
 
 def _format_sequence(values: Collection) -> Tuple[str, List]:

@@ -88,6 +88,27 @@ enabled with the `wal` option:
 >>> backend = SQLiteCache(wal=True)
 ```
 
+## Snapshots
+For workloads that read several related pages (for example a list page plus its detail pages) while
+another process is refreshing the cache, a read-only, point-in-time view can be opened with
+{py:meth}`.SQLiteCache.snapshot`:
+```python
+>>> backend = SQLiteCache()
+>>> with backend.snapshot() as snapshot:
+...     response = snapshot.get_response(cache_key)
+```
+
+When the snapshot is opened, the current database is copied into a private in-memory database:
+
+- Cached responses and redirect mappings stay fixed at that moment, even if another thread or
+  process refreshes or deletes entries in the original cache afterward.
+- The snapshot is strictly read-only and never makes network requests; a key missing from the
+  snapshot is an explicit miss (`KeyError` on the dict-like storages, or the default from
+  {py:meth}`.BaseCache.get_response`).
+- Normal writes to the original cache can continue while the snapshot is open.
+- Closing the snapshot (explicitly with `close()` or by exiting the context manager) releases its
+  in-memory copy and connections.
+
 ## Hosting Services and Filesystem Compatibility
 There are some caveats to using SQLite with some hosting services, based on what kind of storage is
 available:

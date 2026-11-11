@@ -39,9 +39,9 @@ except ImportError as e:
     RedisCache = RedisDict = RedisHashDict = get_placeholder_class(e)  # type: ignore
 
 try:
-    from .sqlite import SQLiteCache, SQLiteDict
+    from .sqlite import SQLiteCache, SQLiteDict, SQLiteSnapshot
 except ImportError as e:
-    SQLiteCache = SQLiteDict = get_placeholder_class(e)  # type: ignore
+    SQLiteCache = SQLiteDict = SQLiteSnapshot = get_placeholder_class(e)  # type: ignore
 
 try:
     from .filesystem import FileCache, FileDict, LRUFileDict
