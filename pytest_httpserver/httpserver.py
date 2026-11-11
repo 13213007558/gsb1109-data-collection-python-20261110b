@@ -1043,6 +1043,12 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         Attribute containing the http status code (int) which will be the response
         status when no matcher is found for the request. By default, it is set to *500*
         but it can be overridden to any valid http status code such as *404* if needed.
+
+    .. py:attribute:: forbidden_requests
+
+        Attribute containing the list of :py:class:`werkzeug.Request` objects which
+        matched a forbidden matcher registered by :py:meth:`expect_forbidden_request`.
+        Verified by :py:meth:`check_forbidden`.
     """
 
     DEFAULT_LISTEN_HOST = "localhost"
@@ -1066,6 +1072,8 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         self.ordered_handlers: list[RequestHandler] = []
         self.oneshot_handlers = RequestHandlerList()
         self.handlers = RequestHandlerList()
+        self.forbidden_matchers: list[RequestMatcher] = []
+        self.forbidden_requests: list[Request] = []
         self.permanently_failed = False
         if default_waiting_settings is not None:
             self.default_waiting_settings = default_waiting_settings
@@ -1109,16 +1117,26 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         """
         super().clear()
         self.clear_all_handlers()
+        self.clear_forbidden()
         self.permanently_failed = False
 
     def clear_all_handlers(self) -> None:
         """
-        Clears all types of the handlers (ordered, oneshot, permanent)
+        Clears all types of the handlers (ordered, oneshot, permanent) and the
+        forbidden matchers.
         """
 
         self.ordered_handlers = []
         self.oneshot_handlers = RequestHandlerList()
         self.handlers = RequestHandlerList()
+        self.forbidden_matchers = []
+
+    def clear_forbidden(self) -> None:
+        """
+        Clears the list of the forbidden requests received.
+        """
+
+        self.forbidden_requests = []
 
     def expect(self, matcher: RequestMatcher, handler_type: HandlerType = HandlerType.PERMANENT) -> RequestHandler:
         """
@@ -1344,6 +1362,125 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             **({"data_form": data_form} if data_form is not None else {}),
         )
 
+    def expect_forbidden_request(
+        self,
+        uri: str | URIPattern | Pattern[str],
+        method: str = METHOD_ALL,
+        data: str | bytes | None = None,
+        data_encoding: str = "utf-8",
+        headers: Mapping[str, str] | None = None,
+        query_string: QueryMatcher | str | bytes | Mapping[str, str] | None = None,
+        header_value_matcher: HVMATCHER_T | None = None,
+        json: Any = UNDEFINED,
+        data_form: Mapping[str, str] | None = None,
+    ) -> RequestMatcher:
+        """
+        Create and register a forbidden request matcher.
+
+        A forbidden matcher declares a request that must never be made. When an
+        incoming request matches it, the server records the request as forbidden,
+        responds with *403 Forbidden* without calling any request handler (so no
+        handler side effects are produced), and the request is still added to the
+        request log. Forbidden matchers are checked before any ordered, oneshot,
+        or permanent handler.
+
+        Forbidden requests are verified by :py:meth:`check_forbidden`, which is
+        also called by :py:meth:`check` and by the ``httpserver`` pytest fixtures
+        when the test finishes, so a passing test needs no manual verification.
+
+        :param uri: URI of the request. This must be an absolute path starting with ``/``, a
+            :py:class:`URIPattern` object, or a regular expression compiled by :py:func:`re.compile`.
+        :param method: HTTP method of the request. If not specified (or `METHOD_ALL`
+            specified), all HTTP requests will match. Case insensitive.
+        :param data: payload of the HTTP request. This could be a string (utf-8 encoded
+            by default, see `data_encoding`) or a bytes object.
+        :param data_encoding: the encoding used for data parameter if data is a string.
+        :param headers: dictionary of the headers of the request to be matched
+        :param query_string: the http query string, after ``?``, such as ``username=user``.
+            If string is specified it will be encoded to bytes with the encode method of
+            the string. If dict is specified, it will be matched to the ``key=value`` pairs
+            specified in the request. If multiple values specified for a given key, the first
+            value will be used. If multiple values needed to be handled, use ``MultiDict``
+            object from werkzeug.
+        :param header_value_matcher: :py:class:`HeaderValueMatcher` that matches
+            values of headers, or a ``Callable[[str, Optional[str], str], bool]``
+            receiving the header key (from `headers`), header value (or `None`) and the expected
+            value (from `headers`) and should return ``True`` if the header matches, ``False`` otherwise.
+        :param json: a python object (eg. a dict) whose value will be compared to the request body after it
+            is loaded as json. If load fails, this matcher will be failed also. *Content-Type* is not checked.
+            If that's desired, add it to the headers parameter.
+        :param data_form: expected form fields, parsed by werkzeug using the request's *Content-Type*.
+            A mapping matches the first value for each field; a ``MultiDict`` matches all values.
+            Mutually exclusive with `data` and `json`.
+
+        :return: Created and registered :py:class:`RequestMatcher`.
+
+        Parameters `json`, `data`, and `data_form` are mutually exclusive.
+        """
+
+        matcher = self.create_matcher(
+            uri,
+            method=method.upper(),
+            data=data,
+            data_encoding=data_encoding,
+            headers=headers,
+            query_string=query_string,
+            header_value_matcher=header_value_matcher,
+            json=json,
+            **({"data_form": data_form} if data_form is not None else {}),
+        )
+        self.forbidden_matchers.append(matcher)
+        return matcher
+
+    def match_forbidden(self, request: Request) -> RequestMatcher | None:
+        """
+        Returns the first forbidden matcher matching the specified request. Otherwise, it returns `None`.
+        """
+        for matcher in self.forbidden_matchers:
+            if matcher.match(request):
+                return matcher
+        return None
+
+    def respond_forbidden(self, request: Request, matcher: RequestMatcher) -> Response:
+        """
+        Record a forbidden request and respond to it without calling any handler.
+
+        The request is appended to :py:attr:`forbidden_requests` so it can be
+        reported by :py:meth:`check_forbidden`, and a *403 Forbidden* response
+        is returned.
+        """
+
+        self.forbidden_requests.append(request)
+        text = "Forbidden request {!r} matched forbidden matcher {!r}.".format(request, matcher)
+        return Response(text, status=HTTPStatus.FORBIDDEN.value)
+
+    def check_forbidden(self) -> None:
+        """
+        Raise AssertionError when at least one forbidden request has been received.
+
+        Forbidden requests are those matching a matcher registered by
+        :py:meth:`expect_forbidden_request`. When no forbidden request arrived,
+        this method returns silently, so it can be called unconditionally at the
+        end of a test.
+        """
+        if not self.forbidden_requests:
+            return
+
+        lines = ["Forbidden request(s) received:"]
+        lines.extend("    {!r}".format(request) for request in self.forbidden_requests)
+        self.clear_forbidden()
+        raise AssertionError("\n".join(lines))
+
+    def check(self) -> None:
+        """
+        Raises AssertionError or Errors raised in handlers.
+
+        Runs :py:meth:`check_assertions`, :py:meth:`check_handler_errors`, and
+        :py:meth:`check_forbidden`.
+        """
+        super().check()
+        self.check_forbidden()
+
     def format_matchers(self) -> str:
         """
         Return a string representation of the matchers
@@ -1369,6 +1506,12 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         lines.append("")
         lines.append("Persistent matchers:")
         lines.extend(format_handlers(self.handlers))
+        lines.append("")
+        lines.append("Forbidden matchers:")
+        if self.forbidden_matchers:
+            lines.extend("    {!r}".format(matcher) for matcher in self.forbidden_matchers)
+        else:
+            lines.append("    none")
 
         return "\n".join(lines)
 
@@ -1404,7 +1547,11 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         This method tries to find the request handler whose matcher matches the request, and
         then calls it in order to serve the request.
 
-        First, the request is checked for the ordered matchers. If there's an ordered matcher,
+        First, the request is checked against the forbidden matchers. If there's a
+        match, the request is recorded as forbidden and a *403 Forbidden* response
+        is returned without calling any request handler.
+
+        Then, the request is checked for the ordered matchers. If there's an ordered matcher,
         it must match the request, otherwise the server will be put into a `permanent failure`
         mode in which it makes all request failed - this is the intended way of working of ordered
         matchers.
@@ -1418,6 +1565,10 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             self._readiness_check_pending = False
 
             return Response(HTTPStatus.OK.phrase, status=HTTPStatus.OK.value)
+
+        forbidden_matcher = self.match_forbidden(request)
+        if forbidden_matcher is not None:
+            return self.respond_forbidden(request, forbidden_matcher)
 
         if self.permanently_failed:
             return self.respond_permanent_failure()

@@ -71,10 +71,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:  # n
 
 
 @pytest.fixture
-def httpserver(make_httpserver: HTTPServer) -> HTTPServer:
+def httpserver(make_httpserver: HTTPServer) -> Generator[HTTPServer, None, None]:
     server = make_httpserver
     server.clear()
-    return server
+    yield server
+    server.check_forbidden()
 
 
 @pytest.fixture(scope="session")
@@ -90,10 +91,11 @@ def make_httpserver_ipv4(
 
 
 @pytest.fixture
-def httpserver_ipv4(make_httpserver_ipv4: HTTPServer) -> HTTPServer:
+def httpserver_ipv4(make_httpserver_ipv4: HTTPServer) -> Generator[HTTPServer, None, None]:
     server = make_httpserver_ipv4
     server.clear()
-    return server
+    yield server
+    server.check_forbidden()
 
 
 @pytest.fixture(scope="session")
@@ -109,7 +111,8 @@ def make_httpserver_ipv6(
 
 
 @pytest.fixture
-def httpserver_ipv6(make_httpserver_ipv6: HTTPServer) -> HTTPServer:
+def httpserver_ipv6(make_httpserver_ipv6: HTTPServer) -> Generator[HTTPServer, None, None]:
     server = make_httpserver_ipv6
     server.clear()
-    return server
+    yield server
+    server.check_forbidden()

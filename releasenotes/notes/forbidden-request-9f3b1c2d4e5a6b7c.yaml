@@ -1,0 +1,12 @@
+features:
+  - |
+    Add ``HTTPServer.expect_forbidden_request()``, which registers a forbidden
+    request matcher using the same method, URI, and data conventions as
+    ``expect_request()``. A matching request is intercepted before any ordered,
+    oneshot, or permanent handler, so no handler side effects are produced; the
+    server responds with *403 Forbidden* and the request is still recorded in
+    the request log. Received forbidden requests are reported by the new
+    ``HTTPServer.check_forbidden()`` method, which is also called by
+    ``HTTPServer.check()`` and by the ``httpserver`` pytest fixtures when the
+    test finishes, so a test that never triggers a forbidden request needs no
+    manual verification.

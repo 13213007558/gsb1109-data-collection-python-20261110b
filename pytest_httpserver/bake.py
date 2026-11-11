@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from .httpserver import HTTPServer
     from .httpserver import RequestHandler
+    from .httpserver import RequestMatcher
     from .httpserver import RequestMatcherKwargs
     from .httpserver import URIPattern
 
@@ -99,3 +100,11 @@ class BakedHTTPServer:
     ) -> RequestHandler:
         """Create and register an ordered request handler, using baked defaults."""
         return self._server.expect_ordered_request(uri, **self._merge_kwargs(kwargs))
+
+    def expect_forbidden_request(
+        self,
+        uri: str | URIPattern | Pattern[str],
+        **kwargs: Unpack[RequestMatcherKwargs],
+    ) -> RequestMatcher:
+        """Create and register a forbidden request matcher, using baked defaults."""
+        return self._server.expect_forbidden_request(uri, **self._merge_kwargs(kwargs))
