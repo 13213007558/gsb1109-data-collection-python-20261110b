@@ -8,6 +8,13 @@ Unreleased yet
 
 Features:
 
+* Add an ``allowEncodingChange`` option (also accepted by
+  ``HTMLParser.parse`` and ``parseFragment``) for byte streams that can only
+  be read once and cannot be rewound. When set to ``False`` the encoding is
+  settled as soon as decoding starts; a later ``<meta charset>`` declaration
+  can only confirm the encoding in use or be recorded as a conflict, exposed
+  through the ``encodingChangeResult`` and ``encodingConflicts`` attributes,
+  instead of rewinding and re-parsing the already-read bytes.
 * Add support for the ``<wbr>`` element in the sanitizer, `which indicates
   a line break opportunity <https://html.spec.whatwg.org/#the-wbr-element>`_.
   This element is allowed by default. (#395) (Thank you, Tom Most!)

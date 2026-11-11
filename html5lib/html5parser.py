@@ -169,6 +169,36 @@ class HTMLParser(object):
             return None
         return self.tokenizer.stream.charEncoding[0].name
 
+    @property
+    def encodingChangeResult(self):
+        """Disposition of the last encoding declaration encountered, or
+        :obj:`None` before any input stream exists.
+
+        One of the ``ENCODING_*`` constants from :mod:`html5lib._inputstream`:
+
+        * ``ENCODING_UNDETERMINED`` - no declaration has been processed yet
+        * ``ENCODING_CONFIRMED`` - a declaration matched the encoding in use
+        * ``ENCODING_IGNORED`` - a conflicting declaration was ignored because
+          the encoding had already been settled (fixed-encoding mode only)
+        * ``ENCODING_REPARSED`` - the encoding was changed and the stream was
+          re-parsed from the start (default seekable mode only)
+        """
+        if not hasattr(self, 'tokenizer'):
+            return None
+        return getattr(self.tokenizer.stream, "encodingChangeResult", None)
+
+    @property
+    def encodingConflicts(self):
+        """List of ``(declared_encoding, used_encoding)`` name pairs for
+        encoding declarations that were ignored in fixed-encoding mode.
+
+        Empty when parsing with the default reparse behaviour or when no
+        conflicting declaration was ever seen.
+        """
+        if not hasattr(self, 'tokenizer'):
+            return []
+        return list(getattr(self.tokenizer.stream, "encodingConflicts", ()))
+
     def isHTMLIntegrationPoint(self, element):
         if (element.name == "annotation-xml" and
                 element.namespace == namespaces["mathml"]):
@@ -272,6 +302,13 @@ class HTMLParser(object):
             the encoding.  If specified, that encoding will be used,
             regardless of any BOM or later declaration (such as in a meta
             element).
+
+            Pass ``allowEncodingChange=False`` for a byte stream that can only
+            be read once and cannot be rewound. The encoding then becomes
+            settled as soon as decoding starts; a later declaration can only
+            confirm it or be ignored, and ignored conflicts are available on
+            the parser's ``encodingConflicts`` attribute instead of causing a
+            re-parse.
 
         :arg scripting: treat noscript elements as if JavaScript was turned on
 
@@ -714,9 +751,15 @@ class InHeadPhase(Phase):
         token["selfClosingAcknowledged"] = True
 
         attributes = token["data"]
-        if self.parser.tokenizer.stream.charEncoding[1] == "tentative":
+        stream = self.parser.tokenizer.stream
+        # In the default mode only a tentative encoding may be changed. In
+        # fixed-encoding mode declarations are forwarded even once the
+        # encoding has been settled, so a late one can be confirmed or
+        # recorded as a conflict instead of silently disappearing.
+        if (stream.charEncoding[1] == "tentative" or
+                not getattr(stream, "allowEncodingChange", True)):
             if "charset" in attributes:
-                self.parser.tokenizer.stream.changeEncoding(attributes["charset"])
+                stream.changeEncoding(attributes["charset"])
             elif ("content" in attributes and
                   "http-equiv" in attributes and
                   attributes["http-equiv"].lower() == "content-type"):
@@ -727,7 +770,7 @@ class InHeadPhase(Phase):
                 data = _inputstream.EncodingBytes(attributes["content"].encode("utf-8"))
                 parser = _inputstream.ContentAttrParser(data)
                 codec = parser.parse()
-                self.parser.tokenizer.stream.changeEncoding(codec)
+                stream.changeEncoding(codec)
 
     def startTagTitle(self, token):
         self.parser.parseRCDataRawtext(token, "RCDATA")

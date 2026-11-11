@@ -163,3 +163,16 @@ the following way:
 * If all else fails, the default encoding will be used. This is usually
   `Windows-1252 <http://en.wikipedia.org/wiki/Windows-1252>`_, which is
   a common fallback used by Web browsers.
+
+When a later ``<meta charset>`` declaration disagrees with the tentative
+encoding, html5lib normally rewinds the byte stream and re-parses from the
+start. This only works for seekable input. For a stream that is consumed as
+it arrives and cannot be rewound, pass ``allowEncodingChange=False`` to
+:meth:`~html5lib.html5parser.HTMLParser.parse`. The encoding is then settled
+as soon as decoding begins: a later declaration either confirms the encoding
+in use or is recorded as a conflict rather than being applied. Query
+:attr:`~html5lib.html5parser.HTMLParser.encodingChangeResult` for the
+disposition of the last declaration and
+:attr:`~html5lib.html5parser.HTMLParser.encodingConflicts` for the
+``(declared_encoding, used_encoding)`` pairs that were ignored. Pages without
+a conflicting declaration produce the same tree as a normal one-shot parse.

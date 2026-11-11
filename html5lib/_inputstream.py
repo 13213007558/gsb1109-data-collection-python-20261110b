@@ -47,6 +47,14 @@ ascii_punctuation_re = re.compile("[\u0009-\u000D\u0020-\u002F\u003A-\u0040\u005
 # Cache for charsUntil()
 charsUntilRegEx = {}
 
+# Possible outcomes of an encoding declaration handed to
+# HTMLBinaryInputStream.changeEncoding(), queryable through the
+# encodingChangeResult attribute.
+ENCODING_UNDETERMINED = "undetermined"
+ENCODING_CONFIRMED = "confirmed"
+ENCODING_IGNORED = "ignored"
+ENCODING_REPARSED = "reparsed"
+
 
 class BufferedStream(object):
     """Buffering for streams that do not have buffering of their own
@@ -123,6 +131,11 @@ class BufferedStream(object):
 
 
 def HTMLInputStream(source, **kwargs):
+    # This only applies to byte streams; a unicode source already has a
+    # certain encoding, so consume it here rather than handing it to a
+    # constructor that would not understand it.
+    allowEncodingChange = kwargs.pop("allowEncodingChange", True)
+
     # Work around Python bug #20007: read(0) closes the connection.
     # http://bugs.python.org/issue20007
     if (isinstance(source, http_client.HTTPResponse) or
@@ -142,7 +155,9 @@ def HTMLInputStream(source, **kwargs):
 
         return HTMLUnicodeInputStream(source, **kwargs)
     else:
-        return HTMLBinaryInputStream(source, **kwargs)
+        return HTMLBinaryInputStream(source,
+                                     allowEncodingChange=allowEncodingChange,
+                                     **kwargs)
 
 
 class HTMLUnicodeInputStream(object):
@@ -385,7 +400,8 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
 
     def __init__(self, source, override_encoding=None, transport_encoding=None,
                  same_origin_parent_encoding=None, likely_encoding=None,
-                 default_encoding="windows-1252", useChardet=True):
+                 default_encoding="windows-1252", useChardet=True,
+                 allowEncodingChange=True):
         """Initialises the HTMLInputStream.
 
         HTMLInputStream(source, [encoding]) -> Normalized stream from source
@@ -398,10 +414,24 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
         regardless of any BOM or later declaration (such as in a meta
         element)
 
+        :arg allowEncodingChange: when True (the default) a later encoding
+            declaration that disagrees with the current, still tentative,
+            encoding rewinds the stream and re-parses everything from the
+            start, which requires a seekable byte stream. When False the
+            current encoding is treated as settled as soon as bytes have been
+            handed to the decoder: a later declaration can confirm the
+            current encoding or be ignored, but the already-read bytes are
+            never rewound or re-decoded. The outcome of every declaration is
+            recorded in ``encodingChangeResult`` and can be queried by a
+            caller that starts its bookkeeping once the encoding is settled.
+
         """
         # Raw Stream - for unicode objects this will encode to utf-8 and set
         #              self.charEncoding as appropriate
         self.rawStream = self.openStream(source)
+
+        # Set before the superclass __init__ runs, since it calls reset().
+        self.allowEncodingChange = allowEncodingChange
 
         HTMLUnicodeInputStream.__init__(self, self.rawStream)
 
@@ -418,6 +448,14 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
         self.likely_encoding = likely_encoding
         self.default_encoding = default_encoding
 
+        # Disposition of the last encoding declaration that was seen while
+        # the encoding was still tentative.
+        self.encodingChangeResult = ENCODING_UNDETERMINED
+        # Encoding declarations that could not be honoured once the encoding
+        # had been settled in allowEncodingChange=False mode. Each entry is
+        # a (declared_encoding, current_encoding) tuple of encoding names.
+        self.encodingConflicts = []
+
         # Determine encoding
         self.charEncoding = self.determineEncoding(useChardet)
         assert self.charEncoding[0] is not None
@@ -427,6 +465,11 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
 
     def reset(self):
         self.dataStream = self.charEncoding[0].codec_info.streamreader(self.rawStream, 'replace')
+        # The decoder now owns the byte stream: from here on bytes are being
+        # consumed in the chosen encoding, so an explicit (no reparse)
+        # stream must not switch encoding underneath the caller any more.
+        if not self.allowEncodingChange:
+            self.charEncoding = (self.charEncoding[0], "certain")
         HTMLUnicodeInputStream.reset(self)
 
     def openStream(self, source):
@@ -511,20 +554,43 @@ class HTMLBinaryInputStream(HTMLUnicodeInputStream):
         return lookupEncoding("windows-1252"), "tentative"
 
     def changeEncoding(self, newEncoding):
-        assert self.charEncoding[1] != "certain"
-        newEncoding = lookupEncoding(newEncoding)
-        if newEncoding is None:
+        # In the default mode the encoding may only be changed while it is
+        # still tentative. In fixed-encoding mode every declaration is
+        # forwarded so it can be confirmed or recorded as a conflict.
+        if self.allowEncodingChange:
+            assert self.charEncoding[1] != "certain"
+        declaredEncoding = lookupEncoding(newEncoding)
+        if declaredEncoding is None:
+            # An unparseable declaration never settles anything.
             return
-        if newEncoding.name in ("utf-16be", "utf-16le"):
-            newEncoding = lookupEncoding("utf-8")
-            assert newEncoding is not None
-        elif newEncoding == self.charEncoding[0]:
+        if declaredEncoding.name in ("utf-16be", "utf-16le"):
+            declaredEncoding = lookupEncoding("utf-8")
+            assert declaredEncoding is not None
+
+        if declaredEncoding == self.charEncoding[0]:
+            # The declaration matches the encoding in use: it simply settles
+            # the question, no matter which mode we are running in.
             self.charEncoding = (self.charEncoding[0], "certain")
-        else:
-            self.rawStream.seek(0)
-            self.charEncoding = (newEncoding, "certain")
-            self.reset()
-            raise _ReparseException("Encoding changed from %s to %s" % (self.charEncoding[0], newEncoding))
+            self.encodingChangeResult = ENCODING_CONFIRMED
+            return
+
+        if not self.allowEncodingChange:
+            # The caller has fixed the encoding for a stream that cannot be
+            # rewound. Keep decoding the already-consumed bytes with the
+            # original encoding instead of switching underneath them, and
+            # make the conflicting declaration queryable rather than
+            # raising or silently dropping it.
+            self.encodingConflicts.append((declaredEncoding.name,
+                                           self.charEncoding[0].name))
+            self.encodingChangeResult = ENCODING_IGNORED
+            return
+
+        self.rawStream.seek(0)
+        self.charEncoding = (declaredEncoding, "certain")
+        self.encodingChangeResult = ENCODING_REPARSED
+        self.reset()
+        raise _ReparseException("Encoding changed from %s to %s" %
+                                (self.charEncoding[0], declaredEncoding))
 
     def detectBOM(self):
         """Attempts to detect at BOM at the start of the stream. If
