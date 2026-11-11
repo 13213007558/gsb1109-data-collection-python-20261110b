@@ -701,6 +701,48 @@ Example:
    :language: python
 
 
+Querying only the requests after a position
+--------------------------------------------
+
+Sometimes the log contains requests the test is not interested in, for
+example a warm-up GET performed by a client while it starts. Clearing the
+shared log is not an option when several observers query the same server.
+
+For these cases a saveable *position* can be taken with
+:py:meth:`pytest_httpserver.HTTPServer.log_position`. The returned
+:py:class:`pytest_httpserver.LogPosition` marks the end of the log at that
+moment. It can be passed as the ``position`` argument of
+:py:meth:`pytest_httpserver.HTTPServer.iter_log`,
+:py:meth:`pytest_httpserver.HTTPServer.iter_matching_requests`,
+:py:meth:`pytest_httpserver.HTTPServer.get_matching_requests_count` and
+:py:meth:`pytest_httpserver.HTTPServer.assert_request_made`, which then
+consider only the entries appended after the position was created.
+
+Taking a position neither copies nor removes log entries. Multiple positions
+can be kept and queried independently, and querying a position does not
+consume it, so the same position can be read repeatedly while the shared log
+stays intact.
+
+The log records the *completion order* of the requests: an entry is appended
+once its response has been produced. When the server runs with
+``threaded=True`` and requests are processed concurrently, the completion
+order may differ from the order in which the requests arrived, so a request
+which arrived first but was processed slowly can be logged after a
+later-arriving request which finished earlier.
+
+A position remains valid while entries are appended. It becomes invalid when
+the log is reset with :py:meth:`pytest_httpserver.HTTPServer.clear_log` or
+:py:meth:`pytest_httpserver.HTTPServer.clear`, or when it is used with a
+different server instance (for example a server created to replace a reset
+one). Using an invalid position raises
+:py:class:`pytest_httpserver.InvalidLogPositionError`.
+
+Example:
+
+.. literalinclude :: ../tests/examples/test_howto_log_position.py
+   :language: python
+
+
 Serving requests in parallel
 ----------------------------
 

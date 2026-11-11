@@ -14,6 +14,8 @@ __all__ = [
     "HTTPServer",
     "HTTPServerError",
     "HeaderValueMatcher",
+    "InvalidLogPositionError",
+    "LogPosition",
     "NoHandlerError",
     "RequestHandler",
     "RequestMatcher",
@@ -32,6 +34,8 @@ from .httpserver import Error
 from .httpserver import HeaderValueMatcher
 from .httpserver import HTTPServer
 from .httpserver import HTTPServerError
+from .httpserver import InvalidLogPositionError
+from .httpserver import LogPosition
 from .httpserver import NoHandlerError
 from .httpserver import RequestHandler
 from .httpserver import RequestMatcher

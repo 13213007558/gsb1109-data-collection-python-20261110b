@@ -81,6 +81,14 @@ class HTTPServerError(Error):
     """
 
 
+class InvalidLogPositionError(Error):
+    """
+    Raised when a :py:class:`LogPosition` is used with a server which did not
+    create it, or after the server's log has been reset by
+    :py:meth:`HTTPServerBase.clear` or :py:meth:`HTTPServerBase.clear_log`.
+    """
+
+
 class NoMethodFoundForMatchingHeaderValueError(Error):
     """
     Raised when a :py:class:`HeaderValueMatcher` has no registered method to match the header value.
@@ -690,6 +698,67 @@ class HandlerType(Enum):
     ORDERED = "ordered"
 
 
+class LogPosition:
+    """
+    An opaque, saveable position in the server's request log.
+
+    Positions are created by :py:meth:`HTTPServerBase.log_position` and are
+    consumed by the log querying methods accepting a ``position`` argument
+    (:py:meth:`HTTPServerBase.iter_log`, :py:meth:`HTTPServerBase.iter_matching_requests`,
+    :py:meth:`HTTPServerBase.get_matching_requests_count` and
+    :py:meth:`HTTPServer.assert_request_made`). They let multiple observers
+    query only the entries appended after the position was taken, for example to
+    ignore the warm-up requests performed while starting a client, without
+    clearing the shared :py:attr:`HTTPServerBase.log`.
+
+    A position only stores the log length at the moment it was created and the
+    identity of the originating server. It does not copy log entries, so taking
+    a position never removes entries and several positions can be used
+    independently. Positions stay valid while entries are appended, including
+    when the log grows longer than the stored length.
+
+    A position becomes invalid, and every query using it raises
+    :py:class:`InvalidLogPositionError`, when the log is reset through
+    :py:meth:`HTTPServerBase.clear_log` or :py:meth:`HTTPServerBase.clear`, or
+    when it is presented to a different server instance (for example a server
+    created to replace a reset one).
+
+    This class should not be instantiated directly; use
+    :py:meth:`HTTPServerBase.log_position`.
+    """
+
+    def __init__(self, server: HTTPServerBase, offset: int) -> None:
+        self._server = server
+        self._offset = offset
+        self._valid = True
+
+    @property
+    def offset(self) -> int:
+        """
+        Index of the first log entry visible from this position.
+
+        Entries appended before the position was taken have indexes lower than
+        the offset and are not returned by queries using the position.
+        """
+        return self._offset
+
+    def is_valid(self) -> bool:
+        """
+        Return whether the position can still be used.
+
+        A position is valid until the originating server resets its log with
+        :py:meth:`HTTPServerBase.clear_log` or :py:meth:`HTTPServerBase.clear`.
+        Appending new entries never invalidates a position.
+        """
+        return self._valid and self._server.is_log_position_valid(self)
+
+    def _invalidate(self) -> None:
+        self._valid = False
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__} offset={self._offset} valid={self.is_valid()}>"
+
+
 class HTTPServerBase(abc.ABC):  # pylint: disable=too-many-instance-attributes
     """
     Abstract HTTP server with error handling.
@@ -733,6 +802,7 @@ class HTTPServerBase(abc.ABC):  # pylint: disable=too-many-instance-attributes
         self.assertions: list[str | AssertionError] = []
         self.handler_errors: list[Exception] = []
         self.log: list[tuple[Request, Response]] = []
+        self._log_positions: list[LogPosition] = []
         self.ssl_context = ssl_context
         self.threaded = threaded
         self.no_handler_status_code = 500
@@ -769,9 +839,85 @@ class HTTPServerBase(abc.ABC):  # pylint: disable=too-many-instance-attributes
     def clear_log(self) -> None:
         """
         Clears the list of log entries
+
+        All :py:class:`LogPosition` objects handed out before the reset become
+        invalid: using them afterwards raises
+        :py:class:`InvalidLogPositionError`.
         """
 
         self.log = []
+        for position in self._log_positions:
+            position._invalidate()  # noqa: SLF001
+        self._log_positions = []
+
+    def log_position(self) -> LogPosition:
+        """
+        Return a saveable position representing the end of the current log.
+
+        The position can be passed as ``position`` to the log querying methods
+        (:py:meth:`iter_log`, :py:meth:`iter_matching_requests`,
+        :py:meth:`get_matching_requests_count` and
+        :py:meth:`HTTPServer.assert_request_made`) to observe only entries
+        appended after this call. Entries already logged, such as warm-up
+        requests made during startup, are ignored without clearing the shared
+        :py:attr:`log`.
+
+        Taking a position does not copy or remove log entries, and multiple
+        positions can be kept and queried independently by different
+        observers. Positions remain valid while entries are appended, but
+        resetting the log with :py:meth:`clear_log` or :py:meth:`clear`
+        invalidates every position issued before the reset.
+        """
+
+        position = LogPosition(self, len(self.log))
+        self._log_positions.append(position)
+        return position
+
+    def is_log_position_valid(self, position: LogPosition) -> bool:
+        """
+        Return whether the given :py:class:`LogPosition` belongs to this server
+        and has not been invalidated by a log reset.
+
+        Positions created by another server instance are always invalid.
+        """
+
+        return position._server is self and position._valid  # noqa: SLF001
+
+    def _resolve_log_slice(self, position: LogPosition | None) -> slice:
+        if position is None:
+            return slice(None)
+        if not self.is_log_position_valid(position):
+            raise InvalidLogPositionError(
+                "Log position {!r} is invalid: it was created by another server or the log was cleared.".format(
+                    position
+                )
+            )
+        return slice(position.offset, None)
+
+    def iter_log(self, position: LogPosition | None = None) -> Iterable[tuple[Request, Response]]:
+        """
+        Iterate over the request-response pairs recorded in the log.
+
+        Without a ``position``, every log entry is yielded, in the order in
+        which the requests completed (that is, the order in which
+        :py:meth:`application` appended them). When a :py:class:`LogPosition`
+        is given, only entries appended after the position was created are
+        yielded; the shared log is not modified.
+
+        When the server runs with ``threaded=True`` and requests are processed
+        concurrently, the arrival order of the requests and the order in which
+        they complete can differ. The log (and therefore this method) records
+        the **completion order**: an entry is appended only after its response
+        has been produced, so a request which arrived first but was processed
+        slowly may appear after a later-arriving, faster request. Use the
+        request objects themselves if the arrival order must be reconstructed.
+
+        :param position: optional position obtained from :py:meth:`log_position`.
+            Entries logged before the position was taken are skipped.
+        :return: an iterator of ``(request, response)`` tuples.
+        """
+
+        return iter(self.log[self._resolve_log_slice(position)])
 
     def url_for(self, suffix: str) -> str:
         """
@@ -1536,30 +1682,54 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         if self._waiting_settings.raise_assertions and not waiting.result:
             self.check_assertions()
 
-    def iter_matching_requests(self, matcher: RequestMatcher) -> Iterable[tuple[Request, Response]]:
+    def iter_matching_requests(
+        self,
+        matcher: RequestMatcher,
+        position: LogPosition | None = None,
+    ) -> Iterable[tuple[Request, Response]]:
         """
         Queries log for matching requests.
 
+        Entries are examined in completion order, the same order as
+        :py:meth:`iter_log`: with ``threaded=True`` this is the order in which
+        concurrent requests finished processing, not necessarily the order in
+        which they arrived.
 
         :param matcher: the matcher object to match requests
+        :param position: optional position obtained from :py:meth:`log_position`.
+            When given, only entries appended after the position was created
+            are considered; the shared log is left untouched.
         :return: an iterator with request-response pair from the log
         """
 
-        for request, response in self.log:
+        for request, response in self.iter_log(position):
             if matcher.match(request):
                 yield (request, response)
 
-    def get_matching_requests_count(self, matcher: RequestMatcher) -> int:
+    def get_matching_requests_count(
+        self,
+        matcher: RequestMatcher,
+        position: LogPosition | None = None,
+    ) -> int:
         """
         Queries the log for matching requests, returning the number of log
         entries matching for the specified matcher.
 
         :param matcher: the matcher object to match requests
+        :param position: optional position obtained from :py:meth:`log_position`.
+            When given, only entries appended after the position was created
+            are counted.
         :return: the number of log entries matching
         """
-        return len(list(self.iter_matching_requests(matcher)))
+        return len(list(self.iter_matching_requests(matcher, position)))
 
-    def assert_request_made(self, matcher: RequestMatcher, *, count: int = 1) -> None:
+    def assert_request_made(
+        self,
+        matcher: RequestMatcher,
+        *,
+        count: int = 1,
+        position: LogPosition | None = None,
+    ) -> None:
         """
         Check the amount of log entries matching for the matcher specified. By
         default it verifies that exactly one request matching for the matcher
@@ -1569,14 +1739,18 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
 
         :param matcher: the matcher object to match requests
         :param count: the expected number of matches in the log
+        :param position: optional position obtained from :py:meth:`log_position`.
+            When given, only entries appended after the position was created
+            are considered, so requests logged earlier (such as startup
+            warm-up requests) are ignored without clearing the shared log.
         :return: ``None`` if the assert succeeded, raises
             :py:class:`AssertionError` if not.
         """
 
-        matching_count = self.get_matching_requests_count(matcher)
+        matching_count = self.get_matching_requests_count(matcher, position)
         if matching_count != count:
             similar_requests: list[Request] = []
-            for request, _ in self.log:
+            for request, _ in self.iter_log(position):
                 if request.path == matcher.uri:
                     similar_requests.append(request)
 

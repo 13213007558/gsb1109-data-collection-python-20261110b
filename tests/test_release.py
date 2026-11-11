@@ -220,6 +220,7 @@ def test_sdist_contents(build: Build, version: str):
             "test_ip_protocols.py",
             "test_json_matcher.py",
             "test_log_leak.py",
+            "test_log_position.py",
             "test_log_querying.py",
             "test_mixed.py",
             "test_oneshot.py",

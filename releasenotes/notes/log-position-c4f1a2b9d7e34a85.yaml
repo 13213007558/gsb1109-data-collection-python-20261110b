@@ -1,0 +1,15 @@
+---
+features:
+  - |
+    Add saveable log positions for scoped log querying.
+    ``HTTPServer.log_position()`` returns a ``LogPosition`` marking the end of
+    the request log at that moment. It can be passed as ``position`` to
+    ``iter_log()``, ``iter_matching_requests()``,
+    ``get_matching_requests_count()`` and ``assert_request_made()`` to observe
+    only the entries appended afterwards, for example to ignore startup
+    warm-up requests. Taking a position never clears or copies the shared
+    log, positions are reusable, and multiple observers can keep independent
+    positions. The log records request completion order, which under
+    ``threaded=True`` may differ from arrival order. Resetting the log with
+    ``clear_log()`` or ``clear()``, or using a position with another server,
+    invalidates it and makes queries raise ``InvalidLogPositionError``.

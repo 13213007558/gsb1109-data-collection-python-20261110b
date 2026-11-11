@@ -87,6 +87,18 @@ HTTPServerError
     .. autoclass:: HTTPServerError
         :members:
 
+InvalidLogPositionError
+~~~~~~~~~~~~~~~~~~~~~~~
+
+    .. autoclass:: InvalidLogPositionError
+        :members:
+
+LogPosition
+~~~~~~~~~~~
+
+    .. autoclass:: LogPosition
+        :members:
+
 NoHandlerError
 ~~~~~~~~~~~~~~
 
