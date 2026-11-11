@@ -9,6 +9,7 @@ __lazy_modules__ = {
     "openpyxl.styles",
     "openpyxl.utils",
     "openpyxl.workbook",
+    "tablib.sheet_mapping",
 }
 
 import re
@@ -20,6 +21,17 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook import Workbook
 
 import tablib
+
+from ..exceptions import SheetTitleError
+from ..sheet_mapping import (
+    DEFAULT_SHORT_TITLE_LENGTH,
+    LEGEND_ORIGINAL_HEADER,
+    LEGEND_SHORT_HEADER,
+    LEGEND_SHEET_TITLE,
+    SheetTitleImportResult,
+    SheetTitleMapping,
+    unique_sheet_title,
+)
 
 INVALID_TITLE_REGEX = re.compile(r'[\\*?:/\[\]]')
 
@@ -84,24 +96,56 @@ class XLSXFormat:
 
     @classmethod
     def export_book(cls, databook, freeze_panes=True, invalid_char_subst="-",
-                    escape=False, column_width=None):
+                    escape=False, column_width=None, sheet_name_legend=False,
+                    short_title_length=DEFAULT_SHORT_TITLE_LENGTH):
         """Returns XLSX representation of DataBook.
         See export_set().
+
+        If ``sheet_name_legend`` is True, every dataset is exported under a
+        short, unique sheet title and an additional worksheet named
+        :data:`~tablib.sheet_mapping.LEGEND_SHEET_TITLE` maps the short titles
+        back to the original dataset titles. Sheet order is preserved. The
+        legend lets :meth:`import_book` restore the original titles, including
+        titles longer than the 31-character Excel sheet name limit.
+        ``short_title_length`` sets the maximum length of the generated short
+        titles.
         """
 
         wb = Workbook()
         for sheet in wb.worksheets:
             wb.remove(sheet)
+
+        mapping = None
+        if sheet_name_legend:
+            mapping = SheetTitleMapping.from_titles(
+                [dset.title for dset in databook._datasets],
+                max_length=short_title_length,
+            )
+
         for i, dset in enumerate(databook._datasets):
             ws = wb.create_sheet()
-            ws.title = (
-                safe_xlsx_sheet_title(dset.title, invalid_char_subst)
-                if dset.title else f"Sheet{i}"
-            )
+            if mapping is not None:
+                ws.title = mapping.pairs[i][0]
+            else:
+                ws.title = (
+                    safe_xlsx_sheet_title(dset.title, invalid_char_subst)
+                    if dset.title else f"Sheet{i}"
+                )
 
             cls.dset_sheet(dset, ws, freeze_panes=freeze_panes, escape=escape)
 
             cls._adapt_column_width(ws, column_width)
+
+        if mapping is not None:
+            legend = wb.create_sheet()
+            used = set(mapping.short_titles())
+            legend.title = unique_sheet_title(LEGEND_SHEET_TITLE, used)
+            bold = Font(bold=True)
+            for row_index, row in enumerate(mapping.as_rows(), start=1):
+                legend.append(list(row))
+                if row_index == 1:
+                    for cell in legend[1]:
+                        cell.font = bold
 
         stream = BytesIO()
         wb.save(stream)
@@ -134,18 +178,75 @@ class XLSXFormat:
         sheet = xls_book.active
         cls.import_sheet(dset, sheet, headers, skip_lines)
 
+    @staticmethod
+    def _find_legend_sheet(xls_book):
+        """Locate the sheet name legend by its header row, not its position.
+
+        Raises :class:`~tablib.exceptions.SheetTitleError` when a worksheet
+        named :data:`~tablib.sheet_mapping.LEGEND_SHEET_TITLE` exists but does
+        not start with the expected legend header row, which indicates a
+        damaged legend.
+        """
+        for sheet in xls_book.worksheets:
+            first_row = next(sheet.iter_rows(min_row=1, max_row=1), None)
+            values = [cell.value for cell in first_row] if first_row else []
+            header = [("" if value is None else str(value)) for value in values]
+            if header[:2] == [LEGEND_SHORT_HEADER, LEGEND_ORIGINAL_HEADER]:
+                return sheet
+            if sheet.title == LEGEND_SHEET_TITLE:
+                raise SheetTitleError(
+                    f"Worksheet {sheet.title!r} looks like a sheet name legend "
+                    f"but its header row is {header[:2]!r}; expected "
+                    f"[{LEGEND_SHORT_HEADER!r}, {LEGEND_ORIGINAL_HEADER!r}]."
+                )
+        return None
+
     @classmethod
-    def import_book(cls, dbook, in_stream, headers=True, read_only=True):
-        """Returns databook from XLS stream."""
+    def import_book(cls, dbook, in_stream, headers=True, read_only=True, strict=False):
+        """Returns databook from XLS stream.
+
+        Workbooks exported with ``sheet_name_legend=True`` carry a sheet name
+        legend. Original dataset titles are then restored by matching each
+        worksheet title against the legend. Matching never relies on sheet
+        position: a deleted or renamed worksheet cannot be paired with an
+        unrelated legend entry. The matching report is stored on
+        ``dbook.sheet_title_result``.
+
+        If ``strict`` is True, a :class:`~tablib.exceptions.SheetTitleLookupError`
+        is raised when any worksheet cannot be matched reliably or a legend
+        entry has no worksheet left.
+        """
 
         dbook.wipe()
 
         xls_book = load_workbook(in_stream, read_only=read_only, data_only=True)
+        legend_sheet = cls._find_legend_sheet(xls_book)
 
-        for sheet in xls_book.worksheets:
+        if legend_sheet is None:
+            for sheet in xls_book.worksheets:
+                dset = tablib.Dataset()
+                cls.import_sheet(dset, sheet, headers)
+                dbook.add_sheet(dset)
+            return
+
+        mapping = SheetTitleMapping.from_legend_sheet(legend_sheet)
+        data_sheets = [
+            sheet for sheet in xls_book.worksheets if sheet is not legend_sheet
+        ]
+        matches = mapping.resolve(data_sheets)
+
+        for match in matches:
             dset = tablib.Dataset()
-            cls.import_sheet(dset, sheet, headers)
+            cls.import_sheet(dset, match.worksheet, headers)
+            if match.matched:
+                dset.title = match.original_title
             dbook.add_sheet(dset)
+
+        dbook.sheet_title_result = SheetTitleImportResult(
+            mapping=mapping, matches=matches
+        )
+        if strict:
+            dbook.sheet_title_result.raise_if_incomplete()
 
     @classmethod
     def dset_sheet(cls, dataset, ws, freeze_panes=True, escape=False):

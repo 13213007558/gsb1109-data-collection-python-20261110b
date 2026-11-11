@@ -269,6 +269,36 @@ The adaptive width will be calculated for each sheet in the databook.
 .. versionchanged:: 3.8.0
     The ``column_width`` parameter for ``export_set()`` was added.
 
+When a :class:`Databook` contains datasets with long titles, Excel sheet names
+are limited to 31 characters and must be unique, so several titles can collapse
+to the same sheet name. Pass ``sheet_name_legend=True`` to ``export()`` to give
+each dataset a short, non-conflicting sheet title while preserving sheet order,
+and to append an extra worksheet (named ``"Sheet Names"`` by default) that maps
+every short title back to the original dataset title::
+
+    book.export('xlsx', sheet_name_legend=True)
+    # short titles are at most 12 characters by default
+    book.export('xlsx', sheet_name_legend=True, short_title_length=8)
+
+On import, Tablib detects the legend worksheet from its header row and restores
+the original dataset titles by matching each worksheet title against the
+legend. Matching is name-based and never uses sheet position: if a worksheet
+was deleted or renamed outside Tablib, it cannot be paired with the wrong
+original title. The matching report is available on
+``databook.sheet_title_result``::
+
+    book = tablib.Databook().load(stream, 'xlsx')
+    result = book.sheet_title_result
+    result.ok                 # True only if every sheet matched and none is missing
+    result.unmatched          # worksheets whose title is not in the legend
+    result.missing_titles     # legend entries with no worksheet left
+
+Pass ``strict=True`` to :meth:`Databook.load` to raise
+:class:`~tablib.exceptions.SheetTitleLookupError` instead of keeping the
+unmatched worksheets under their current sheet names. A workbook without a
+legend is imported exactly as before, and ``sheet_title_result`` stays
+``None``.
+
 .. versionchanged:: 3.1.0
 
     The ``skip_lines`` parameter for ``import_set()`` was added.

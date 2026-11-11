@@ -20,3 +20,11 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class SheetTitleError(TablibException, ValueError):
+    """A sheet title legend cannot be found or is malformed."""
+
+
+class SheetTitleLookupError(TablibException, ValueError):
+    """A worksheet cannot be matched reliably against the sheet title legend."""

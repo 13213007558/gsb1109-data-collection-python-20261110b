@@ -865,6 +865,9 @@ class Databook:
 
     def __init__(self, sets=None):
         self._datasets = sets or []
+        # Set by XLSXFormat.import_book() when the workbook carries a sheet
+        # name legend; None otherwise.
+        self.sheet_title_result = None
 
     def __repr__(self):
         try:
@@ -875,6 +878,7 @@ class Databook:
     def wipe(self):
         """Removes all :class:`Dataset` objects from the :class:`Databook`."""
         self._datasets = []
+        self.sheet_title_result = None
 
     def sheets(self):
         return self._datasets

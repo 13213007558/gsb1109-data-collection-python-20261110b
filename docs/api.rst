@@ -30,6 +30,14 @@ Databook Object
    :inherited-members:
 
 
+---------------------
+Sheet Title Mappings
+---------------------
+
+.. automodule:: tablib.sheet_mapping
+   :members:
+
+
 ---------
 Functions
 ---------
