@@ -91,6 +91,7 @@ they never match:
 * ``:enabled``
 * ``:disabled``
 * ``:checked``
+* ``:selected``
 
 These applicable pseudo-classes are not yet implemented:
 

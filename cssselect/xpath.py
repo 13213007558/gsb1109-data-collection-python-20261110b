@@ -830,6 +830,7 @@ class GenericTranslator:
     xpath_enabled_pseudo = pseudo_never_matches
     xpath_disabled_pseudo = pseudo_never_matches
     xpath_checked_pseudo = pseudo_never_matches
+    xpath_selected_pseudo = pseudo_never_matches
 
     # Attrib: dispatch by attribute operator
 
@@ -952,6 +953,39 @@ class HTMLTranslator(GenericTranslator):
             "(@checked "
             "and (name(.) = 'input' or name(.) = 'command')"
             "and (@type = 'checkbox' or @type = 'radio'))"
+        )
+
+    def xpath_selected_pseudo(self, xpath: XPathExpr) -> XPathExpr:
+        # Only the initial selectedness, as described by the markup, can be
+        # known here, not any later user interaction:
+        # https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element
+        # An option is selected if it has a "selected" attribute (the last
+        # one wins in a single-selection select), or, failing that, if it is
+        # the first non-disabled option of a single-selection select.
+        # Options of a multiple-selection select are never implicitly
+        # selected. "count(. | …) = 1" tests node identity in XPath 1.0.
+        selectable = "not(@disabled) and not(parent::optgroup[@disabled])"
+        return xpath.add_condition(
+            f"""
+        name(.) = 'option' and ancestor::select and (
+            (
+                @selected
+                and (
+                    ancestor::select[1]/@multiple
+                    or count(
+                        . | ancestor::select[1]/descendant::option[@selected][last()]
+                    ) = 1
+                )
+            ) or (
+                {selectable}
+                and ancestor::select[1][not(@multiple)]
+                and not(ancestor::select[1]//option[@selected])
+                and count(
+                    . | ancestor::select[1]/descendant::option[{selectable}][1]
+                ) = 1
+            )
+        )
+        """
         )
 
     def xpath_lang_function(self, xpath: XPathExpr, function: Function) -> XPathExpr:

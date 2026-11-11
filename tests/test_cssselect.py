@@ -1856,6 +1856,35 @@ class TestCssselect(unittest.TestCase):
                     element for element in all_elements if element not in matching
                 ]
 
+    def test_select_selected(self) -> None:
+        document = etree.fromstring(HTML_SELECT)
+        generic_css_to_xpath = GenericTranslator().css_to_xpath
+        html_css_to_xpath = HTMLTranslator().css_to_xpath
+
+        def select_ids(css_to_xpath: typing.Callable[[str], str]) -> list[str]:
+            items = typing.cast(
+                "list[etree._Element]", document.xpath(css_to_xpath(":selected"))
+            )
+            return [element.get("id", "nil") for element in items]
+
+        # Only HTMLTranslator implements :selected
+        assert select_ids(generic_css_to_xpath) == []
+        assert select_ids(html_css_to_xpath) == [
+            # First option of a single-selection select without any
+            # "selected" attribute
+            "implicit-first",
+            # Explicit "selected" attribute
+            "explicit-selected",
+            # Single-selection select: only the last "selected" attribute wins
+            "explicit-twice-second",
+            # A disabled first option is not implicitly selected
+            "after-disabled",
+            # Nor is an option of a disabled option group
+            "option-enabled-group",
+            # Explicit "selected" attribute in a multiple-selection select
+            "multiple-selected",
+        ]
+
     def test_select_long_selector_list(self) -> None:
         """A selector list is joined in a single ``or`` chain.
 
@@ -2141,6 +2170,48 @@ c"></li>
 </div>
 <div id="foobar-div" foobar="ab bc
 cde"><span id="foobar-span"></span></div>
+</body></html>
+"""
+
+
+HTML_SELECT = """
+<html><body>
+ <select id="select-implicit">
+   <option id="implicit-first">a</option>
+   <option id="implicit-second">b</option>
+ </select>
+ <select id="select-explicit">
+   <option id="explicit-unselected">a</option>
+   <option id="explicit-selected" selected="selected">b</option>
+ </select>
+ <select id="select-explicit-twice">
+   <option id="explicit-twice-first" selected="selected">a</option>
+   <option id="explicit-twice-second" selected="selected">b</option>
+ </select>
+ <select id="select-disabled-first">
+   <option id="disabled-first" disabled="disabled">a</option>
+   <option id="after-disabled">b</option>
+ </select>
+ <select id="select-disabled-optgroup">
+   <optgroup id="optgroup-disabled" disabled="disabled">
+     <option id="option-disabled-group">a</option>
+   </optgroup>
+   <optgroup id="optgroup-enabled">
+     <option id="option-enabled-group">b</option>
+   </optgroup>
+ </select>
+ <select id="select-multiple" multiple="multiple">
+   <option id="multiple-first">a</option>
+   <option id="multiple-selected" selected="selected">b</option>
+ </select>
+ <select id="select-multiple-none" multiple="multiple">
+   <option id="multiple-none-first">a</option>
+   <option id="multiple-none-second">b</option>
+ </select>
+ <select id="select-all-disabled">
+   <option id="all-disabled-first" disabled="disabled">a</option>
+   <option id="all-disabled-second" disabled="disabled">b</option>
+ </select>
 </body></html>
 """
 

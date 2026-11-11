@@ -1,6 +1,18 @@
 Changelog
 =========
 
+Version 1.7.0
+-------------
+
+Unreleased.
+
+*   Added support for the ``:selected`` pseudo-class. In
+    :class:`HTMLTranslator`, it matches ``option`` elements that are
+    initially selected according to the markup: those with a ``selected``
+    attribute, or, in a single-selection ``select`` element without any such
+    option, the first option that is not disabled, including through a
+    disabled ``optgroup``. In :class:`GenericTranslator`, it never matches.
+
 Version 1.6.0
 -------------
 
