@@ -297,6 +297,107 @@ class TestSoupSieve(util.TestCase):
         self.assertEqual(len(nodes), 1)
         self.assertEqual(nodes[0].attrs['id'], '6')
 
+    def test_filter_iterable_generator(self):
+        """Test filter accepts a one-shot generator, preserves order, and consumes it only once."""
+
+        markup = """
+        <html>
+        <body>
+        <p id="1"><code id="2"></code></p>
+        <pre id="4"></pre>
+        <p><span id="5"></span></p>
+        <pre id="6" class="ignore"></pre>
+        </body>
+        </html>
+        """
+
+        soup = self.soup(markup, 'html.parser')
+        children = list(soup.html.body.children)
+
+        def one_shot():
+            for node in children:
+                yield node
+
+        ids = [tag['id'] for tag in sv.filter('[id]', one_shot())]
+        self.assertEqual(['1', '4', '6'], ids)
+
+        consumed = []
+
+        def tracking():
+            for node in children:
+                consumed.append(node)
+                yield node
+
+        nodes = sv.compile('pre').filter(tracking())
+        self.assertEqual([tag['id'] for tag in nodes], ['4', '6'])
+        self.assertEqual(len(consumed), len(children))
+
+    def test_filter_duplicate_identity(self):
+        """Test an object yielded more than once is kept each time, never de-duplicated."""
+
+        soup = self.soup('<div id="1"></div><div id="2"></div>', 'html.parser')
+        first, second = list(soup.find_all('div'))
+
+        nodes = sv.filter('div', iter([first, second, first]))
+        self.assertEqual([first, second, first], nodes)
+
+    def test_filter_exclude_hits_with_not(self):
+        """Test rule hits are excluded via :not() while the rest keep original order."""
+
+        soup = self.soup(
+            '<div id="1" class="drop"></div>'
+            '<div id="2" class="keep"></div>'
+            '<span id="3" class="keep"></span>',
+            'html.parser'
+        )
+        nodes = list(soup.find_all(True))
+
+        kept = sv.filter(':not(.drop)', iter([nodes[0], nodes[1], nodes[2], nodes[1]]))
+        self.assertEqual([nodes[1], nodes[2], nodes[1]], kept)
+
+    def test_filter_lookalike_nodes(self):
+        """Test equal-looking nodes from different trees are distinct elements."""
+
+        markup = '<html><body><div class="same">value</div></body></html>'
+        tree_one = self.soup(markup, 'html.parser')
+        tree_two = self.soup(markup, 'html.parser')
+        node_one = tree_one.find('div')
+        node_two = tree_two.find('div')
+
+        self.assertIsNot(node_one, node_two)
+        self.assertEqual(str(node_one), str(node_two))
+
+        nodes = sv.filter('.same', iter([node_one, node_two]))
+        self.assertEqual([node_one, node_two], nodes)
+
+    @util.requires_lxml
+    def test_filter_mixed_documents_namespaces(self):
+        """Test each node is matched against its own document and namespace context."""
+
+        html = self.soup('<html><body><item>html</item></body></html>', 'html.parser')
+        xml = self.soup(
+            '<root xmlns:foo="http://foo.example"><foo:item>xml</foo:item></root>',
+            'xml'
+        )
+        html_node = html.find('item')
+        xml_node = xml.find('item')
+        namespaces = {'foo': 'http://foo.example'}
+
+        nodes = sv.filter('foo|item', iter([html_node, xml_node]), namespaces=namespaces)
+        self.assertEqual([xml_node], nodes)
+
+    def test_filter_relationship_scoped_to_document(self):
+        """Test relationship selectors never reach across separate documents."""
+
+        markup = '<html><body><div><p class="hit">x</p></div></body></html>'
+        tree_one = self.soup(markup, 'html.parser')
+        tree_two = self.soup(markup, 'html.parser')
+        div_one = tree_one.find('div')
+        div_two = tree_two.find('div')
+
+        nodes = sv.filter('div:has(p.hit)', iter([div_one, div_two]))
+        self.assertEqual([div_one, div_two], nodes)
+
     def test_closest_match_parent(self):
         """Test match parent closest."""
 
