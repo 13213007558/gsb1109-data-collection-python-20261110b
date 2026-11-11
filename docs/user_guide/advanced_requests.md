@@ -56,3 +56,33 @@ the original streamed response:
 ...         print(chunk.decode('utf-8'))
 ```
 :::
+
+### Deferred caching for streams
+By default, a streamed response is fully buffered (and cached) as soon as it is received, even if
+you only read part of it. If you instead want to consume the response as a stream right away and
+only cache it once it has been **completely** read, use the `lazy_streams` option:
+
+:::{dropdown} Example
+:animate: fade-in-slide-down
+:color: primary
+:icon: file-code
+
+```python
+>>> session = CachedSession(lazy_streams=True)
+>>> response = session.get('https://httpbin.org/stream/20', stream=True)
+>>> # Not cached yet; the response is cached only after the body is fully consumed
+>>> for chunk in response.iter_content(chunk_size=1024):
+...     process(chunk)
+```
+:::
+
+With `lazy_streams` enabled, a response will not be cached if you close it (or otherwise stop
+reading) before the stream is finished, or if the download fails partway through. This guarantees
+that the cache never contains a partially downloaded response.
+
+You can also set `max_cacheable_size` (in bytes) to avoid caching very large responses. Responses
+larger than this are simply not cached; this does not interrupt streaming:
+
+```python
+>>> session = CachedSession(lazy_streams=True, max_cacheable_size=1024**2)
+```

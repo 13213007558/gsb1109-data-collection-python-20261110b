@@ -26,6 +26,7 @@ from .policy import (
     set_request_headers,
 )
 from .serializers import SerializerType
+from .streaming import defer_cache_write
 
 __all__ = ['CachedSession', 'CacheMixin']
 if TYPE_CHECKING:
@@ -55,6 +56,8 @@ class CacheMixin(MIXIN_BASE):
         always_revalidate: bool = False,
         ignored_parameters: Iterable[str] = DEFAULT_IGNORED_PARAMS,
         match_headers: Union[Iterable[str], bool] = False,
+        lazy_streams: bool = False,
+        max_cacheable_size: Optional[int] = None,
         filter_fn: Optional[FilterCallback] = None,
         key_fn: Optional[KeyCallback] = None,
         read_only: bool = False,
@@ -73,6 +76,8 @@ class CacheMixin(MIXIN_BASE):
             always_revalidate=always_revalidate,
             ignored_parameters=ignored_parameters,
             match_headers=match_headers,
+            lazy_streams=lazy_streams,
+            max_cacheable_size=max_cacheable_size,
             filter_fn=filter_fn,
             key_fn=key_fn,
             read_only=read_only,
@@ -282,7 +287,16 @@ class CacheMixin(MIXIN_BASE):
         actions.update_from_response(response)
 
         if not actions.skip_write:
-            self.cache.save_response(response, actions.cache_key, actions.expires)
+            if self.settings.lazy_streams and _is_unbuffered_stream(response):
+                defer_cache_write(
+                    response,
+                    self.cache,
+                    actions.cache_key,
+                    actions.expires,
+                    self.settings.max_cacheable_size,
+                )
+            else:
+                self.cache.save_response(response, actions.cache_key, actions.expires)
         elif cached_response is not None and response.status_code == 304:
             cached_response = actions.update_revalidated_response(
                 response, CachedResponse.from_response(cached_response)
@@ -406,6 +420,12 @@ class CachedSession(CacheMixin, OriginalSession):
             be a list of headers, or ``True`` to match all.
         ignored_parameters: Request parameters, headers, and/or JSON body params to exclude from both
             request matching and cached request data
+        lazy_streams: For streamed responses (``stream=True``), defer caching until the response
+            body has been fully consumed by the caller, instead of buffering it up front. Responses
+            that are only partially read (or fail mid-stream) are never cached.
+        max_cacheable_size: Maximum size (in bytes) of a streamed response body to cache, when
+            ``lazy_streams`` is enabled. Larger responses are not cached, but this does not
+            interrupt streaming.
         read_only: Read existing cached responses, but do not write any new responses to the cache
         stale_if_error: Return a stale response if a new request raises an exception. Optionally
             accepts a time value representing maximum staleness to accept.
@@ -427,3 +447,8 @@ def get_504_response(request: PreparedRequest) -> CachedResponse:
         reason='Not Cached',
         request=request,  # type: ignore
     )
+
+
+def _is_unbuffered_stream(response: AnyResponse) -> bool:
+    """Determine if a response is a streamed response whose body has not been read yet"""
+    return response.raw is not None and not response._content_consumed

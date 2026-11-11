@@ -1,6 +1,10 @@
 # History
 
 ## Unreleased
+* Add `lazy_streams` option to defer caching streamed responses until the body has been fully
+  consumed, so partially read or failed downloads are never cached
+* Add `max_cacheable_size` option to skip caching streamed responses above a given size, without
+  interrupting streaming
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches
