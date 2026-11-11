@@ -84,6 +84,14 @@ clevercsv.encoding module
    :show-inheritance:
    :undoc-members:
 
+clevercsv.header module
+-----------------------
+
+.. automodule:: clevercsv.header
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 clevercsv.escape module
 -----------------------
 

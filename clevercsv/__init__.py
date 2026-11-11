@@ -15,6 +15,12 @@ from .dialect import unix_dialect
 from .dict_read_write import DictReader
 from .dict_read_write import DictWriter
 from .exceptions import Error
+from .exceptions import HeaderNotFoundError
+from .exceptions import TableParseError
+from .header import HeaderLocation
+from .header import iter_rows_with_header
+from .header import locate_headers
+from .header import read_rows_with_header
 from .read import reader
 from .wrappers import detect_dialect
 from .wrappers import read_dataframe
@@ -40,6 +46,12 @@ __all__ = [
     "DictReader",
     "DictWriter",
     "Error",
+    "HeaderLocation",
+    "HeaderNotFoundError",
+    "TableParseError",
+    "iter_rows_with_header",
+    "locate_headers",
+    "read_rows_with_header",
     "reader",
     "detect_dialect",
     "read_dataframe",
