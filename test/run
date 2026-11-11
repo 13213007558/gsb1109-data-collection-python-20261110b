@@ -75,6 +75,7 @@ compare("xlsx2csv-test-file")
 compare("escape", ["-e"])
 compare("hyperlinks", ["--hyperlinks"])
 compare("hyperlinks_continous", ["--hyperlinks"])
+compare("hyperlinks_list")
 compare("namespace")
 compare("float")
 compare("variousdelim", ["--all","--sheetdelimiter=x33", "--lineterminator=\\r", "--delimiter=\\t"])
@@ -117,3 +118,35 @@ def test_dir_sheetname():
     print("OK: dir_sheetname")
 
 test_dir_sheetname()
+
+
+def test_hyperlink_list():
+    # the separate hyperlink list must map every linked cell to its coordinate,
+    # visible text and destination, while the main output stays free of HTML
+    import tempfile
+    expected = open("test/hyperlinks_list_links.csv", "r", encoding="utf-8", newline="").read().replace('\r', '')
+    tmp = tempfile.mkdtemp()
+
+    def check(input_args, label, stdin_data=None):
+        list_path = os.path.join(tmp, "links.csv")
+        cmd = [sys.executable, "./xlsx2csv.py", "--hyperlink-list", list_path] + input_args
+        pipe = subprocess.run(cmd, input=stdin_data, capture_output=True)
+        if pipe.returncode != 0:
+            print("FAILED: hyperlink_list %s (exit %d) %s" % (label, pipe.returncode, pipe.stderr.decode("utf-8", "replace")))
+            sys.exit(1)
+        actual = open(list_path, "r", encoding="utf-8", newline="").read().replace('\r', '')
+        if actual != expected:
+            print("FAILED: hyperlink_list %s" % label)
+            print(" actual:", actual.replace("\n", "\\n"))
+            print(" expected:", expected.replace("\n", "\\n"))
+            sys.exit(1)
+        print("OK: hyperlink_list %s" % label)
+
+    check(["test/hyperlinks_list.xlsx"], "file")
+    with open("test/hyperlinks_list.xlsx", "rb") as f:
+        check(["-"], "stdin", stdin_data=f.read())
+
+    import shutil
+    shutil.rmtree(tmp)
+
+test_hyperlink_list()

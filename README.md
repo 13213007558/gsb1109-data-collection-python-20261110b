@@ -31,7 +31,7 @@ Also works standalone with only the *xlsx2csv.py* script.
                    [-n SHEETNAME] [-d DELIMITER] [-l LINETERMINATOR]
                    [-f DATEFORMAT] [--floatformat FLOATFORMAT]
                    [-i] [-e] [-p SHEETDELIMITER]
-                   [--hyperlinks]
+                   [--hyperlinks] [--hyperlink-list HYPERLINK_LIST]
                    [-I INCLUDE_SHEET_PATTERN [INCLUDE_SHEET_PATTERN ...]]
                    [-E EXCLUDE_SHEET_PATTERN [EXCLUDE_SHEET_PATTERN ...]] [-m]
                    xlsxfile [outfile]
@@ -72,6 +72,11 @@ Also works standalone with only the *xlsx2csv.py* script.
                         field quoting, 'none' 'minimal' 'nonnumeric' or 'all' (default: 'minimal')
   --hyperlinks, --hyperlinks
                         include hyperlinks
+  --hyperlink-list HYPERLINK_LIST
+                        write a separate CSV listing each hyperlink with its
+                        sheet, cell coordinate, visible text, target kind
+                        (external/internal/file) and destination; links are
+                        not fetched and the main CSV is left unchanged
   -I INCLUDE_SHEET_PATTERN [INCLUDE_SHEET_PATTERN ...], --include_sheet_pattern INCLUDE_SHEET_PATTERN [INCLUDE_SHEET_PATTERN ...]
                         only include sheets with names matching the given pattern, only
                         affects when -a option is enabled.
@@ -98,6 +103,38 @@ Usage from within Python:
   # Simple usage (but may cause ResourceWarning in modern Python)
   Xlsx2csv("myfile.xlsx", outputencoding="utf-8").convert("myfile.csv")
 ```
+
+### Hyperlink list
+
+`--hyperlinks` embeds each link as an `<a href='...'>` string inside its cell,
+which is convenient to read but hard to parse downstream. `--hyperlink-list`
+instead writes a separate CSV with one row per linked cell:
+
+```
+sheet,cell,text,kind,target,location
+Sheet1,B2,查看详情,external,https://example.com/north,
+Sheet1,B4,查看详情,internal,,Sheet2!A1
+Sheet1,B7,查看详情,file,reports/q4.xlsx,
+```
+
+- `cell` is the worksheet coordinate (e.g. `B2`), so every row maps back to the
+  main CSV; cells without a link are simply absent.
+- `text` is the value the user sees in the cell, kept separate from the
+  destination, so repeated labels keep their individual targets.
+- `kind` classifies the link from package metadata only: `external` for shared
+  outside links (`TargetMode="External"`), `internal` for anchors pointing into
+  the same workbook (`location`), and `file` for in-package file targets.
+- Links are never opened or validated.
+
+From Python, pass a path or any writable text file handle as `hyperlink_list`:
+
+```
+  with open("links.csv", "w", encoding="utf-8", newline="") as links:
+      with Xlsx2csv("myfile.xlsx", hyperlink_list=links) as xlsx2csv:
+          xlsx2csv.convert("myfile.csv")
+```
+
+The main CSV stays plain text unless `--hyperlinks` is also given.
 
 Expat SAX parser is used for XML parsing.
 

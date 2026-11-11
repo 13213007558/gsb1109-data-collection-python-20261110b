@@ -199,6 +199,8 @@ class Xlsx2csv:
        skip_empty_lines - skip empty lines
        skip_trailing_columns - skip trailing columns
        hyperlinks - include hyperlinks
+       hyperlink_list - path or filehandle for a separate CSV listing every hyperlink
+                        with its cell coordinate, visible text and target kind
        include_sheet_pattern - only include sheets named matching given pattern
        exclude_sheet_pattern - exclude sheets named matching given pattern
        exclude_hidden_sheets - exclude hidden sheets
@@ -219,6 +221,7 @@ class Xlsx2csv:
         options.setdefault("escape_strings", False)
         options.setdefault("no_line_breaks", False)
         options.setdefault("hyperlinks", False)
+        options.setdefault("hyperlink_list", None)
         options.setdefault("include_sheet_pattern", ["^.*$"])
         options.setdefault("exclude_sheet_pattern", [])
         options.setdefault("exclude_hidden_sheets", False)
@@ -233,6 +236,9 @@ class Xlsx2csv:
         self.options = options
         self.py3 = sys.version_info[0] == 3
         self.ziphandle = None
+        self.hyperlink_list_writer = None
+        self.hyperlink_list_handle = None
+        self.hyperlink_list_owned = False
 
         xlsxinputfile = None
         if xlsxfile == "-" and self.py3:
@@ -279,6 +285,13 @@ class Xlsx2csv:
     def close(self):
         # type: () -> None
         """Explicitly close the underlying zip file handle."""
+        if self.hyperlink_list_owned and self.hyperlink_list_handle is not None:
+            try:
+                self.hyperlink_list_handle.close()
+            finally:
+                self.hyperlink_list_handle = None
+                self.hyperlink_list_writer = None
+                self.hyperlink_list_owned = False
         if self.ziphandle:
             self.ziphandle.close()
             self.ziphandle = None
@@ -418,6 +431,8 @@ class Xlsx2csv:
                 sheet.set_skip_empty_lines(self.options['skip_empty_lines'])
                 sheet.set_skip_trailing_columns(self.options['skip_trailing_columns'])
                 sheet.set_include_hyperlinks(self.options['hyperlinks'])
+                if self.options['hyperlink_list']:
+                    sheet.set_collect_hyperlinks(True)
                 sheet.set_merge_cells(self.options['merge_cells'])
                 sheet.set_scifloat(self.options['scifloat'])
                 sheet.set_ignore_formats(self.options['ignore_formats'])
@@ -429,12 +444,66 @@ class Xlsx2csv:
                                             re.sub(r"(<v>[^<>]+)&#9;([^<>]+</v>)", r"\1\\t\2",
                                                    re.sub(r"(<v>[^<>]+)&#13;([^<>]+</v>)", r"\1\\r\2", sheet.filedata.decode())))
                 sheet.to_csv(writer)
+                if self.options['hyperlink_list']:
+                    self._write_hyperlink_list(sheet, sheets_filtered[0]['name'])
             finally:
                 sheet_file.close()
                 sheet.close()
         finally:
             if closefile:
                 outfile.close()
+
+    HYPERLINK_LIST_HEADER = ["sheet", "cell", "text", "kind", "target", "location"]
+
+    def _csv_field(self, value):
+        if value is None:
+            value = ""
+        if not self.py3:
+            value = value.encode("utf-8")
+        return value
+
+    def _get_hyperlink_list_writer(self):
+        if self.hyperlink_list_writer is not None:
+            return self.hyperlink_list_writer
+        destination = self.options['hyperlink_list']
+        if hasattr(destination, "write"):
+            self.hyperlink_list_handle = destination
+            self.hyperlink_list_owned = False
+        elif isinstance(destination, str):
+            if sys.version_info[0] == 2:
+                self.hyperlink_list_handle = open(destination, 'wb+')
+            else:
+                self.hyperlink_list_handle = open(destination, 'w+',
+                                                  encoding=self.options['outputencoding'], newline="")
+            self.hyperlink_list_owned = True
+        elif hasattr(destination, "open"):
+            self.hyperlink_list_handle = destination.open("w+",
+                                                          encoding=self.options['outputencoding'], newline="")
+            self.hyperlink_list_owned = True
+        else:
+            raise XlsxException("error: hyperlink_list must be a file path or a writable file handle")
+        self.hyperlink_list_writer = csv.writer(
+            self.hyperlink_list_handle,
+            quoting=self.options['quoting'],
+            delimiter=self.options['delimiter'],
+            lineterminator=self.options['lineterminator'])
+        self.hyperlink_list_writer.writerow(self.HYPERLINK_LIST_HEADER)
+        return self.hyperlink_list_writer
+
+    def _write_hyperlink_list(self, sheet, sheet_name):
+        writer = self._get_hyperlink_list_writer()
+        for cell in sheet.hyperlink_records:
+            meta = sheet.hyperlink_meta[cell]
+            writer.writerow([
+                self._csv_field(sheet_name),
+                self._csv_field(cell),
+                self._csv_field(meta.get('text')),
+                self._csv_field(meta['type']),
+                self._csv_field(meta['target']),
+                self._csv_field(meta['location']),
+            ])
+        if self.hyperlink_list_owned:
+            self.hyperlink_list_handle.flush()
 
     def _filehandle(self, filename):
         for name in filter(lambda f: filename and f.lower() == filename.lower()[1:], self.ziphandle.namelist()):
@@ -581,9 +650,11 @@ class Relationships:
             if rId:
                 vtype = attrs.get('Type')
                 target = attrs.get('Target')
+                target_mode = attrs.get('TargetMode')
                 self.relationships[str(rId.value)] = {
                     "type": vtype and str(vtype.value) or None,
-                    "target": target and str(target.value) or None
+                    "target": target and str(target.value) or None,
+                    "target_mode": target_mode and str(target_mode.value) or None
                 }
 
 
@@ -734,6 +805,11 @@ class Sheet:
         self.styles = styles
 
         self.hyperlinks = {}
+        self.wrap_hyperlinks = False
+        self.hyperlink_meta = {}
+        self.hyperlink_records = []
+        self.collect_hyperlinks = False
+        self.hyperlinks_loaded = False
         self.mergeCells = {}
         self.ignore_formats = []
         self.skip_hidden_rows = False
@@ -818,8 +894,21 @@ class Sheet:
         self.scifloat = scifloat
 
     def set_include_hyperlinks(self, hyperlinks):
-        if not hyperlinks or not self.relationships or not self.relationships.relationships:
+        if not hyperlinks:
             return
+        self.wrap_hyperlinks = True
+        self._load_hyperlinks()
+
+    def set_collect_hyperlinks(self, collect):
+        # gather hyperlink metadata without wrapping cell values in HTML
+        self.collect_hyperlinks = bool(collect)
+        if collect:
+            self._load_hyperlinks()
+
+    def _load_hyperlinks(self):
+        if self.hyperlinks_loaded:
+            return
+        self.hyperlinks_loaded = True
         # we must read file first to get hyperlinks, but we don't wont to parse whole file
         if not self.filedata:
             self.filedata = self.filehandle.read()
@@ -848,20 +937,51 @@ class Sheet:
             hiperlinkNodes = doc.getElementsByTagName("hyperlink")
         for hlink in hiperlinkNodes:
             attrs = hlink._attrs
-            ref = rId = None
+            ref = rId = location = None
             for k in attrs.keys():
-                if k == "ref":
+                local_name = k.split(":")[-1]
+                if local_name == "ref":
                     ref = str(attrs[k].value)
-                if k.endswith(":id"):
+                elif local_name == "id":
                     rId = str(attrs[k].value)
-            if not ref or not rId:
+                elif local_name == "location":
+                    location = str(attrs[k].value)
+            if not ref:
                 continue
-            rel = self.relationships.relationships.get(rId)
-            if not rel:
+
+            target = target_mode = None
+            if rId and self.relationships and self.relationships.relationships:
+                rel = self.relationships.relationships.get(rId)
+                if rel:
+                    target = rel.get('target')
+                    target_mode = rel.get('target_mode')
+
+            link_type = self._hyperlink_kind(target, target_mode, location)
+            if target is None and location is None:
+                # hyperlink node without any resolvable destination
                 continue
-            target = rel.get('target')
+
             for cell in self._range(ref):
-                self.hyperlinks[cell] = target
+                # HTML wrapping needs one destination string; anchors use their location
+                self.hyperlinks[cell] = target if target is not None else location
+                self.hyperlink_meta[cell] = {
+                    'target': target,
+                    'location': location,
+                    'target_mode': target_mode,
+                    'type': link_type,
+                }
+                self.hyperlink_records.append(cell)
+
+    @staticmethod
+    def _hyperlink_kind(target, target_mode, location):
+        # classification relies on package metadata only, links are never fetched
+        if target_mode == "External":
+            return "external"
+        if location is not None:
+            return "internal"
+        if target is not None:
+            return "file"
+        return "none"
 
     def to_csv(self, writer):
         self.writer = writer
@@ -1079,10 +1199,12 @@ class Sheet:
             t = 0
             for i in self.colNum: t = t * 26 + ord(i) - 64
             d = self.data
-            if self.hyperlinks:
+            if self.wrap_hyperlinks:
                 hyperlink = self.hyperlinks.get(self.cellId)
                 if hyperlink:
                     d = "<a href='" + hyperlink + "'>" + d + "</a>"
+            if self.collect_hyperlinks and self.cellId in self.hyperlink_meta:
+                self.hyperlink_meta[self.cellId]['text'] = self.data
             if self.colNum + self.rowNum in self.mergeCells.keys():
                 if 'copyFrom' in self.mergeCells[self.colNum + self.rowNum].keys() and \
                                 self.mergeCells[self.colNum + self.rowNum]['copyFrom'] == self.colNum + self.rowNum:
@@ -1237,6 +1359,9 @@ def main():
                         help="delimiter - column delimiter in CSV, 'tab' or 'x09' for a tab (default: comma ',')")
     parser.add_argument("--hyperlinks", "--hyperlinks", dest="hyperlinks", action="store_true", default=False,
                         help="include hyperlinks")
+    parser.add_argument("--hyperlink-list", dest="hyperlink_list", action="store", default=None,
+                        help="write a separate CSV listing each hyperlink with its cell coordinate, "
+                             "visible text, target kind and destination (links are not fetched)")
     parser.add_argument("-e", "--escape", dest='escape_strings', default=False, action="store_true",
                         help="escape \\r\\n\\t characters")
     parser.add_argument("--no-line-breaks", "--no-line-breaks", dest='no_line_breaks', default=False, action="store_true",
@@ -1350,6 +1475,7 @@ def main():
         'escape_strings': options.escape_strings,
         'no_line_breaks': options.no_line_breaks,
         'hyperlinks': options.hyperlinks,
+        'hyperlink_list': options.hyperlink_list,
         'include_sheet_pattern': options.include_sheet_pattern,
         'exclude_sheet_pattern': options.exclude_sheet_pattern,
         'exclude_hidden_sheets': options.exclude_hidden_sheets,

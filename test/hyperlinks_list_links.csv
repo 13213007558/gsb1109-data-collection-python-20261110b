@@ -1,0 +1,6 @@
+sheet,cell,text,kind,target,location
+Sheet1,B2,查看详情,external,https://example.com/north,
+Sheet1,B3,查看详情,external,https://example.com/east,
+Sheet1,B4,查看详情,internal,,Sheet2!A1
+Sheet1,B6,查看详情,internal,worksheets/sheet2.xml,A1
+Sheet1,B7,查看详情,file,reports/q4.xlsx,

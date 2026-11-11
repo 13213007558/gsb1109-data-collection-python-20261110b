@@ -1,4 +1,9 @@
 unreleased:
+ * Add --hyperlink-list option (and hyperlink_list API argument) writing a separate
+   CSV of every hyperlink with its sheet, cell coordinate, visible text, target kind
+   (external/internal/file), target and in-workbook location; repeated cell labels keep
+   their own destinations, cells without a link are omitted, and links are never fetched
+ * Support internal hyperlinks that carry only a "location" attribute without a relationship
  * Fix custom number formats with quoted literal text (e.g. 0 "pcs", 0.0 "mm", #,##0 "days")
    being misdetected as dates, or having the literal text counted as decimal places
  * Fix date1904="0" in workbookPr being treated as the 1904 date system (only "1" and "true" enable it)
