@@ -148,6 +148,20 @@ class TestCssselect(unittest.TestCase):
         assert parse_many(":nth-child(2n+2)") == [
             "Function[Element[*]:nth-child(['2', 'n', '+2'])]"
         ]
+        assert parse_many(
+            "li:nth-child(3 of .product)",
+            "li:nth-child(3 OF .product)",
+            "li:nth-child( 3  of  .product )",
+        ) == ["Function[Element[li]:nth-child(['3'], of=[Class[Element[*].product]])]"]
+        assert parse_many("li:nth-last-child(-n+2 of .a, #b)") == [
+            "Function[Element[li]:nth-last-child(['-n', '+2'], "
+            "of=[Class[Element[*].a], Hash[Element[*]#b]])]"
+        ]
+        assert parse_many("li:nth-child(2 of .product:not(.sponsored))") == [
+            "Function[Element[li]:nth-child(['2'], "
+            "of=[Negation[Class[Element[*].product]:not("
+            "Class[Element[*].sponsored])]])]"
+        ]
         assert parse_many("div:nth-of-type(10)") == [
             "Function[Element[div]:nth-of-type(['10'])]"
         ]
@@ -363,6 +377,10 @@ class TestCssselect(unittest.TestCase):
         assert specificity(":before") == (0, 0, 1)
         assert specificity("*:before") == (0, 0, 1)
         assert specificity(":nth-child(2)") == (0, 1, 0)
+        assert specificity(":nth-child(2 of *)") == (0, 1, 0)
+        assert specificity(":nth-child(2 of foo)") == (0, 1, 1)
+        assert specificity(":nth-child(2 of .foo)") == (0, 2, 0)
+        assert specificity(":nth-last-child(2 of .foo, #bar)") == (1, 1, 0)
         assert specificity(".bar") == (0, 1, 0)
         assert specificity("[baz]") == (0, 1, 0)
         assert specificity('[baz="4"]') == (0, 1, 0)
@@ -428,6 +446,9 @@ class TestCssselect(unittest.TestCase):
         css2css(":beFOre", "::before")
         css2css("*:before", "::before")
         css2css(":nth-child(2)")
+        css2css(":nth-child(2 of .foo)")
+        css2css(":nth-child(2n+1 of *.foo, #bar)", ":nth-child(2n+1 of .foo, #bar)")
+        css2css(":nth-last-child(-n+2 of :not(.foo))")
         css2css(".bar")
         css2css("[baz]")
         css2css('[baz="4"]', "[baz='4']")
@@ -588,6 +609,22 @@ class TestCssselect(unittest.TestCase):
         assert get_error("[a /* c */ ]") is None
         assert get_error(":is(a /* c */ , b)") is None
         assert get_error(":nth-child(2n /* c */ + 1)") is None
+        assert get_error(":nth-child(2 of .a /* c */ , b)") is None
+        # The "of" selector list of :nth-child()
+        assert get_error(":nth-child(2 of)") == (
+            "Expected selector, got <DELIM ')' at 15>"
+        )
+        assert get_error(":nth-child(2 of .a,)") == (
+            "Expected selector, got <DELIM ')' at 19>"
+        )
+        # Combinators are not supported in the "of" selector list
+        assert get_error(":nth-child(2 of .a b)") == (
+            "Expected an argument, got <IDENT 'b' at 19>"
+        )
+        # ... and "of" is not defined for :nth-of-type()
+        assert get_error(":nth-of-type(2 of .a)") == (
+            "Expected an argument, got <DELIM '.' at 18>"
+        )
         assert get_error("a:lang( en /* c */ )") is None
         assert get_error(":not( a /* c */ )") is None
 
@@ -791,6 +828,44 @@ class TestCssselect(unittest.TestCase):
         )
         # represents the two last e elements
         assert xpath("e:nth-last-child(-n+2)") == ("e[not(following-sibling::*[2])]")
+
+        # --- nth-child() with an "of" selector list -------------------
+        # The element itself must match the "of" list, and only the
+        # siblings matching it are counted.
+        assert xpath("e:nth-child(2 of [foo])") == (
+            "e[(@foo) and "
+            "(preceding-sibling::*[@foo][1] and "
+            "not(preceding-sibling::*[@foo][2]))]"
+        )
+        assert xpath("e:nth-last-child(2 of [foo])") == (
+            "e[(@foo) and "
+            "(following-sibling::*[@foo][1] and "
+            "not(following-sibling::*[@foo][2]))]"
+        )
+        assert xpath("e:nth-child(-n+2 of [foo])") == (
+            "e[(@foo) and (not(preceding-sibling::*[@foo][2]))]"
+        )
+        assert xpath("e:nth-child(2n of [foo])") == (
+            "e[(@foo) and ((count(preceding-sibling::*[@foo]) +1) mod 2 = 0)]"
+        )
+        # always true except for the "of" list itself
+        assert xpath("e:nth-child(n of [foo])") == "e[@foo]"
+        # A node matching several selectors of the "of" list is still a
+        # single sibling, counted once.
+        assert xpath("e:nth-child(2 of [foo], [bar])") == (
+            "e[((@foo) or (@bar)) and "
+            "(preceding-sibling::*[(@foo) or (@bar)][1] and "
+            "not(preceding-sibling::*[(@foo) or (@bar)][2]))]"
+        )
+        # "of *" filters nothing out
+        assert xpath("e:nth-child(2 of *)") == (
+            "e[preceding-sibling::*[1] and not(preceding-sibling::*[2])]"
+        )
+        # "of" is only defined for :nth-child() and :nth-last-child()
+        nth_of_type = parse("e:nth-of-type(2)")[0]
+        nth_of_type.parsed_tree.of_selectors = [parse("[foo]")[0].parsed_tree]  # type: ignore[attr-defined]
+        with pytest.raises(ExpressionError):
+            GenericTranslator().selector_to_xpath(nth_of_type)
 
         assert xpath("e:nth-of-type(1)") == ("e[not(preceding-sibling::e[1])]")
         assert xpath("e:nth-last-of-type(1)") == ("e[not(following-sibling::e[1])]")
@@ -1831,6 +1906,44 @@ class TestCssselect(unittest.TestCase):
             "checkbox-checked",
             "checkbox-disabled-checked",
         ]
+
+    def test_select_nth_child_of(self) -> None:
+        """:nth-child(An+B of S) counts only the siblings matching S."""
+        document = etree.fromstring(
+            """
+            <ul>
+              <li class="product" id="p1"></li>
+              <li class="sponsored" id="ad1"></li>
+              <li class="product" id="p2"></li>
+              <li class="sponsored" id="ad2"></li>
+              <li class="product" id="p3"></li>
+              <li class="product sponsored" id="p4"></li>
+              <li class="product" id="p5"></li>
+            </ul>
+            """
+        )
+        css_to_xpath = GenericTranslator().css_to_xpath
+
+        def pcss(css: str) -> list[str]:
+            xpath = css_to_xpath(css)
+            items = typing.cast("list[etree._Element]", document.xpath(xpath))
+            return [element.get("id") for element in items]
+
+        assert pcss("li:nth-child(3)") == ["p2"]
+        assert pcss("li:nth-child(3 of .product)") == ["p3"]
+        assert pcss("li:nth-child(3 of .product:not(.sponsored))") == ["p3"]
+        assert pcss("li:nth-last-child(2 of .product:not(.sponsored))") == ["p3"]
+        assert pcss("li:nth-child(-n+2 of .product:not(.sponsored))") == ["p1", "p2"]
+        assert pcss("li:nth-child(2n of .product)") == ["p2", "p4"]
+        assert pcss("li:nth-child(2 of .sponsored)") == ["ad2"]
+        # The element itself must match the "of" list: ad1 is the 2nd
+        # child, but not a .product.
+        assert pcss("li:nth-child(2 of .product)") == ["p2"]
+        # p4 matches both ".product" and "#p4" but is counted once.
+        assert pcss("li:nth-child(4 of .product, #p4)") == ["p4"]
+        assert pcss("li:nth-child(5 of .product, #p4)") == ["p5"]
+        # "of *" filters nothing out.
+        assert pcss("li:nth-child(3 of *)") == ["p2"]
 
     def test_select_complex_negation(self) -> None:
         """``*:not(S)`` selects exactly ``*`` minus ``S``."""

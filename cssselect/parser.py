@@ -200,27 +200,61 @@ class FunctionalPseudoElement:
 class Function:
     """
     Represents selector:name(expr)
+
+    .. attribute:: of_selectors
+
+        For ``:nth-child()`` and ``:nth-last-child()``, the selector list
+        of the ``of`` clause (Selectors Level 4), as a list of parsed
+        selectors, or ``None`` when there is no such clause.
+        Other functional pseudo-classes always have ``None`` here.
+
     """
 
-    def __init__(self, selector: Tree, name: str, arguments: Sequence[Token]) -> None:
+    def __init__(
+        self,
+        selector: Tree,
+        name: str,
+        arguments: Sequence[Token],
+        of_selectors: list[Tree] | None = None,
+    ) -> None:
         self.selector = selector
         self.name = ascii_lower(name)
         self.arguments = arguments
+        self.of_selectors = of_selectors
 
     def __repr__(self) -> str:
         token_values = [token.value for token in self.arguments]
-        return f"{self.__class__.__name__}[{self.selector!r}:{self.name}({token_values!r})]"
+        of = ""
+        if self.of_selectors is not None:
+            of = f", of={self.of_selectors!r}"
+        return f"{self.__class__.__name__}[{self.selector!r}:{self.name}({token_values!r}{of})]"
 
     def argument_types(self) -> list[str]:
         return [token.type for token in self.arguments]
 
     def canonical(self) -> str:
         args = "".join(token.css() for token in self.arguments)
+        if self.of_selectors is not None:
+            of_args = []
+            for s in self.of_selectors:
+                selarg = s.canonical()
+                # Strip a redundant universal selector, e.g. "*.foo".
+                if len(selarg) > 1 and selarg[0] == "*" and selarg[1] in "#.[:":
+                    selarg = selarg[1:]
+                of_args.append(selarg)
+            args += " of " + ", ".join(of_args)
         return f"{self.selector.canonical()}:{_serialize_ident(self.name)}({args})"
 
     def specificity(self) -> tuple[int, int, int]:
         a, b, c = self.selector.specificity()
         b += 1
+        if self.of_selectors:
+            # Selectors Level 4: the "of" clause adds the specificity of
+            # its most specific selector.
+            a2, b2, c2 = max(s.specificity() for s in self.of_selectors)
+            a += a2
+            b += b2
+            c += c2
         return a, b, c
 
 
@@ -767,6 +801,8 @@ def parse_simple_selector(
             elif ident.lower() == "where":
                 selectors = parse_simple_selector_arguments(stream)
                 result = SpecificityAdjustment(result, selectors)
+            elif ident.lower() in ("nth-child", "nth-last-child"):
+                result = parse_nth_child_like(result, ident, stream)
             else:
                 result = Function(result, ident, parse_arguments(stream))
         else:
@@ -790,6 +826,53 @@ def parse_arguments(stream: TokenStream) -> list[Token]:  # noqa: RET503
             return arguments
         else:
             raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+
+
+def parse_nth_child_like(selector: Tree, ident: str, stream: TokenStream) -> Function:
+    """Parse the arguments of :nth-child() and :nth-last-child(): an An+B
+    microsyntax, optionally followed by "of <selector-list>" (Selectors
+    Level 4)."""
+    arguments: list[Token] = []
+    of_selectors = None
+    while 1:
+        stream.skip_whitespace()
+        next_ = stream.next()
+        if next_.type == "IDENT" and ascii_lower(cast("str", next_.value)) == "of":
+            of_selectors = parse_of_selector_list(stream)
+            break
+        if next_.type in ("IDENT", "STRING", "NUMBER") or next_ in [
+            ("DELIM", "+"),
+            ("DELIM", "-"),
+        ]:
+            arguments.append(next_)
+        elif next_ == ("DELIM", ")"):
+            break
+        else:
+            raise SelectorSyntaxError(f"Expected an argument, got {next_}")
+    return Function(selector, ident, arguments, of_selectors=of_selectors)
+
+
+def parse_of_selector_list(stream: TokenStream) -> list[Tree]:  # noqa: RET503
+    """Parse the selector list after "of" in :nth-child(An+B of S).
+
+    Like the arguments of :is(), only compound selectors are supported;
+    combinators are not.
+    """
+    selectors = []
+    while 1:
+        result, pseudo_element = parse_simple_selector(stream)
+        if pseudo_element:
+            raise SelectorSyntaxError(
+                f"Got pseudo-element ::{pseudo_element} inside function"
+            )
+        selectors.append(result)
+        stream.skip_whitespace()
+        next_ = stream.next()
+        if next_ == ("DELIM", ","):
+            continue
+        if next_ == ("DELIM", ")"):
+            return selectors
+        raise SelectorSyntaxError(f"Expected an argument, got {next_}")
 
 
 def parse_relative_selector(stream: TokenStream) -> list[tuple[Token, Selector]]:

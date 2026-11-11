@@ -380,6 +380,16 @@ class GenericTranslator:
     ) -> XPathExpr:
         """Add a condition matching any selector of the list
         (for :is() and :where())."""
+        condition = self._selector_list_condition(selector_list)
+        if condition is None:
+            # An argument matches any element, so the whole selector
+            # list does too: it adds no condition.
+            return xpath
+        return xpath.add_condition(condition)
+
+    def _selector_list_condition(self, selector_list: Iterable[Tree]) -> str | None:
+        """Return a condition matching any selector of the list,
+        or None if the list matches every element."""
         conditions: list[str] = []
         for e in (self.xpath(selector) for selector in selector_list):
             if e.path:
@@ -395,10 +405,10 @@ class GenericTranslator:
             e.add_name_test()
             if not e.condition:
                 # This argument matches any element, so the whole selector
-                # list does too: it adds no condition.
-                return xpath
+                # list does too.
+                return None
             conditions.append(e.condition)
-        return xpath.add_condition(_or_conditions(conditions))
+        return _or_conditions(conditions)
 
     def xpath_function(self, function: Function) -> XPathExpr:
         """Translate a functional pseudo-class."""
@@ -591,6 +601,19 @@ class GenericTranslator:
         except ValueError as ex:
             raise ExpressionError(f"Invalid series: '{function.arguments!r}'") from ex
 
+        # Selectors Level 4: ":nth-child(An+B of S)" only counts the
+        # siblings matching S, and the element itself must match S too.
+        of_condition = None
+        if function.of_selectors:
+            if not add_name_test:
+                raise ExpressionError(
+                    f"The pseudo-class :{function.name}() does not accept "
+                    "an 'of' selector list"
+                )
+            of_condition = self._selector_list_condition(function.of_selectors)
+            if of_condition is not None:
+                xpath.add_condition(of_condition)
+
         # From https://www.w3.org/TR/css3-selectors/#structural-pseudos:
         #
         # :nth-child(an+b)
@@ -653,11 +676,14 @@ class GenericTranslator:
         # nth_of_type() calls nth_child(add_name_test=False)
         nodetest = "*" if add_name_test else f"{xpath.element}"
 
-        # siblings before or after the element
+        # siblings before or after the element, restricted to those
+        # matching the "of" selector list when there is one
         if not last:
             siblings = f"preceding-sibling::{nodetest}"
         else:
             siblings = f"following-sibling::{nodetest}"
+        if of_condition is not None:
+            siblings = f"{siblings}[{of_condition}]"
         siblings_count = f"count({siblings})"
 
         # count(***-sibling::***) >= k is tested as ***-sibling::***[k],

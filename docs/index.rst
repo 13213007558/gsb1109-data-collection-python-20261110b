@@ -115,6 +115,11 @@ be implemented):
   ``:is(:has(> a))``).
 * The ``:has()`` pseudo-class, e.g. ``:has(> a.important, + p b)``. Limitation:
   ``:scope`` is rejected inside it.
+* The ``of <selector-list>`` clause of ``:nth-child()`` and
+  ``:nth-last-child()``, e.g. ``:nth-child(2 of .foo)``: only the siblings
+  matching the list are counted, and the element itself must match it too.
+  Limitation: like ``:is()``, the list only takes *compound selectors*;
+  combinators are not allowed.
 * The ``i`` and ``s`` attribute selector flags, e.g. ``[href^="HTTP" i]``.
   ``i`` makes the value comparison ASCII case-insensitive. ``s`` is accepted
   but has no effect, since attribute values are already compared

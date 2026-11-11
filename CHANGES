@@ -1,6 +1,18 @@
 Changelog
 =========
 
+Version 1.7.0
+-------------
+
+Unreleased.
+
+*   ``:nth-child()`` and ``:nth-last-child()`` now support the Selectors
+    Level 4 ``of <selector-list>`` clause, e.g.
+    ``:nth-child(2 of .foo, #bar)``: only the siblings matching the list
+    are counted, and the element itself must match it too. Like ``:is()``,
+    the list only takes compound selectors; combinators are not allowed.
+    ``Function`` nodes expose it as the new ``of_selectors`` attribute.
+
 Version 1.6.0
 -------------
 
