@@ -11,7 +11,7 @@ import pytest
 from platformdirs import user_cache_dir
 
 from requests_cache.backends import BaseCache, SQLiteCache, SQLiteDict
-from requests_cache.backends.sqlite import MEMORY_URI
+from requests_cache.backends.sqlite import MEMORY_URI, QUARANTINE_TABLE
 from requests_cache.models import CachedRequest, CachedResponse
 from requests_cache.policy import utcnow
 from tests.conftest import skip_pypy
@@ -451,3 +451,148 @@ class TestSQLiteCache(BaseCacheTest):
             assert prev_item is None or prev_item.expires < item.expires
             assert item.cache_key
             assert not item.is_expired
+
+    def _drop_quarantine_table(self, cache):
+        with cache.responses.connection(commit=True) as con:
+            con.execute(f'DROP TABLE IF EXISTS {QUARANTINE_TABLE}')
+
+    def _populate_corrupt_cache(self, session):
+        """Add one good response, one corrupt response, and a redirect to the corrupt response"""
+        cache = session.cache
+        self._drop_quarantine_table(cache)
+        good_key = 'good_key'
+        corrupt_key = 'corrupt_key'
+        redirect_key = 'redirect_key'
+        cache.responses[good_key] = CachedResponse(
+            status_code=200, url='https://example.com/good'
+        )
+        cache.responses[corrupt_key] = CachedResponse(
+            status_code=200, url='https://example.com/corrupt'
+        )
+        cache.redirects[redirect_key] = corrupt_key
+
+        # Replace the serialized value with bytes that the pickle serializer can't read
+        raw_value = b'this is not a valid serialized response'
+        with cache.responses.connection(commit=True) as con:
+            con.execute(
+                f'UPDATE {cache.responses.table_name} SET value=? WHERE key=?',
+                (raw_value, corrupt_key),
+            )
+        return good_key, corrupt_key, redirect_key, raw_value
+
+    def test_scan_corrupt_entries__preview(self):
+        """A scan reports corrupt entries with raw bytes and redirect keys, without changes"""
+        session = self.init_session()
+        good_key, corrupt_key, redirect_key, raw_value = self._populate_corrupt_cache(session)
+        cache = session.cache
+
+        entries = cache.scan_corrupt_entries()
+
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry.cache_key == corrupt_key
+        assert entry.error
+        assert entry.raw_value == raw_value
+        assert entry.redirect_keys == [redirect_key]
+
+        # Preview must not modify any cache tables
+        assert good_key in cache.responses
+        assert corrupt_key in cache.responses
+        assert cache.redirects[redirect_key] == corrupt_key
+        with cache.responses.connection() as con:
+            assert con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (QUARANTINE_TABLE,),
+            ).fetchone() is None
+
+    def test_quarantine_corrupt_entries__after_preview(self):
+        """Quarantining moves the corrupt row and its redirects, keeps raw bytes, other URLs work"""
+        session = self.init_session()
+        good_key, corrupt_key, redirect_key, raw_value = self._populate_corrupt_cache(session)
+        cache = session.cache
+
+        entries = cache.scan_corrupt_entries()
+        quarantined = cache.quarantine_corrupt_entries(entries)
+
+        assert [e.cache_key for e in quarantined] == [corrupt_key]
+
+        # Corrupt response and associated redirect are removed from the active tables
+        assert corrupt_key not in cache.responses
+        assert redirect_key not in cache.redirects
+
+        # Other URLs still hit the cache normally
+        assert good_key in cache.responses
+        assert cache.get_response(good_key).status_code == 200
+        assert cache.get_response(corrupt_key) is None
+
+        # Original bytes are preserved in the quarantine table with diagnostics
+        with cache.responses.connection() as con:
+            row = con.execute(
+                f'SELECT key, value, error, redirect_keys FROM {QUARANTINE_TABLE}'
+            ).fetchone()
+        assert row[0] == corrupt_key
+        assert bytes(row[1]) == raw_value
+        assert row[2]
+        assert redirect_key in row[3]
+
+        # The same data is available through the read-back API, including raw bytes
+        quarantined_entries = cache.get_quarantined_entries()
+        assert len(quarantined_entries) == 1
+        stored = quarantined_entries[0]
+        assert stored.cache_key == corrupt_key
+        assert stored.raw_value == raw_value
+        assert stored.redirect_keys == [redirect_key]
+        assert stored.error
+        assert stored.quarantined_at is not None
+
+    def test_quarantine_corrupt_entries__scans_when_no_entries_given(self):
+        """Without an explicit list, quarantine runs a scan first and returns what it moved"""
+        session = self.init_session()
+        good_key, corrupt_key, redirect_key, _ = self._populate_corrupt_cache(session)
+        cache = session.cache
+
+        quarantined = cache.quarantine_corrupt_entries()
+
+        assert [e.cache_key for e in quarantined] == [corrupt_key]
+        assert corrupt_key not in cache.responses
+        assert good_key in cache.responses
+
+    def test_quarantine_corrupt_entries__noop_on_healthy_cache(self):
+        """A healthy cache is left untouched and no quarantine table is created"""
+        session = self.init_session()
+        self._drop_quarantine_table(session.cache)
+        session.cache.responses['key_1'] = CachedResponse(status_code=200)
+
+        assert session.cache.quarantine_corrupt_entries() == []
+        assert session.cache.get_quarantined_entries() == []
+        with session.cache.responses.connection() as con:
+            assert con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (QUARANTINE_TABLE,),
+            ).fetchone() is None
+
+    def test_quarantine_corrupt_entries__vacuum(self):
+        """The vacuum flag is forwarded to the storage backend"""
+        session = self.init_session()
+        self._populate_corrupt_cache(session)
+
+        with patch.object(SQLiteDict, 'vacuum') as mock_vacuum:
+            session.cache.quarantine_corrupt_entries(vacuum=True)
+            mock_vacuum.assert_called_once()
+
+    def test_quarantine_corrupt_entries__skips_missing_keys(self):
+        """Entries deleted between preview and confirm are skipped without failing"""
+        session = self.init_session()
+        _, corrupt_key, _, _ = self._populate_corrupt_cache(session)
+        cache = session.cache
+        entries = cache.scan_corrupt_entries()
+
+        del cache.responses[corrupt_key]
+        quarantined = cache.quarantine_corrupt_entries(entries)
+
+        assert quarantined == []
+        with cache.responses.connection() as con:
+            assert con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (QUARANTINE_TABLE,),
+            ).fetchone() is None

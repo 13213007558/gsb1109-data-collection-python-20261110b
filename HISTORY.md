@@ -1,6 +1,7 @@
 # History
 
 ## Unreleased
+* Add `SQLiteCache.scan_corrupt_entries()` and `quarantine_corrupt_entries()` to preview and then isolate corrupted responses (with their raw bytes and associated redirect keys) in a `quarantine` table, without affecting other cached URLs or deleting the database
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

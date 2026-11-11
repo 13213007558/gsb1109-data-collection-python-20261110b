@@ -5,6 +5,7 @@
    :nosignatures:
 """
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -14,8 +15,9 @@ from os.path import getsize, isfile
 from pathlib import Path
 from tempfile import gettempdir
 from time import sleep, time
-from typing import Collection, Iterator, List, Optional, Tuple, Type
+from typing import Any, Collection, Dict, Iterable, Iterator, List, Optional, Tuple, Type
 
+from attrs import define, field
 from platformdirs import user_cache_dir
 
 from .._utils import chunkify, get_valid_kwargs
@@ -23,12 +25,33 @@ from ..models.response import CachedResponse
 from ..policy import ExpirationTime
 from ..serializers import SerializerType, pickle_serializer
 from . import BaseCache, BaseStorage, StrOrPath
-from .base import VT
+from .base import DESERIALIZE_ERRORS, VT
 
 MEMORY_URI = 'file::memory:?cache=shared'
 SQLITE_MAX_VARIABLE_NUMBER = 999
+QUARANTINE_TABLE = 'quarantine'
 
 logger = getLogger(__name__)
+
+
+@define
+class CorruptCacheEntry:
+    """A cache entry whose serialized value cannot be deserialized.
+
+    Args:
+        cache_key: Cache key of the corrupted response
+        error: Deserialization error message
+        raw_value: Original serialized bytes, exactly as stored in the database
+        redirect_keys: Cache keys in the redirects table that point to this response
+        quarantined_at: Unix timestamp of when the entry was moved to the quarantine table;
+            only set for entries read back from quarantine
+    """
+
+    cache_key: str
+    error: str
+    raw_value: bytes
+    redirect_keys: List[str] = field(factory=list)
+    quarantined_at: Optional[int] = None
 
 
 class SQLiteCache(BaseCache):
@@ -188,6 +211,159 @@ class SQLiteCache(BaseCache):
             expired: Set to ``False`` to exclude expired responses
         """
         return self.responses.sorted(key, reversed, limit, expired)
+
+    def scan_corrupt_entries(self) -> List[CorruptCacheEntry]:
+        """Scan the cache for responses that cannot be deserialized, without modifying anything.
+
+        Every entry in the ``responses`` table is deserialized using the current serializer.
+        Entries that fail are returned together with their original serialized bytes and the keys
+        of any redirects that point to them, so the result can be inspected before calling
+        :py:meth:`quarantine_corrupt_entries`.
+
+        Returns:
+            Corrupted entries found in the cache
+        """
+        redirects_by_value: Dict[str, List[str]] = {}
+        with self.redirects.connection() as con:
+            for redirect_key, target_key in con.execute(
+                f'SELECT key, value FROM {self.redirects.table_name}'
+            ):
+                redirects_by_value.setdefault(target_key, []).append(redirect_key)
+
+        corrupt_entries: List[CorruptCacheEntry] = []
+        serializer = self.responses.serializer
+        if not serializer:
+            return corrupt_entries
+        with self.responses.connection() as con:
+            for cache_key, raw_value in con.execute(
+                f'SELECT key, value FROM {self.responses.table_name}'
+            ):
+                try:
+                    serializer.loads(raw_value)
+                except DESERIALIZE_ERRORS as e:
+                    logger.error(f'Unable to deserialize response with key {cache_key}: {e}')
+                    corrupt_entries.append(
+                        CorruptCacheEntry(
+                            cache_key=cache_key,
+                            error=str(e),
+                            raw_value=_to_bytes(raw_value),
+                            redirect_keys=redirects_by_value.get(cache_key, []),
+                        )
+                    )
+        return corrupt_entries
+
+    def quarantine_corrupt_entries(
+        self,
+        entries: Optional[Iterable[CorruptCacheEntry]] = None,
+        vacuum: bool = False,
+    ) -> List[CorruptCacheEntry]:
+        """Move corrupted responses into a ``quarantine`` table instead of deleting them.
+
+        This is a maintenance operation intended to be run after reviewing the results of
+        :py:meth:`scan_corrupt_entries`. Each quarantined entry keeps its original serialized
+        bytes, along with the deserialization error and the keys of the redirects associated with
+        it, so it can be inspected or repaired separately. The corrupted rows and their redirect
+        entries are removed from the active cache tables, while all other URLs keep working.
+
+        Args:
+            entries: Corrupted entries to quarantine. If not provided, a scan is run first.
+            vacuum: Vacuum the database afterwards to free up disk space
+        Returns:
+            The entries that were quarantined
+        """
+        if entries is None:
+            entries = self.scan_corrupt_entries()
+        entries = list(entries)
+        if not entries:
+            return []
+
+        responses = self.responses
+        redirects = self.redirects
+        quarantined: List[CorruptCacheEntry] = []
+        with responses.connection(commit=True) as con:
+            table_created = False
+            now = round(time())
+            for entry in entries:
+                row = con.execute(
+                    f'SELECT value FROM {responses.table_name} WHERE key=?',
+                    (entry.cache_key,),
+                ).fetchone()
+                # Skip entries that were removed between the preview and this operation
+                if row is None:
+                    logger.debug(
+                        f'Skipping quarantine for missing cache key: {entry.cache_key}'
+                    )
+                    continue
+                if not table_created:
+                    con.execute(
+                        f'CREATE TABLE IF NOT EXISTS {QUARANTINE_TABLE} ('
+                        '    key TEXT PRIMARY KEY,'
+                        '    value BLOB,'
+                        '    error TEXT,'
+                        '    redirect_keys TEXT,'
+                        '    quarantined_at INTEGER'
+                        ')'
+                    )
+                    table_created = True
+                con.execute(
+                    f'INSERT OR REPLACE INTO {QUARANTINE_TABLE}'
+                    ' (key, value, error, redirect_keys, quarantined_at) VALUES (?,?,?,?,?)',
+                    (
+                        entry.cache_key,
+                        row[0],
+                        entry.error,
+                        json.dumps(entry.redirect_keys),
+                        now,
+                    ),
+                )
+                con.execute(
+                    f'DELETE FROM {responses.table_name} WHERE key=?',
+                    (entry.cache_key,),
+                )
+                if entry.redirect_keys:
+                    marks, args = _format_sequence(entry.redirect_keys)
+                    con.execute(
+                        f'DELETE FROM {redirects.table_name} WHERE key IN ({marks})',
+                        args,
+                    )
+                quarantined.append(entry)
+
+        if quarantined:
+            logger.info(f'Quarantined {len(quarantined)} corrupted response(s)')
+        if vacuum and quarantined:
+            responses.vacuum()
+        return quarantined
+
+    def get_quarantined_entries(self) -> List[CorruptCacheEntry]:
+        """Read corrupted entries previously moved to the ``quarantine`` table.
+
+        The original serialized bytes are included, so entries can be inspected or repaired
+        separately without affecting the active cache tables.
+
+        Returns:
+            Quarantined entries, in the order they were stored
+        """
+        entries: List[CorruptCacheEntry] = []
+        with self.responses.connection() as con:
+            try:
+                rows = con.execute(
+                    f'SELECT key, value, error, redirect_keys, quarantined_at'
+                    f' FROM {QUARANTINE_TABLE} ORDER BY quarantined_at'
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return entries
+
+        for cache_key, raw_value, error, redirect_keys, quarantined_at in rows:
+            entries.append(
+                CorruptCacheEntry(
+                    cache_key=cache_key,
+                    error=error,
+                    raw_value=_to_bytes(raw_value),
+                    redirect_keys=json.loads(redirect_keys) if redirect_keys else [],
+                    quarantined_at=quarantined_at,
+                )
+            )
+        return entries
 
 
 class SQLiteDict(BaseStorage):
@@ -459,6 +635,11 @@ class SQLiteDict(BaseStorage):
 def _format_sequence(values: Collection) -> Tuple[str, List]:
     """Get SQL parameter marks for a sequence-based query"""
     return ','.join(['?'] * len(values)), list(values)
+
+
+def _to_bytes(value: Any) -> bytes:
+    """Return a stored BLOB value as plain bytes, regardless of the sqlite3 row factory/type"""
+    return bytes(value) if isinstance(value, (bytes, bytearray, memoryview)) else value
 
 
 def _get_sqlite_cache_path(

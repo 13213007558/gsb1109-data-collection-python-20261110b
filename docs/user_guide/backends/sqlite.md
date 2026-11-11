@@ -88,6 +88,32 @@ enabled with the `wal` option:
 >>> backend = SQLiteCache(wal=True)
 ```
 
+## Quarantining Corrupted Entries
+Occasionally a single cached response may fail to deserialize, for example after a dependency or
+serializer upgrade. Such entries are simply skipped during normal cache reads, but they remain in
+the database. Instead of deleting the whole cache, the SQLite backend provides a maintenance
+operation that isolates the affected entries one at a time.
+
+First, preview the corrupted entries without modifying anything:
+```python
+>>> from requests_cache import SQLiteCache
+>>> backend = SQLiteCache()
+>>> entries = backend.scan_corrupt_entries()
+```
+Each {py:class}`.CorruptCacheEntry` reports the affected cache key, the deserialization error, the
+keys of any redirects pointing to it, and the original serialized bytes.
+
+After reviewing the preview, move those entries into a separate `quarantine` table. The corrupted
+rows and their associated redirect entries are removed from the active cache tables, while every
+other URL continues to hit the cache. The original bytes are preserved rather than deleted, so they
+can be inspected or repaired from an admin tool afterwards:
+```python
+>>> backend.quarantine_corrupt_entries(entries)
+>>> backend.get_quarantined_entries()
+```
+If called without arguments, `quarantine_corrupt_entries()` runs a scan first. Pass
+`vacuum=True` to reclaim disk space afterwards.
+
 ## Hosting Services and Filesystem Compatibility
 There are some caveats to using SQLite with some hosting services, based on what kind of storage is
 available:
