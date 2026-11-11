@@ -72,6 +72,16 @@ example "%Y-%m-%d".
 
 Skip empty lines.
 
+=item B<--formula-status>
+
+Annotate formula cells with their cached value status and cell
+reference: #FORMULA_OK!E<lt>refE<gt>:E<lt>valueE<gt> when a cached value
+is stored, #FORMULA_ERROR!E<lt>refE<gt>:E<lt>errorE<gt> when the cached
+value is an error, #FORMULA_MISSING!E<lt>refE<gt> when the workbook
+stored no cached value. Non-formula cells are output unchanged. Shared
+formula cells are judged by their own cached value; the master formula
+cell's value is never copied to the other cells.
+
 =item B<-p SHEETDELIMITER, --sheetdelimiter=SHEETDELIMITER>
 
 Sheet delimiter used to separate sheets, pass "" if you don't want

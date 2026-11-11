@@ -203,6 +203,7 @@ class Xlsx2csv:
        exclude_sheet_pattern - exclude sheets named matching given pattern
        exclude_hidden_sheets - exclude hidden sheets
        skip_hidden_rows - skip hidden rows
+       formula_status - annotate formula cells with their cached value status
     """
 
     def __init__(self, xlsxfile, **options):
@@ -229,6 +230,7 @@ class Xlsx2csv:
         options.setdefault("skip_hidden_rows", True)
         options.setdefault("ignore_invalid_char_data", False)
         options.setdefault("ignore_percentage", False)
+        options.setdefault("formula_status", False)
 
         self.options = options
         self.py3 = sys.version_info[0] == 3
@@ -424,6 +426,7 @@ class Xlsx2csv:
                 sheet.set_skip_hidden_rows(self.options['skip_hidden_rows'])
                 sheet.set_no_line_breaks(self.options['no_line_breaks'])
                 sheet.set_ignore_percentage(self.options['ignore_percentage'])
+                sheet.set_formula_status(self.options['formula_status'])
                 if self.options['escape_strings'] and sheet.filedata:
                     sheet.filedata = re.sub(r"(<v>[^<>]+)&#10;([^<>]+</v>)", r"\1\\n\2",
                                             re.sub(r"(<v>[^<>]+)&#9;([^<>]+</v>)", r"\1\\t\2",
@@ -711,6 +714,8 @@ class Sheet:
         self.in_row = False
         self.in_cell = False
         self.in_cell_value = False
+        self.in_cell_formula = False
+        self.cell_has_value = False
 
         self.columns = {}
         self.lastRowNum = 0
@@ -739,6 +744,7 @@ class Sheet:
         self.skip_hidden_rows = False
         self.no_line_breaks = False
         self.ignore_percentage = False
+        self.formula_status = False
 
         self.colIndex = 0
         self.colNum = ""
@@ -774,6 +780,9 @@ class Sheet:
 
     def set_ignore_percentage(self, ignore_percentage):
         self.ignore_percentage = ignore_percentage
+
+    def set_formula_status(self, formula_status):
+        self.formula_status = formula_status
 
     def set_merge_cells(self, mergecells):
         if not mergecells:
@@ -1037,8 +1046,15 @@ class Sheet:
                 self.colIndex += 1
             self.data = ""
             self.in_cell = True
+            self.in_cell_formula = False
+            self.cell_has_value = False
         elif self.in_cell and ((name == 'v' or name == 't') or (has_namespace and (name.endswith(':v') or name.endswith(':t')))):
             self.in_cell_value = True
+            self.cell_has_value = True
+        elif self.in_cell and (name == 'f' or (has_namespace and name.endswith(':f'))):
+            # formula cell: shared formula cells are judged by their own cached
+            # value, the master formula cell's value is never copied over
+            self.in_cell_formula = True
         elif self.in_sheet and (name == 'row' or (has_namespace and name.endswith(':row'))) and not (self.skip_hidden_rows and 'hidden' in attrs and attrs['hidden'] in ('1', 'true')):
             self.rowIndex += 1
             if 'r' in attrs:
@@ -1079,6 +1095,15 @@ class Sheet:
             t = 0
             for i in self.colNum: t = t * 26 + ord(i) - 64
             d = self.data
+            if self.formula_status and self.in_cell_formula:
+                cellref = self.cellId or ""
+                if not self.cell_has_value:
+                    # no cached value stored in the workbook
+                    d = "#FORMULA_MISSING!" + cellref
+                elif self.colType == "e" or d in EXCEL_ERROR_VALUES:
+                    d = "#FORMULA_ERROR!" + cellref + ":" + d
+                else:
+                    d = "#FORMULA_OK!" + cellref + ":" + d
             if self.hyperlinks:
                 hyperlink = self.hyperlinks.get(self.cellId)
                 if hyperlink:
@@ -1280,6 +1305,11 @@ def main():
                         help="continue processing remaining files when an error occurs during batch processing")
     parser.add_argument("--ignore-percentage", dest="ignore_percentage", default=False, action="store_true",
                         help="ignore percentage formatting and output raw values")
+    parser.add_argument("--formula-status", dest="formula_status", default=False, action="store_true",
+                        help="annotate formula cells with their cached value status and cell reference: "
+                             "#FORMULA_OK!<ref>:<value> when a cached value is stored, "
+                             "#FORMULA_ERROR!<ref>:<error> when the cached value is an error, "
+                             "#FORMULA_MISSING!<ref> when the workbook stored no cached value")
 
     if argparser:
         options = parser.parse_args()
@@ -1358,7 +1388,8 @@ def main():
         'lineterminator': options.lineterminator,
         'ignore_formats': options.ignore_formats,
         'skip_hidden_rows': not options.include_hidden_rows,
-        'ignore_percentage': options.ignore_percentage
+        'ignore_percentage': options.ignore_percentage,
+        'formula_status': options.formula_status
     }
     sheetid = options.sheetid
     if options.all:

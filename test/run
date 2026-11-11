@@ -92,6 +92,7 @@ compare("quoted_literals")
 compare("date1904_0")
 compare("date1904_1")
 compare("hidden_rows")
+compare("formula_status", ["--formula-status"])
 
 
 def test_dir_sheetname():

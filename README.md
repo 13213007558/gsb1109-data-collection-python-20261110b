@@ -79,6 +79,14 @@ Also works standalone with only the *xlsx2csv.py* script.
                         exclude sheets with names matching the given pattern, only
                         affects when -a option is enabled.
   -m, --merge-cells     merge cells
+  --formula-status      annotate formula cells with their cached value status
+                        and cell reference: #FORMULA_OK!<ref>:<value> when a
+                        cached value is stored, #FORMULA_ERROR!<ref>:<error>
+                        when the cached value is an error, #FORMULA_MISSING!<ref>
+                        when the workbook stored no cached value. Non-formula
+                        cells are output unchanged. Shared formula cells are
+                        judged by their own cached value; the master formula
+                        cell's value is never copied to the other cells.
 ```
 
 Usage with a folder containing multiple `xlsx` files:
