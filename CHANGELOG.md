@@ -2,6 +2,13 @@
 
 ## Development
 
+* Added `ijson.confirmed_items`, an adapter that streams a paged response
+  envelope in a single pass, spools rows to temporary storage, and only
+  yields them once the envelope's trailing (or leading) status member has
+  been confirmed. Envelopes with a missing or repeated status raise the new
+  `ijson.BadEnvelopeError`; a non-matching status, a truncated response or
+  an early close of the generator never yield uncommitted rows and always
+  release the temporary staging file.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).
