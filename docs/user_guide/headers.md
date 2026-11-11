@@ -30,6 +30,27 @@ True
 Also see {ref}`stale-while-revalidate` for a variation of this behavior.
 ```
 
+(update-get-on-head)=
+## Refreshing Cached GETs With HEAD
+If you periodically send `HEAD` requests to check whether a resource has changed (for example,
+a crawler checking large attachments without downloading them), you can use those responses to
+update an already cached `GET` response with the `update_get_on_head` option:
+```python
+>>> session = CachedSession(update_get_on_head=True)
+```
+
+When a `HEAD` response is received, requests-cache looks up the cached `GET` response for the
+same URL (including the same {ref}`content negotiation <matching-headers>` headers, if any):
+* If the `HEAD` response's validators (`ETag` and/or `Last-Modified`) match the cached response,
+  it's still the same representation: the cached response's headers and expiration are updated,
+  and its content is kept as-is.
+* If the validators indicate the content has changed, the cached `GET` response is deleted, so it
+  will no longer be returned from the cache.
+* If there is no cached `GET` response, nothing happens; a `HEAD` response alone has no content,
+  so it can't be used to create a readable cache entry.
+* If the `HEAD` response shares no validators with the cached response, the cache is left
+  unchanged.
+
 (cache-control)=
 ## Cache-Control
 `Cache-Control` **request** headers will always be used if present. This is mainly useful if you are

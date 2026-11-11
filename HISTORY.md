@@ -1,6 +1,8 @@
 # History
 
 ## Unreleased
+* Add `update_get_on_head` option to update or invalidate a cached GET response based on validators
+  from a HEAD response for the same URL
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

@@ -5,7 +5,7 @@ from logging import getLogger
 from threading import RLock, Thread
 from typing import TYPE_CHECKING, Iterable, Mapping, Optional, Union
 
-from requests import PreparedRequest
+from requests import PreparedRequest, Response
 from requests import Session as OriginalSession
 from requests.hooks import dispatch_hook
 
@@ -59,6 +59,7 @@ class CacheMixin(MIXIN_BASE):
         key_fn: Optional[KeyCallback] = None,
         read_only: bool = False,
         stale_if_error: Union[bool, int] = False,
+        update_get_on_head: bool = False,
         autoclose: bool = True,
         **kwargs,
     ):
@@ -77,6 +78,7 @@ class CacheMixin(MIXIN_BASE):
             key_fn=key_fn,
             read_only=read_only,
             stale_if_error=stale_if_error,
+            update_get_on_head=update_get_on_head,
             autoclose=autoclose,
             **kwargs,
         )
@@ -277,6 +279,13 @@ class CacheMixin(MIXIN_BASE):
         """Send a request and cache the response, unless disabled by settings or headers.
         If applicable, also handle conditional requests.
         """
+        # If enabled, a HEAD response may be used to update a cached GET response; snapshot a
+        # GET-equivalent request for cache key lookup before validation headers are applied
+        get_request = None
+        if self.settings.update_get_on_head and request.method == 'HEAD':
+            get_request = request.copy()
+            get_request.method = 'GET'
+
         request = actions.update_request(request)
         response = super().send(request, **kwargs)
         actions.update_from_response(response)
@@ -294,12 +303,80 @@ class CacheMixin(MIXIN_BASE):
         else:
             logger.debug(f'Skipping cache write for URL: {request.url}')
 
+        if get_request is not None and not isinstance(response, CachedResponse):
+            self._update_cached_get_from_head(get_request, response, **kwargs)
+
         # This is possible if the original request is a cache miss, but updating its validation
         # headers results in redirecting to a different URL that is a cache hit
         if isinstance(response, CachedResponse):
             return response
         else:
             return OriginalResponse.wrap_response(response, actions)
+
+    def _update_cached_get_from_head(
+        self,
+        get_request: PreparedRequest,
+        head_response: Response,
+        **kwargs,
+    ) -> None:
+        """Use a fresh HEAD response to update or invalidate a cached GET response for the same
+        URL, if one exists. See the ``update_get_on_head`` option for details.
+
+        * If the HEAD response's validators match the cached GET, the cached response is still
+          the same representation: update its mutable metadata (headers and expiration), and keep
+          the cached GET body.
+        * If the validators indicate the content has changed, delete the cached GET response so
+          it is no longer returned from the cache.
+        * If there is no cached GET response, do nothing; a HEAD response alone is not enough to
+          create a cache entry with a readable body.
+        """
+        # Look up the cached GET response the same way a real GET request would, including
+        # Vary-based content negotiation, so variants don't affect each other
+        cache_key = self.cache.create_key(get_request, **kwargs)
+        actions = CacheActions.from_request(cache_key, get_request, self.settings)
+        cached_response = self.cache.get_response(actions.cache_key)
+        actions.update_from_cached_response(cached_response, self.cache.create_key, **kwargs)
+
+        if actions.vary_cache_key:
+            cached_response = self.cache.get_response(actions.vary_cache_key)
+            if cached_response is None:
+                return
+            actions.cache_key = actions.vary_cache_key
+        elif cached_response is None or not actions._vary_matched:
+            return
+
+        # Compare validators shared by the HEAD response and the cached GET response
+        comparisons = []
+        for header in ('ETag', 'Last-Modified'):
+            head_value = head_response.headers.get(header)
+            cached_value = cached_response.headers.get(header)
+            if head_value and cached_value:
+                comparisons.append(_normalize_etag(head_value) == _normalize_etag(cached_value))
+
+        if not comparisons:
+            logger.debug(
+                f'HEAD response for URL {head_response.url} shares no validators with the '
+                'cached GET response; skipping cache update'
+            )
+            return
+
+        if not all(comparisons):
+            logger.debug(
+                f'HEAD response for URL {head_response.url} has different validators; '
+                'invalidating cached GET response'
+            )
+            if not (self.settings.read_only or self.settings.disabled):
+                self.cache.delete(actions.cache_key)
+            return
+
+        # The representation is unchanged; freshen the cached GET response's metadata
+        actions.update_from_response(head_response)
+        updated_response = actions.update_revalidated_response(
+            head_response, CachedResponse.from_response(cached_response)
+        )
+        updated_response.cache_key = actions.cache_key
+        if not actions.skip_write:
+            self.cache.save_response(updated_response, actions.cache_key, actions.expires)
 
     def _resend(
         self,
@@ -411,12 +488,21 @@ class CachedSession(CacheMixin, OriginalSession):
             accepts a time value representing maximum staleness to accept.
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
+        update_get_on_head: Use HEAD responses to update or invalidate a cached GET response for
+            the same URL, based on validators. See :ref:`update-get-on-head` for details.
         autoclose: Close the cache backend when the session is closed
         filter_fn: Response filtering function that indicates whether or not a given response should
             be cached. See :ref:`custom-filtering` for details.
         key_fn: Request matching function for generating custom cache keys. See
             :ref:`custom-matching` for details.
     """
+
+
+def _normalize_etag(etag: str) -> str:
+    """Normalize an ETag for weak comparison (ignore the ``W/`` prefix); also used for
+    ``Last-Modified`` values, which are compared as-is
+    """
+    return etag[2:] if etag.startswith('W/') else etag
 
 
 def get_504_response(request: PreparedRequest) -> CachedResponse:

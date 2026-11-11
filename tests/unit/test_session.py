@@ -32,6 +32,8 @@ from requests_cache.policy import (
 from requests_cache.policy.actions import METHOD_OVERRIDE_HEADERS
 from requests_cache.session import OriginalSession
 from tests.conftest import (
+    ETAG,
+    LAST_MODIFIED,
     MOCKED_URL,
     MOCKED_URL_200_404,
     MOCKED_URL_404,
@@ -1437,6 +1439,152 @@ def test_request_refresh__no_validator(mock_session):
     assert response_2.from_cache is True
     assert response_3.from_cache is True and response_3.revalidated is False
     assert response_2.expires == response_4.expires
+
+
+def test_update_get_on_head__refresh(mock_session):
+    """With update_get_on_head, a HEAD response with matching validators should update the cached
+    GET response's headers and expiration, and keep its content
+    """
+    mock_session.settings.update_get_on_head = True
+    mock_session.settings.expire_after = 60
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL_ETAG, headers={'ETag': ETAG}, text='mock response'
+    )
+    response_1 = mock_session.get(MOCKED_URL_ETAG)
+
+    mock_session.mock_adapter.register_uri(
+        'HEAD', MOCKED_URL_ETAG, headers={'ETag': ETAG, 'new_header': 'true'}
+    )
+    mock_session.head(MOCKED_URL_ETAG, expire_after=3600)
+    response_2 = mock_session.get(MOCKED_URL_ETAG)
+
+    assert response_1.from_cache is False
+    assert response_2.from_cache is True
+    assert response_2.text == 'mock response'
+    assert response_2.headers['new_header'] == 'true'
+    assert response_2.expires > response_1.expires
+
+
+def test_update_get_on_head__last_modified(mock_session):
+    """Last-Modified may be used as a validator if ETag is not available"""
+    mock_session.settings.update_get_on_head = True
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL, headers={'Last-Modified': LAST_MODIFIED}, text='mock response'
+    )
+    mock_session.get(MOCKED_URL)
+
+    # Same Last-Modified: the cached GET response is refreshed
+    mock_session.mock_adapter.register_uri(
+        'HEAD', MOCKED_URL, headers={'Last-Modified': LAST_MODIFIED, 'new_header': 'true'}
+    )
+    mock_session.head(MOCKED_URL)
+    response = mock_session.get(MOCKED_URL)
+    assert response.from_cache is True
+    assert response.headers['new_header'] == 'true'
+
+    # Different Last-Modified: the cached GET response is invalidated
+    mock_session.mock_adapter.register_uri(
+        'HEAD', MOCKED_URL, headers={'Last-Modified': 'Thu, 05 Jul 2012 15:31:31 GMT'}
+    )
+    mock_session.head(MOCKED_URL, force_refresh=True)
+    assert not mock_session.cache.contains(url=MOCKED_URL)
+
+
+def test_update_get_on_head__content_changed(mock_session):
+    """A HEAD response with different validators should invalidate the cached GET response"""
+    mock_session.settings.update_get_on_head = True
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL_ETAG, headers={'ETag': ETAG}, text='mock response'
+    )
+    mock_session.get(MOCKED_URL_ETAG)
+
+    mock_session.mock_adapter.register_uri('HEAD', MOCKED_URL_ETAG, headers={'ETag': '"new_etag"'})
+    mock_session.head(MOCKED_URL_ETAG)
+
+    assert not mock_session.cache.contains(url=MOCKED_URL_ETAG)
+    assert mock_session.get(MOCKED_URL_ETAG).from_cache is False
+
+
+def test_update_get_on_head__no_cached_get(mock_session):
+    """A HEAD response alone should not create a GET cache entry, since it has no content"""
+    mock_session.settings.update_get_on_head = True
+    mock_session.head(MOCKED_URL_ETAG)
+
+    assert not mock_session.cache.contains(url=MOCKED_URL_ETAG)
+    assert mock_session.get(MOCKED_URL_ETAG).from_cache is False
+
+
+def test_update_get_on_head__disabled_by_default(mock_session):
+    """By default, a HEAD response should not affect a cached GET response"""
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL_ETAG, headers={'ETag': ETAG}, text='mock response'
+    )
+    mock_session.get(MOCKED_URL_ETAG)
+
+    mock_session.mock_adapter.register_uri('HEAD', MOCKED_URL_ETAG, headers={'ETag': '"new_etag"'})
+    mock_session.head(MOCKED_URL_ETAG)
+
+    assert mock_session.cache.contains(url=MOCKED_URL_ETAG)
+    assert mock_session.get(MOCKED_URL_ETAG).from_cache is True
+
+
+def test_update_get_on_head__no_validator(mock_session):
+    """A HEAD response that shares no validators with the cached GET response can't confirm
+    whether the content changed, so the cache should be left unchanged
+    """
+    mock_session.settings.update_get_on_head = True
+    mock_session.get(MOCKED_URL)
+    mock_session.head(MOCKED_URL)
+
+    assert mock_session.cache.contains(url=MOCKED_URL)
+    assert mock_session.get(MOCKED_URL).from_cache is True
+
+
+def test_update_get_on_head__match_headers(mock_session):
+    """With match_headers, a HEAD request should only update a cached GET response with
+    matching headers
+    """
+    mock_session.settings.update_get_on_head = True
+    mock_session.settings.match_headers = ['Accept']
+    json_headers = {'Accept': 'application/json'}
+    html_headers = {'Accept': 'text/html'}
+
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL_ETAG, headers={'ETag': ETAG}, text='mock response'
+    )
+    mock_session.get(MOCKED_URL_ETAG, headers=json_headers)
+
+    # Different Accept header: different cache key, so the cached GET is not affected
+    mock_session.mock_adapter.register_uri('HEAD', MOCKED_URL_ETAG, headers={'ETag': '"new_etag"'})
+    mock_session.head(MOCKED_URL_ETAG, headers=html_headers)
+    assert mock_session.get(MOCKED_URL_ETAG, headers=json_headers).from_cache is True
+
+    # Matching Accept header with a changed validator: the cached GET is invalidated
+    mock_session.head(MOCKED_URL_ETAG, headers=json_headers, force_refresh=True)
+    assert mock_session.get(MOCKED_URL_ETAG, headers=json_headers).from_cache is False
+
+
+def test_update_get_on_head__vary(mock_session):
+    """With Vary, a HEAD request should only update the cached GET variant that matches its
+    content negotiation headers
+    """
+    mock_session.settings.update_get_on_head = True
+    json_headers = {'Accept': 'application/json'}
+    html_headers = {'Accept': 'text/html'}
+
+    mock_session.mock_adapter.register_uri(
+        'GET', MOCKED_URL_VARY, headers={'Vary': 'Accept', 'ETag': ETAG}, text='mock response'
+    )
+    mock_session.get(MOCKED_URL_VARY, headers=json_headers)
+
+    # A HEAD request with different negotiation headers should not affect the cached GET
+    mock_session.mock_adapter.register_uri('HEAD', MOCKED_URL_VARY, headers={'ETag': '"new_etag"'})
+    mock_session.head(MOCKED_URL_VARY, headers=html_headers)
+    assert mock_session.get(MOCKED_URL_VARY, headers=json_headers).from_cache is True
+
+    # A HEAD request with matching headers and a changed validator should invalidate it
+    mock_session.head(MOCKED_URL_VARY, headers=json_headers, force_refresh=True)
+    assert mock_session.get(MOCKED_URL_VARY, headers=json_headers).from_cache is False
 
 
 def test_request_refresh__prepared_request(mock_session):
