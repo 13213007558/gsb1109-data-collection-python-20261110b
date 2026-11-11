@@ -9,7 +9,7 @@
 Wrapper for _yajl2 C extension module
 '''
 
-from ijson import common, compat, utils
+from ijson import common, compat, utils, utils35
 from . import _yajl2
 
 
@@ -54,17 +54,36 @@ def kvitems_async(file, prefix, map_type=None, **kwargs):
     buf_size = _get_buf_size(kwargs)
     return _yajl2.kvitems_async(file, buf_size, prefix, map_type, **kwargs)
 
-@utils.coroutine
-def items_basecoro(target, prefix, map_type=None, **kwargs):
-    return _yajl2.items_basecoro(target.send, prefix, map_type, **kwargs)
+def items_basecoro(target, prefix, map_type=None, should_include=None, **kwargs):
+    if should_include is not None:
+        # Branch filtering is not supported by the C implementation;
+        # use the generic python coroutine instead, which works on top
+        # of the parsing events produced by this backend
+        return common.items_basecoro(
+            target, prefix, map_type=map_type, should_include=should_include
+        )
+    coro = _yajl2.items_basecoro(target.send, prefix, map_type, **kwargs)
+    next(coro)
+    return coro
 
-def items_gen(file, prefix, map_type=None, **kwargs):
+def items_gen(file, prefix, map_type=None, should_include=None, **kwargs):
     f = compat.bytes_reader(file)
     buf_size = _get_buf_size(kwargs)
+    if should_include is not None:
+        # See items_basecoro
+        return utils.coros2gen(
+            common.file_source(f, buf_size=buf_size),
+            *common._items_pipeline(globals(), prefix, map_type, should_include, kwargs)
+        )
     return _yajl2.items(f, buf_size, prefix, map_type, **kwargs)
 
-def items_async(file, prefix, map_type=None, **kwargs):
+def items_async(file, prefix, map_type=None, should_include=None, **kwargs):
     buf_size = _get_buf_size(kwargs)
+    if should_include is not None:
+        # See items_basecoro
+        return utils35.async_iterable(file, buf_size,
+            *common._items_pipeline(globals(), prefix, map_type, should_include, kwargs)
+        )
     return _yajl2.items_async(file, buf_size, prefix, map_type, **kwargs)
 
 common.enrich_backend(globals())

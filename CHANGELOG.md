@@ -2,6 +2,13 @@
 
 ## Development
 
+* The `items` function (and all its variants) now accepts
+  an optional `should_include` callback,
+  called as `should_include(path, kind)` for every value
+  about to be added to the objects being built.
+  When it returns a false value the branch is excluded from the result
+  without building any python objects for it,
+  while malformed JSON within the branch is still reported as an error.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

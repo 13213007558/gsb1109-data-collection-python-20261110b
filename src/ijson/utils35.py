@@ -78,9 +78,9 @@ def _make_parse_async(backend):
     return parse_async
 
 def _make_items_async(backend):
-    def items_async(f, prefix, map_type=None, buf_size=64*1024, **config):
+    def items_async(f, prefix, map_type=None, buf_size=64*1024, should_include=None, **config):
         return async_iterable(f, buf_size,
-            *common._items_pipeline(backend, prefix, map_type, config)
+            *common._items_pipeline(backend, prefix, map_type, should_include, config)
         )
     return items_async
 

@@ -5,6 +5,8 @@ import sys
 
 import pytest
 
+from decimal import Decimal
+
 from .test_base import ARRAY_JSON, ARRAY_JSON_OBJECT, EMPTY_MEMBER_TEST_CASES, JSON, JSON_OBJECT
 
 from ijson import JSONError
@@ -107,3 +109,93 @@ def test_items_int_exceeding_max_str_digits(adaptor):
     json = b'[%s]' % (b'1' * (sys.get_int_max_str_digits() + 1))
     with pytest.raises(ValueError, match="integer string conversion"):
         adaptor.items(json, 'item')
+
+
+RECORDS_JSON = b'''[
+  {"id": 1, "name": "a", "debug_payload": {"blob": [1, 2, 3], "meta": {"size": 1.5}}},
+  {"id": 2, "name": "b"},
+  {"id": 3, "name": "c", "debug_payload": {"blob": [4, 5, 6]}}
+]'''
+
+
+def test_items_should_include(adaptor):
+    """Branches rejected by should_include don't make it into the result"""
+    def should_include(path, kind):
+        return path != 'debug_payload'
+    result = adaptor.items(RECORDS_JSON, 'item', should_include=should_include)
+    assert [
+        {'id': 1, 'name': 'a'},
+        {'id': 2, 'name': 'b'},
+        {'id': 3, 'name': 'c'},
+    ] == result
+
+
+def test_items_should_include_paths_and_kinds(adaptor):
+    """should_include is called with the path and kind of every value"""
+    calls = []
+    def should_include(path, kind):
+        calls.append((path, kind))
+        return True
+    adaptor.items(b'{"a": [1, {"b": "x"}], "c": null}', '', should_include=should_include)
+    assert [
+        ('', 'object'),
+        ('a', 'array'),
+        ('a.item', 'scalar'),
+        ('a.item', 'object'),
+        ('a.item.b', 'scalar'),
+        ('c', 'scalar'),
+    ] == calls
+
+
+def test_items_should_include_scalars_and_arrays(adaptor):
+    """Scalar and array branches can be excluded too"""
+    def should_include(path, kind):
+        return not (path == 'id' or kind == 'array')
+    result = adaptor.items(RECORDS_JSON, 'item', should_include=should_include)
+    assert [
+        {'name': 'a', 'debug_payload': {'meta': {'size': Decimal('1.5')}}},
+        {'name': 'b'},
+        {'name': 'c', 'debug_payload': {}},
+    ] == result
+
+
+def test_items_should_include_does_not_build_excluded_branches(adaptor):
+    """No python objects are built for excluded branches"""
+    built = []
+    class CountingDict(dict):
+        def __init__(self):
+            built.append(1)
+            super().__init__()
+    def should_include(path, kind):
+        return path != 'debug_payload'
+    result = adaptor.items(
+        RECORDS_JSON, 'item', map_type=CountingDict, should_include=should_include
+    )
+    # Only the three top-level records are built; the excluded
+    # debug_payload objects (and their nested "meta" object) are not
+    assert 3 == len(built)
+    assert {'id': 1, 'name': 'a'} == result[0]
+
+
+def test_items_should_include_bad_json_still_fails(adaptor):
+    """Malformed JSON inside an excluded branch is still reported"""
+    json = b'[{"id": 1, "debug_payload": {"blob": [1, 2, }}, {"id": 2}]'
+    def should_include(path, kind):
+        return path != 'debug_payload'
+    with pytest.raises(JSONError):
+        adaptor.items(json, 'item', should_include=should_include)
+
+
+def test_items_should_include_keeps_other_options(adaptor):
+    """map_type and use_float keep working together with should_include"""
+    json = b'{"a": 1.5, "b": {"c": 2.5}}'
+    def should_include(path, kind):
+        return path != 'b'
+    result = adaptor.items(
+        json, '', map_type=collections.OrderedDict, use_float=True,
+        should_include=should_include
+    )
+    assert 1 == len(result)
+    assert isinstance(result[0], collections.OrderedDict)
+    assert {'a': 1.5} == result[0]
+    assert isinstance(result[0]['a'], float)
