@@ -21,6 +21,15 @@ Dataset Object
    :inherited-members:
 
 
+--------------
+Column Object
+--------------
+
+
+.. autoclass:: Column
+   :members:
+
+
 ---------------
 Databook Object
 ---------------

@@ -1,5 +1,7 @@
-""" Tablib - DataFrame Support.
+""" Tablib - DataFrame Support
 """
+
+__lazy_modules__ = {"pandas"}
 
 try:
     from pandas import DataFrame
@@ -25,14 +27,24 @@ class DataFrameFormat:
             return False
 
     @classmethod
-    def export_set(cls, dset):
-        """Returns DataFrame representation of DataBook."""
+    def export_set(cls, dset, column_keys=None):
+        """Returns DataFrame representation of DataBook.
+
+        A DataFrame built from dictionaries cannot hold two columns with the
+        same label, so duplicate display headers are resolved to the stable
+        column keys instead of overwriting a column. Pass ``column_keys`` to
+        provide caller-chosen unique column names (one per column).
+        """
         if DataFrame is None:
             raise NotImplementedError(
                 'DataFrame Format requires `pandas` to be installed.'
                 ' Try `pip install "tablib[pandas]"`.')
-        dataframe = DataFrame(dset.dict, columns=dset.headers)
-        return dataframe
+        if dset.headers is None:
+            return DataFrame(dset.dict)
+
+        keys = dset._resolve_export_keys(column_keys)
+        records = dset._package(key_headers=keys)
+        return DataFrame(records, columns=keys if keys is not None else dset.headers)
 
     @classmethod
     def import_set(cls, dset, in_stream):

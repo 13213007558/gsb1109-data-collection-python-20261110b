@@ -11,8 +11,11 @@ except ImportError:
 
 
 from .core import (  # noqa: F401
+    Column,
     Databook,
     Dataset,
+    DuplicateHeaders,
+    InvalidColumnKey,
     InvalidDatasetType,
     InvalidDimensions,
     UnsupportedFormat,

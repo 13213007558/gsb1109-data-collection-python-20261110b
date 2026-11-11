@@ -45,18 +45,26 @@ class SQLFormat:
         return f"'{text}'"
 
     @classmethod
-    def export_set(cls, dataset, table=None, columns=None, commit=False):
+    def export_set(cls, dataset, table=None, columns=None, commit=False,
+                   column_keys=None):
         """
         Return SQL INSERT statements for Dataset rows.
         :param table: optional table name; defaults to dataset.title or 'data'
+        :param column_keys: optional unique column identifiers, one per
+            column. Used in place of the display headers when headers contain
+            duplicates so the generated statement does not reference the same
+            column twice.
         """
         tbl = table or getattr(dataset, 'title', None) or 'export_table'
         tbl_ident = str(tbl)
-        columns_headers = (','.join(
-                columns if columns is not None else
-                dataset.headers if dataset.headers is not None else []
-            )
-        )
+        if columns is not None:
+            column_identifiers = columns
+        elif dataset.headers is not None:
+            resolved = dataset._resolve_export_keys(column_keys)
+            column_identifiers = resolved if resolved is not None else dataset.headers
+        else:
+            column_identifiers = []
+        columns_headers = ','.join(column_identifiers)
         columns_headers = f' ({columns_headers})' if columns_headers else ''
         statements = []
         for row in dataset._data:

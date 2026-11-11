@@ -20,3 +20,16 @@ class HeadersNeeded(TablibException, AttributeError):
 
 class UnsupportedFormat(TablibException, NotImplementedError):
     """Format not supported."""
+
+
+class DuplicateHeaders(TablibException, ValueError):
+    """The Dataset has duplicate headers that cannot be represented uniquely.
+
+    Raised by export formats relying on unique object keys (such as JSON,
+    YAML or DataFrame) when :attr:`Dataset.headers` contains duplicates and no
+    ``column_keys`` override has been supplied for the export.
+    """
+
+
+class InvalidColumnKey(TablibException, KeyError):
+    """A column key does not exist or is not unique within the Dataset."""

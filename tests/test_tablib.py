@@ -18,8 +18,9 @@ from odf import opendocument, table
 from openpyxl.reader.excel import load_workbook
 
 import tablib
+from tablib import Column, DuplicateHeaders, InvalidColumnKey
 from tablib.core import Row, detect_format
-from tablib.exceptions import UnsupportedFormat
+from tablib.exceptions import InvalidDatasetIndex, UnsupportedFormat
 from tablib.formats import registry
 
 try:
@@ -2144,3 +2145,267 @@ class SQLFormatTests(unittest.TestCase):
         expected = ("INSERT INTO schema_name.custom_table (col1,col2)"
                     " VALUES (1, 'test');\nCOMMIT;\n")
         self.assertEqual(sql, expected)
+
+
+class DuplicateHeaderColumnTests(unittest.TestCase):
+    """Stable column identities survive rename/reorder and duplicate headers."""
+
+    def _duplicate_dataset(self):
+        # Two columns share the display name "amount".
+        return tablib.Dataset().load(
+            StringIO('name,amount,amount\na,1,2\nb,3,4\n'), format='csv'
+        )
+
+    def test_csv_import_keeps_duplicate_columns_and_roundtrips(self):
+        dset = self._duplicate_dataset()
+        self.assertEqual(dset.headers, ['name', 'amount', 'amount'])
+        self.assertEqual(dset.width, 3)
+        self.assertEqual(dset[0], ('a', '1', '2'))
+        # Re-exporting CSV keeps the supplier-provided header untouched.
+        self.assertEqual(
+            dset.csv, 'name,amount,amount\r\na,1,2\r\nb,3,4\r\n'
+        )
+
+    def test_duplicate_headers_get_distinct_stable_keys(self):
+        dset = self._duplicate_dataset()
+        self.assertEqual(
+            [column.key for column in dset.columns],
+            ['name', 'amount', 'amount_2'],
+        )
+        self.assertTrue(dset.has_duplicate_headers())
+        self.assertEqual(
+            [column.header for column in dset.columns],
+            ['name', 'amount', 'amount'],
+        )
+
+    def test_plain_headers_keep_header_as_key(self):
+        dset = tablib.Dataset(headers=['a', 'b'])
+        self.assertEqual([column.key for column in dset.columns], ['a', 'b'])
+        self.assertIsNone(tablib.Dataset().columns)
+
+    def test_dict_does_not_overwrite_duplicate_column(self):
+        dset = self._duplicate_dataset()
+        self.assertEqual(
+            dset.dict,
+            [
+                {'name': 'a', 'amount': '1', 'amount_2': '2'},
+                {'name': 'b', 'amount': '3', 'amount_2': '4'},
+            ],
+        )
+
+    def test_stable_key_access_after_rename_and_reorder(self):
+        dset = self._duplicate_dataset()
+        dset.rename_column('amount_2', 'tax')
+        dset.reorder_columns(['name', 'amount_2', 'amount'])
+
+        self.assertEqual(dset.headers, ['name', 'tax', 'amount'])
+        # Identities still address the original columns despite rename/swap.
+        self.assertEqual(dset['amount'], ['1', '3'])
+        self.assertEqual(dset['amount_2'], ['2', '4'])
+        self.assertEqual(dset.get_col(dset.column_index('amount_2')), ['2', '4'])
+
+    def test_ambiguous_display_header_is_rejected(self):
+        # Both columns display "amount" but neither uses it as stable key, so
+        # looking the display name up cannot resolve a single column.
+        dset = tablib.Dataset(headers=[
+            Column('amount', key='amount_in'),
+            Column('amount', key='amount_out'),
+        ])
+        dset.append((1, 2))
+        with self.assertRaises(InvalidColumnKey):
+            dset['amount']
+        with self.assertRaises(InvalidColumnKey):
+            dset.add_formatter('amount', str)
+
+    def test_unknown_column_key_is_rejected(self):
+        dset = self._duplicate_dataset()
+        with self.assertRaises(InvalidColumnKey):
+            dset['missing']
+        with self.assertRaises(InvalidDatasetIndex):
+            dset.column_index(99)
+
+    def test_column_index_accepts_column_instance_and_position(self):
+        dset = self._duplicate_dataset()
+        column = dset.columns[2]
+        self.assertEqual(dset.column_index(column), 2)
+        self.assertEqual(dset.column_index(-1), 2)
+        dset.reorder_columns(['amount_2', 'name', 'amount'])
+        # The Column object tracks its column after reordering.
+        self.assertEqual(dset.column_index(column), 0)
+
+    def test_reorder_validates_every_column_once(self):
+        dset = self._duplicate_dataset()
+        with self.assertRaises(InvalidColumnKey):
+            dset.reorder_columns(['name', 'amount_2'])
+        with self.assertRaises(InvalidColumnKey):
+            dset.reorder_columns(['name', 'amount_2', 'amount_2'])
+
+    def test_explicit_column_keys_allow_duplicate_display_names(self):
+        dset = tablib.Dataset(headers=[
+            'name',
+            Column('amount', key='amount_in'),
+            Column('amount', key='amount_out'),
+        ])
+        dset.append(('a', 1, 2))
+        self.assertEqual(dset.headers, ['name', 'amount', 'amount'])
+        self.assertEqual(dset['amount_in'], [1])
+        self.assertEqual(dset['amount_out'], [2])
+
+    def test_duplicate_explicit_column_key_is_rejected(self):
+        with self.assertRaises(DuplicateHeaders):
+            tablib.Dataset(headers=[
+                Column('amount', key='amt'),
+                Column('amount', key='amt'),
+            ])
+
+    def test_append_col_with_column_identity(self):
+        dset = tablib.Dataset(headers=['name'])
+        dset.append(('a',))
+        dset.append_col([1], header=Column('amount', key='amount_in'))
+        dset.append_col([2], header=Column('amount', key='amount_out'))
+        self.assertEqual(dset.headers, ['name', 'amount', 'amount'])
+        self.assertEqual(
+            [column.key for column in dset.columns],
+            ['name', 'amount_in', 'amount_out'],
+        )
+
+    def test_delete_column_by_stable_key(self):
+        dset = self._duplicate_dataset()
+        del dset['amount_2']
+        self.assertEqual(dset.headers, ['name', 'amount'])
+        self.assertEqual([column.key for column in dset.columns], ['name', 'amount'])
+        self.assertEqual(dset[0], ('a', '1'))
+
+    def test_subset_and_sort_preserve_identities(self):
+        dset = self._duplicate_dataset()
+        sub = dset.subset(cols=['amount_2', 'name'])
+        self.assertEqual(sub.headers, ['amount', 'name'])
+        self.assertEqual([column.key for column in sub.columns], ['amount_2', 'name'])
+
+        sorted_dset = dset.sort('amount_2', reverse=True)
+        self.assertEqual(sorted_dset['amount_2'], ['4', '2'])
+        self.assertEqual(
+            [column.key for column in sorted_dset.columns],
+            ['name', 'amount', 'amount_2'],
+        )
+
+    def test_copy_preserves_column_identities(self):
+        import copy
+        dset = self._duplicate_dataset()
+        clone = copy.copy(dset)
+        self.assertEqual(clone.columns, dset.columns)
+        self.assertEqual(clone['amount_2'], ['2', '4'])
+
+    def test_transpose_keeps_every_duplicated_header_column(self):
+        dset = tablib.Dataset(headers=[
+            Column('amt', key='amount_in'),
+            Column('amt', key='amount_out'),
+        ])
+        dset.append((1, 2))
+        transposed = dset.transpose()
+        # The hinge column feeds the new header; the second same-named
+        # column still produces its own row instead of being skipped.
+        self.assertEqual(transposed.headers, ['amt', 1])
+        self.assertEqual(transposed[0], ('amt', 2))
+
+    def test_json_uses_stable_keys_for_duplicate_headers(self):
+        dset = self._duplicate_dataset()
+        exported = json.loads(dset.json)
+        self.assertEqual(
+            exported,
+            [
+                {'name': 'a', 'amount': '1', 'amount_2': '2'},
+                {'name': 'b', 'amount': '3', 'amount_2': '4'},
+            ],
+        )
+
+    def test_json_column_keys_override(self):
+        dset = self._duplicate_dataset()
+        exported = json.loads(
+            dset.export('json', column_keys=['nm', 'in_amt', 'out_amt'])
+        )
+        self.assertEqual(
+            exported,
+            [
+                {'nm': 'a', 'in_amt': '1', 'out_amt': '2'},
+                {'nm': 'b', 'in_amt': '3', 'out_amt': '4'},
+            ],
+        )
+
+    def test_json_rejects_invalid_column_keys(self):
+        dset = self._duplicate_dataset()
+        with self.assertRaises(tablib.InvalidDimensions):
+            dset.export('json', column_keys=['a', 'b'])
+        with self.assertRaises(DuplicateHeaders):
+            dset.export('json', column_keys=['a', 'b', 'b'])
+
+    def test_yaml_uses_stable_keys_for_duplicate_headers(self):
+        import yaml
+        dset = self._duplicate_dataset()
+        exported = yaml.safe_load(dset.yaml)
+        self.assertEqual(
+            exported,
+            [
+                {'name': 'a', 'amount': '1', 'amount_2': '2'},
+                {'name': 'b', 'amount': '3', 'amount_2': '4'},
+            ],
+        )
+        overridden = yaml.safe_load(
+            dset.export('yaml', column_keys=['nm', 'x', 'y'])
+        )
+        self.assertEqual(set(overridden[0].keys()), {'nm', 'x', 'y'})
+
+    def test_databook_key_formats_handle_duplicate_headers(self):
+        dset = self._duplicate_dataset()
+        book = tablib.Databook([dset])
+        exported_book = json.loads(book.json)
+        self.assertEqual(
+            set(exported_book[0]['data'][0].keys()),
+            {'name', 'amount', 'amount_2'},
+        )
+        import yaml
+        self.assertEqual(
+            set(yaml.safe_load(book.yaml)[0]['data'][0].keys()),
+            {'name', 'amount', 'amount_2'},
+        )
+
+    def test_tabular_formats_keep_duplicate_display_headers(self):
+        dset = self._duplicate_dataset()
+        for format_name in ('csv', 'tsv', 'html', 'jira', 'latex', 'rst'):
+            output = dset.export(format_name)
+            self.assertIn('amount', output)
+        # Spreadsheet roundtrips preserve both same-named header cells.
+        for format_name in ('xlsx', 'xls', 'ods'):
+            reloaded = tablib.Dataset().load(dset.export(format_name), format_name)
+            self.assertEqual(reloaded.headers, ['name', 'amount', 'amount'])
+            self.assertEqual(reloaded[0], ('a', '1', '2'))
+
+    def test_sql_uses_unique_identifiers_for_duplicate_headers(self):
+        dset = self._duplicate_dataset()
+        sql = dset.export('sql', table='t')
+        self.assertIn('(name,amount,amount_2)', sql)
+        custom = dset.export('sql', table='t', column_keys=['nm', 'x', 'y'])
+        self.assertIn('(nm,x,y)', custom)
+
+    def test_dbf_uses_unique_field_names(self):
+        dset = tablib.Dataset(headers=[
+            'name', Column('amt', key='amt_in'), Column('amt', key='amt_out'),
+        ])
+        dset.append(('a', 1, 2))
+        reloaded = tablib.Dataset().load(dset.export('dbf'), 'dbf')
+        self.assertEqual(reloaded.headers, ['NAME', 'AMT_IN', 'AMT_OUT'])
+
+        custom = tablib.Dataset().load(
+            dset.export('dbf', column_keys=['nm', 'in_amt', 'out_amt']), 'dbf'
+        )
+        self.assertEqual(custom.headers, ['NM', 'IN_AMT', 'OUT_AMT'])
+
+    @unittest.skipIf(pandas is None, 'pandas is not installed')
+    def test_dataframe_uses_unique_column_labels(self):
+        dset = self._duplicate_dataset()
+        frame = dset.export('df')
+        self.assertEqual(list(frame.columns), ['name', 'amount', 'amount_2'])
+        self.assertEqual(frame.shape, (2, 3))
+
+        custom = dset.export('df', column_keys=['nm', 'x', 'y'])
+        self.assertEqual(list(custom.columns), ['nm', 'x', 'y'])

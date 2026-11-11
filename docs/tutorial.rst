@@ -101,6 +101,46 @@ Let's view the data now. ::
 It's that easy.
 
 
+---------------------------
+Column Identities
+---------------------------
+
+Every column has a stable **key** in addition to its displayed header. Plain
+header strings use themselves as the key, so existing code keeps working. When
+two columns share the same display name (for example a supplier report with two
+``amount`` columns), wrap the headers in :class:`Column` objects and give each
+column a distinct key::
+
+    from tablib import Column
+
+    data = tablib.Dataset(headers=[
+        'name',
+        Column('amount', key='amount_in'),
+        Column('amount', key='amount_out'),
+    ])
+    data.append(('invoice-1', 100, 80))
+
+The display name may change and the columns may be reordered, but the key keeps
+pointing at the original column::
+
+    data.rename_column('amount_out', 'tax')
+    data.reorder_columns(['amount_out', 'amount_in', 'name'])
+    data['amount_in']   # still the original incoming amount column
+
+Duplicate display names loaded from formats such as CSV are kept in input
+order; the second occurrence automatically receives a deterministic key
+(``amount_2``) so no column is lost when building dictionaries. Positional
+formats (CSV, TSV, HTML, spreadsheets, ...) always render the display headers
+unchanged, while key-based formats (JSON, YAML, DataFrame, DBF, SQL) fall back
+to the stable keys. You may also provide explicit names per export::
+
+    data.export('json', column_keys=['tax', 'amount', 'name'])
+
+``column_keys`` must contain exactly one unique name per column; otherwise
+:class:`tablib.DuplicateHeaders` or :class:`tablib.InvalidDimensions` is raised
+instead of silently overwriting another column.
+
+
 --------------
 Importing Data
 --------------

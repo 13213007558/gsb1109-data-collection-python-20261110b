@@ -23,14 +23,23 @@ class DBFFormat:
     DEFAULT_ENCODING = 'utf-8'
 
     @classmethod
-    def export_set(cls, dataset):
-        """Returns DBF representation of a Dataset"""
+    def export_set(cls, dataset, column_keys=None):
+        """Returns DBF representation of a Dataset.
+
+        DBF field names must be unique, so duplicate display headers are
+        resolved to the stable column keys instead of overwriting a field.
+        Pass ``column_keys`` to provide caller-chosen unique field names.
+        """
         new_dbf = dbfnew.dbf_new()
         temp_file, temp_uri = tempfile.mkstemp()
 
+        field_names = dataset._resolve_export_keys(column_keys)
+        if field_names is None:
+            field_names = dataset.headers
+
         # create the appropriate fields based on the contents of the first row
         first_row = dataset[0]
-        for fieldname, field_value in zip(dataset.headers, first_row):
+        for fieldname, field_value in zip(field_names, first_row):
             if type(field_value) in [int, float]:
                 new_dbf.add_field(fieldname, 'N', 10, 8)
             else:
@@ -41,7 +50,7 @@ class DBFFormat:
         dbf_file = dbf.Dbf(temp_uri, readOnly=0)
         for row in dataset:
             record = dbfrecord.DbfRecord(dbf_file)
-            for fieldname, field_value in zip(dataset.headers, row):
+            for fieldname, field_value in zip(field_names, row):
                 record[fieldname] = field_value
             record.store()
 

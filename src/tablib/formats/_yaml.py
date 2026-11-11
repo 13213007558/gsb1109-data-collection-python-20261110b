@@ -1,4 +1,4 @@
-""" Tablib - YAML Support.
+""" Tablib - YAML Support
 """
 
 __lazy_modules__ = {"yaml"}
@@ -13,10 +13,17 @@ class YAMLFormat:
     extensions = ('yaml', 'yml')
 
     @classmethod
-    def export_set(cls, dataset):
-        """Returns YAML representation of Dataset."""
+    def export_set(cls, dataset, column_keys=None):
+        """Returns YAML representation of Dataset.
+
+        YAML mappings require unique keys. When the Dataset has duplicate
+        display headers, the stable column keys are used instead of silently
+        overwriting a column. Pass ``column_keys`` to provide caller-chosen
+        unique names (one per column).
+        """
+        keys = dataset._resolve_export_keys(column_keys)
         return yaml.safe_dump(
-            dataset._package(),
+            dataset._package(key_headers=keys),
             default_flow_style=None,
             allow_unicode=True,
             sort_keys=False,

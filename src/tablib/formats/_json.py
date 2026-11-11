@@ -24,17 +24,34 @@ class JSONFormat:
     extensions = ('json', 'jsn')
 
     @classmethod
-    def export_set(cls, dataset):
-        """Returns JSON representation of Dataset."""
+    def export_set(cls, dataset, column_keys=None):
+        """Returns JSON representation of Dataset.
+
+        JSON objects require unique keys. When the Dataset has duplicate
+        display headers, the stable column keys are used instead of silently
+        overwriting a column. Pass ``column_keys`` to provide caller-chosen
+        unique names (one per column); a non-unique or wrong-sized value
+        raises :class:`tablib.DuplicateHeaders` /
+        :class:`tablib.InvalidDimensions`.
+        """
+        keys = dataset._resolve_export_keys(column_keys)
         return json.dumps(
-            dataset.dict, default=serialize_objects_handler, ensure_ascii=False
+            dataset._package(key_headers=keys),
+            default=serialize_objects_handler,
+            ensure_ascii=False,
         )
 
     @classmethod
     def export_book(cls, databook):
-        """Returns JSON representation of Databook."""
+        """Returns JSON representation of Databook.
+
+        Sheets with duplicate headers fall back to their stable column keys
+        instead of overwriting one column with another.
+        """
         return json.dumps(
-            databook._package(), default=serialize_objects_handler, ensure_ascii=False
+            databook._package(),
+            default=serialize_objects_handler,
+            ensure_ascii=False,
         )
 
     @classmethod
