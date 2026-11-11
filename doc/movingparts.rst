@@ -115,6 +115,17 @@ html5lib provides several filters:
   configuration of the sanitizer follows the `WHATWG Sanitization Rules
   <http://wiki.whatwg.org/wiki/Sanitization_rules>`_.
 
+  When archiving a page fragment you can additionally pass a
+  ``link_policy`` to :func:`html5lib.serialize` (or the filter) so that
+  only same-site links stay clickable and external links are reduced to
+  their visible text. Pass the page URL as a string, or any object with
+  an ``allows(value)`` method. HTML ``href`` and SVG ``xlink:href``
+  targets are resolved against the given page URL, ignoring in-document
+  ``<base>`` markup::
+
+      serialize(dom, sanitize=True,
+                link_policy="https://example.gov.cn/notice/1")
+
 * :class:`whitespace.Filter <html5lib.filters.whitespace.Filter>`
   collapses all whitespace characters to single spaces unless they're in
   ``<pre/>`` or ``<textarea/>`` tags.

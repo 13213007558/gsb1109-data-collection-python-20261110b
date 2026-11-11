@@ -4,7 +4,9 @@ import warnings
 
 import pytest
 
-from html5lib import constants, parseFragment, serialize
+from six.moves import urllib_parse as urlparse
+
+from html5lib import constants, parseFragment, serialize, getTreeWalker
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore", DeprecationWarning)
@@ -16,6 +18,24 @@ def sanitize_html(stream):
     with pytest.deprecated_call():
         serialized = serialize(parsed,
                                sanitize=True,
+                               omit_optional_tags=False,
+                               use_trailing_solidus=True,
+                               space_before_trailing_solidus=False,
+                               quote_attr_values="always",
+                               quote_char='"',
+                               alphabetical_attributes=True)
+    return serialized
+
+
+PAGE_URL = "https://announce.example.gov.cn/notice/2026/001.html"
+
+
+def sanitize_html_with_policy(stream, link_policy=PAGE_URL):
+    parsed = parseFragment(stream)
+    with pytest.deprecated_call():
+        serialized = serialize(parsed,
+                               sanitize=True,
+                               link_policy=link_policy,
                                omit_optional_tags=False,
                                use_trailing_solidus=True,
                                space_before_trailing_solidus=False,
@@ -172,3 +192,142 @@ def test_ol_reversed_allowed():
     sanitized = sanitize_html("<ol reversed><li>.</ol>")
     expected = '<ol reversed><li>.</li></ol>'
     assert expected == sanitized
+
+
+def test_policy_keeps_relative_same_site_links():
+    sanitized = sanitize_html_with_policy(
+        '<p><a href="/notice/2026/002.html">root relative</a>'
+        '<a href="003.html">relative</a>'
+        '<a href="?page=2">query</a>'
+        '<a href="#section">fragment</a></p>')
+    expected = ('<p><a href="/notice/2026/002.html">root relative</a>'
+                '<a href="003.html">relative</a>'
+                '<a href="?page=2">query</a>'
+                '<a href="#section">fragment</a></p>')
+    assert expected == sanitized
+
+
+def test_policy_keeps_same_site_absolute_link():
+    sanitized = sanitize_html_with_policy(
+        '<a href="https://announce.example.gov.cn/notice/2026/004.html">same</a>')
+    assert sanitized == (
+        '<a href="https://announce.example.gov.cn/notice/2026/004.html">same</a>')
+
+
+def test_policy_normalizes_default_port_and_host_case():
+    policy = sanitizer.SameOriginLinkPolicy(PAGE_URL)
+    assert policy.allows("https://ANNOUNCE.example.gov.cn:443/notice/2026/005.html")
+    assert not policy.allows("http://announce.example.gov.cn/notice/2026/006.html")
+
+
+def test_external_link_keeps_only_visible_text():
+    sanitized = sanitize_html_with_policy(
+        '<a href="https://evil.example/x">点此查看 <strong>详情</strong></a>')
+    assert sanitized == '<a>点此查看 <strong>详情</strong></a>'
+
+
+def test_protocol_relative_external_link_is_stripped():
+    sanitized = sanitize_html_with_policy('<a href="//evil.example/y">x</a>')
+    assert sanitized == '<a>x</a>'
+
+
+def test_protocol_relative_same_site_link_is_kept():
+    sanitized = sanitize_html_with_policy(
+        '<a href="//announce.example.gov.cn/notice/2026/007.html">x</a>')
+    assert sanitized == (
+        '<a href="//announce.example.gov.cn/notice/2026/007.html">x</a>')
+
+
+def test_entity_encoded_external_link_is_stripped():
+    for href in ("https&#58;//evil.example/z", "https&colon;//evil.example/z",
+                 "&#104;ttps://evil.example/z"):
+        sanitized = sanitize_html_with_policy('<a href="%s">x</a>' % href)
+        assert sanitized == '<a>x</a>'
+
+
+def test_backslash_and_scheme_slash_bypasses_are_stripped():
+    for href in ("https:\\evil.example\\a", "https:/evil.example",
+                 "https:\\/evil.example/x", "HTTPS:\\EVIL.EXAMPLE",
+                 "https://evil.example\t/x"):
+        sanitized = sanitize_html_with_policy('<a href="%s">x</a>' % href)
+        assert sanitized == '<a>x</a>'
+
+
+def test_empty_and_unparseable_targets_are_stripped():
+    sanitized = sanitize_html_with_policy(
+        '<a href="">empty</a><a href="https://[bad">junk</a>')
+    assert sanitized == '<a>empty</a><a>junk</a>'
+
+
+def test_policy_covers_svg_xlink_href():
+    sanitized = sanitize_html_with_policy(
+        '<svg><a xlink:href="/notice/2026/008.html">same</a>'
+        '<a xlink:href="https://evil.example/g">external</a></svg>')
+    assert sanitized == ('<svg><a href="/notice/2026/008.html">same</a>'
+                         '<a>external</a></svg>')
+
+
+def test_in_document_base_cannot_restore_external_link():
+    outputs = [
+        sanitize_html_with_policy(
+            '<base href="https://evil.example/">'
+            '<a href="//evil.example/base">base</a>'),
+        sanitize_html_with_policy(
+            '<div xml:base="https://evil.example/">'
+            '<a href="//evil.example/xb">xml base</a></div>'),
+    ]
+    assert outputs[0] == '&lt;base href="https://evil.example/"&gt;<a>base</a>'
+    assert outputs[1] == '<div><a>xml base</a></div>'
+
+    for serialized in outputs:
+        reparsed = parseFragment(serialized)
+        for token in getTreeWalker("etree")(reparsed):
+            if token["type"] in ("StartTag", "EmptyTag") and token["name"] == "a":
+                assert (None, "href") not in token["data"]
+
+
+def test_reparsed_relative_link_resolves_to_announcement():
+    serialized = sanitize_html_with_policy(
+        '<p><a href="/notice/2026/009.html">公告九</a></p>')
+    reparsed = parseFragment(serialized)
+    hrefs = [token["data"][(None, "href")]
+             for token in getTreeWalker("etree")(reparsed)
+             if token["type"] == "StartTag" and token["name"] == "a"]
+    assert hrefs == ["/notice/2026/009.html"]
+    assert urlparse.urljoin(PAGE_URL, hrefs[0]) == \
+        "https://announce.example.gov.cn/notice/2026/009.html"
+
+
+def test_reparsed_external_link_is_not_clickable():
+    serialized = sanitize_html_with_policy(
+        '<a href="https://evil.example/x">external</a>')
+    reparsed = parseFragment(serialized)
+    for token in getTreeWalker("etree")(reparsed):
+        if token["type"] in ("StartTag", "EmptyTag"):
+            assert (None, "href") not in token["data"]
+
+
+class _AllowAllPolicy(object):
+    def allows(self, value):
+        return True
+
+
+def test_custom_policy_object_is_used():
+    sanitized = sanitize_html_with_policy(
+        '<a href="https://evil.example/x">x</a>',
+        link_policy=_AllowAllPolicy())
+    assert sanitized == '<a href="https://evil.example/x">x</a>'
+
+
+def test_explicit_policy_instance_is_used():
+    sanitized = sanitize_html_with_policy(
+        '<a href="https://evil.example/x">x</a>',
+        link_policy=sanitizer.SameOriginLinkPolicy(PAGE_URL))
+    assert sanitized == '<a>x</a>'
+
+
+def test_no_policy_keeps_legacy_behavior():
+    sanitized = sanitize_html('<a href="https://evil.example/x">x</a>')
+    assert sanitized == '<a href="https://evil.example/x">x</a>'
+    sanitized = sanitize_html('<a href="/example.com"></a>')
+    assert sanitized == '<a href="/example.com"></a>'

@@ -124,13 +124,14 @@ class HTMLSerializer(object):
     inject_meta_charset = True
     strip_whitespace = False
     sanitize = False
+    link_policy = None
 
     options = ("quote_attr_values", "quote_char", "use_best_quote_char",
                "omit_optional_tags", "minimize_boolean_attributes",
                "use_trailing_solidus", "space_before_trailing_solidus",
                "escape_lt_in_attrs", "escape_rcdata", "resolve_entities",
                "alphabetical_attributes", "inject_meta_charset",
-               "strip_whitespace", "sanitize")
+               "strip_whitespace", "sanitize", "link_policy")
 
     def __init__(self, **kwargs):
         """Initialize HTMLSerializer
@@ -202,6 +203,14 @@ class HTMLSerializer(object):
 
             Defaults to ``False``.
 
+        :arg link_policy: Policy applied to hyperlink targets while sanitizing.
+            Either an object with an ``allows(value)`` method, or the page URL
+            the fragment came from as a string, in which case only same-site
+            links keep their ``href``/``xlink:href`` and other links are
+            reduced to visible text. Requires ``sanitize=True``.
+
+            Defaults to ``None``.
+
         :arg omit_optional_tags: Omit start/end tags that are optional.
 
             Defaults to ``True``.
@@ -257,7 +266,7 @@ class HTMLSerializer(object):
             treewalker = Filter(treewalker)
         if self.sanitize:
             from .filters.sanitizer import Filter
-            treewalker = Filter(treewalker)
+            treewalker = Filter(treewalker, link_policy=self.link_policy)
         if self.omit_optional_tags:
             from .filters.optionaltags import Filter
             treewalker = Filter(treewalker)

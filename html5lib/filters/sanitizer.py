@@ -12,12 +12,13 @@ import re
 import warnings
 from xml.sax.saxutils import escape, unescape
 
+from six import string_types
 from six.moves import urllib_parse as urlparse
 
 from . import base
 from ..constants import namespaces, prefixes
 
-__all__ = ["Filter"]
+__all__ = ["Filter", "SameOriginLinkPolicy"]
 
 
 _deprecation_msg = (
@@ -541,6 +542,13 @@ attr_val_is_uri = frozenset((
     (namespaces['xml'], 'base'),
 ))
 
+# Hyperlink targets governed by the configurable link policy: the HTML href
+# attribute and its SVG equivalent (xlink:href, plus the bare SVG2 href).
+link_attributes = frozenset((
+    (None, 'href'),
+    (namespaces['xlink'], 'href'),
+))
+
 svg_attr_val_allows_ref = frozenset((
     (None, 'clip-path'),
     (None, 'color-profile'),
@@ -729,6 +737,59 @@ data_content_type = re.compile(r'''
                                re.VERBOSE)
 
 
+class SameOriginLinkPolicy(object):
+    """Strategy deciding which link targets may stay clickable.
+
+    Resolves every URI against the URL of the page being archived, so that
+    same-site links (including relative ones) survive while links to other
+    sites are reduced to their visible text. Only the page URL supplied to the
+    constructor is used as the base: character references are already decoded
+    by the parser and in-document ``<base>``/``xml:base`` markup is never
+    consulted, so neither can resurrect a target that should be stripped.
+    """
+
+    def __init__(self, page_url):
+        #:arg page_url: absolute URL of the page the fragment was taken from
+        self.page_url = page_url
+        self.page_parts = urlparse.urlsplit(page_url)
+
+    def _origin(self, parts):
+        if parts.scheme and parts.hostname:
+            return (parts.scheme.lower(),
+                    parts.hostname.lower(),
+                    parts.port or self._default_port(parts.scheme))
+        return None
+
+    @staticmethod
+    def _default_port(scheme):
+        if scheme == 'http':
+            return 80
+        if scheme == 'https':
+            return 443
+        return None
+
+    def allows(self, value):
+        """Return whether ``value`` may remain a clickable link target."""
+        if value is None:
+            return False
+        # Browsers ignore ASCII tab/newline/CR inside URLs and trim whitespace.
+        value = re.sub(r'[\t\n\r]', '', value).strip()
+        if not value:
+            return False
+        # Browsers treat backslashes as path separators and accept any number
+        # of slashes after a special scheme, so e.g. "https:\evil.example" or
+        # "https:/evil.example" point at evil.example rather than the page.
+        value = value.replace('\\', '/')
+        value = re.sub(r'^([a-zA-Z][a-zA-Z0-9+.\-]*:)/+', r'\1//', value)
+        try:
+            resolved = urlparse.urlsplit(urlparse.urljoin(self.page_url, value))
+        except ValueError:
+            return False
+        if not resolved.scheme or not resolved.hostname:
+            return False
+        return self._origin(resolved) == self._origin(self.page_parts)
+
+
 class Filter(base.Filter):
     """Sanitizes token stream of XHTML+MathML+SVG and of inline style attributes"""
     def __init__(self,
@@ -742,7 +803,9 @@ class Filter(base.Filter):
                  allowed_content_types=allowed_content_types,
                  attr_val_is_uri=attr_val_is_uri,
                  svg_attr_val_allows_ref=svg_attr_val_allows_ref,
-                 svg_allow_local_href=svg_allow_local_href):
+                 svg_allow_local_href=svg_allow_local_href,
+                 link_attributes=link_attributes,
+                 link_policy=None):
         """Creates a Filter
 
         :arg allowed_elements: set of elements to allow--everything else will
@@ -773,6 +836,15 @@ class Filter(base.Filter):
         :arg svg_allow_local_href: set of SVG elements that can have local
             hrefs--these are removed
 
+        :arg link_attributes: set of hyperlink target attributes governed by
+            ``link_policy``
+
+        :arg link_policy: object with an ``allows(value)`` method deciding
+            whether a link target may stay clickable. When set, HTML ``href``
+            and SVG ``xlink:href`` targets it rejects are stripped, leaving the
+            element's visible text in place. Pass a page URL as a string (or a
+            :class:`SameOriginLinkPolicy`) to keep only same-site links.
+
         """
         super(Filter, self).__init__(source)
 
@@ -788,6 +860,10 @@ class Filter(base.Filter):
         self.attr_val_is_uri = attr_val_is_uri
         self.svg_attr_val_allows_ref = svg_attr_val_allows_ref
         self.svg_allow_local_href = svg_allow_local_href
+        self.link_attributes = link_attributes
+        if isinstance(link_policy, string_types):
+            link_policy = SameOriginLinkPolicy(link_policy)
+        self.link_policy = link_policy
 
     def __iter__(self):
         for token in base.Filter.__iter__(self):
@@ -859,6 +935,13 @@ class Filter(base.Filter):
                             del attrs[attr]
                         elif m.group('content_type') not in self.allowed_content_types:
                             del attrs[attr]
+
+            # Strip hyperlink targets the configured link policy does not
+            # allow; the element and its visible text are left untouched
+            if self.link_policy is not None:
+                for attr in (attr_names & self.link_attributes):
+                    if attr in attrs and not self.link_policy.allows(attrs[attr]):
+                        del attrs[attr]
 
             for attr in self.svg_attr_val_allows_ref:
                 if attr in attrs:
