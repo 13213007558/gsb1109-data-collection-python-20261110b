@@ -117,3 +117,106 @@ def test_dir_sheetname():
     print("OK: dir_sheetname")
 
 test_dir_sheetname()
+
+
+def test_plan_mode():
+    # --plan lists input/sheet/target paths, flags conflicts using the target
+    # filesystem's case rules, never writes CSV, and a saved plan is re-checked
+    # against the source workbooks before it is applied.
+    import json
+    import shutil
+    import tempfile
+
+    root = tempfile.mkdtemp()
+    try:
+        indir = os.path.join(root, "in")
+        outdir = os.path.join(root, "out")
+        os.mkdir(indir)
+        os.mkdir(os.path.join(indir, "sub1"))
+        os.mkdir(os.path.join(indir, "sub2"))
+        os.mkdir(outdir)
+        # same stem in two folders: all-sheets output paths collide
+        shutil.copy("test/sheets_order.xlsx", os.path.join(indir, "sub1", "a.xlsx"))
+        shutil.copy("test/sheets_order.xlsx", os.path.join(indir, "sub2", "a.xlsx"))
+
+        def run(args):
+            return subprocess.run([sys.executable, "./xlsx2csv.py"] + args,
+                                  capture_output=True, text=True)
+
+        pipe = run(["--plan", "-a", indir, outdir])
+        if pipe.returncode == 0 or "CONFLICT:" not in pipe.stdout:
+            print("FAILED: plan_mode conflict not reported")
+            print(pipe.stdout, pipe.stderr)
+            sys.exit(1)
+        if "case-insensitive" not in pipe.stdout and "case-sensitive" not in pipe.stdout:
+            print("FAILED: plan_mode filesystem case rule not reported")
+            sys.exit(1)
+        for base, _dirs, files in os.walk(root):
+            if any(name.endswith(".csv") for name in files):
+                print("FAILED: plan_mode created CSV files")
+                sys.exit(1)
+        # conflicting plans must not be saved
+        conflict_plan = os.path.join(root, "conflict.json")
+        pipe = run(["--plan", "-a", "--plan-file", conflict_plan, indir, outdir])
+        if pipe.returncode == 0 or os.path.exists(conflict_plan):
+            print("FAILED: conflicting plan was saved")
+            sys.exit(1)
+
+        # resolve the clash: give the second workbook a unique stem
+        os.rename(os.path.join(indir, "sub2", "a.xlsx"),
+                  os.path.join(indir, "sub2", "b.xlsx"))
+        plan_path = os.path.join(root, "plan.json")
+        pipe = run(["--plan", "-a", "--plan-file", plan_path, indir, outdir])
+        if pipe.returncode != 0 or not os.path.exists(plan_path):
+            print("FAILED: clean plan was not saved")
+            print(pipe.stdout, pipe.stderr)
+            sys.exit(1)
+        for base, _dirs, files in os.walk(outdir):
+            if files:
+                print("FAILED: planning wrote output files")
+                sys.exit(1)
+
+        # tamper with the confirmed plan: the recorded sheet list of one
+        # workbook no longer matches the live source, so applying must
+        # require re-confirmation
+        with open(plan_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        changed_input = next(iter(data["workbook_sheets"]))
+        data["workbook_sheets"][changed_input][0][1] = "renamed-sheet"
+        stale_plan = os.path.join(root, "stale.json")
+        with open(stale_plan, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        pipe = run(["--plan-file", stale_plan, indir, outdir])
+        if pipe.returncode == 0:
+            print("FAILED: stale plan was applied")
+            sys.exit(1)
+
+        # apply the still-valid plan and compare with a normal batch run
+        pipe = run(["--plan-file", plan_path, indir, outdir])
+        if pipe.returncode != 0:
+            print("FAILED: confirmed plan not applied")
+            print(pipe.stdout, pipe.stderr)
+            sys.exit(1)
+        refdir = os.path.join(root, "ref")
+        os.mkdir(refdir)
+        subprocess.check_call([sys.executable, "./xlsx2csv.py", "-a", indir, refdir],
+                              stdout=subprocess.DEVNULL)
+
+        def output_files(folder):
+            result = []
+            for base, _dirs, files in os.walk(folder):
+                for name in files:
+                    full = os.path.join(base, name)
+                    with open(full, "rb") as f:
+                        result.append((os.path.relpath(full, folder), f.read()))
+            return sorted(result)
+
+        if output_files(outdir) != output_files(refdir):
+            print("FAILED: planned output differs from normal batch output")
+            sys.exit(1)
+    finally:
+        shutil.rmtree(root)
+    print("OK: plan_mode")
+
+
+test_plan_mode()

@@ -77,6 +77,19 @@ Skip empty lines.
 Sheet delimiter used to separate sheets, pass "" if you don't want
 delimiters. DEfaults to "--------".
 
+=item B<--plan>
+
+Plan mode for directory input. Print each input file, its selected
+sheets and the relative target CSV path, detect target path conflicts
+according to the target filesystem's case rules, and write no CSV
+files. Exits non-zero when two sheets would be written to one path.
+
+=item B<--plan-file=FILE>
+
+With B<--plan>, save the confirmed plan to FILE. Without B<--plan>,
+validate and apply the previously saved plan; application is refused
+if a source workbook's sheet list changed since the plan was made.
+
 =item B<-q QUOTING, --quoting=QUOTING>
 
 Output csv fields quoting. Use "none" "minimal" "nonnumeric" or "all".

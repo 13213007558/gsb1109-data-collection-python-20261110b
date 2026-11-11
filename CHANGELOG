@@ -1,4 +1,12 @@
 unreleased:
+ * Add --plan mode for directory (and single-file) conversion: prints the input
+   files, selected sheets and relative target CSV paths, detects target path
+   conflicts using the target filesystem's case rules (case-only differences
+   count on case-insensitive filesystems), and never writes CSV files
+ * Add --plan-file: save a confirmed plan alongside --plan, then validate and
+   apply it later. Applying re-opens every source workbook and refuses to run
+   if any sheet list changed (re-run --plan to re-confirm); conflicting plans
+   can neither be saved nor applied, so two sheets are never written to one CSV
  * Fix custom number formats with quoted literal text (e.g. 0 "pcs", 0.0 "mm", #,##0 "days")
    being misdetected as dates, or having the literal text counted as decimal places
  * Fix date1904="0" in workbookPr being treated as the 1904 date system (only "1" and "true" enable it)

@@ -173,6 +173,325 @@ class OutFileAlreadyExistsException(XlsxException):
     pass
 
 
+class PlanConflictError(XlsxException):
+    """Two planned sheets would be written to the same target path."""
+    pass
+
+
+class PlanStaleError(XlsxException):
+    """A saved plan no longer matches the sheet list of its source workbooks."""
+    pass
+
+
+try:
+    import json
+except ImportError:
+    # python2.4 has no json module, plan files are unavailable there
+    json = None
+
+PLAN_FORMAT_VERSION = 1
+
+
+def fs_case_sensitive(path):
+    # type: (str) -> bool
+    """Whether the filesystem that will host path distinguishes name case.
+
+    A throwaway probe file is created in the nearest existing ancestor
+    directory and removed immediately; no output file is left behind.
+    """
+    probe_dir = path or os.curdir
+    while probe_dir and not os.path.isdir(probe_dir):
+        parent = os.path.dirname(probe_dir)
+        if parent == probe_dir:
+            break
+        probe_dir = parent
+    probe = os.path.join(probe_dir, ".xlsx2csv_case_probe_%d" % os.getpid())
+    try:
+        probe_file = open(probe, "w")
+        probe_file.close()
+        try:
+            return not os.path.exists(probe.swapcase())
+        finally:
+            os.remove(probe)
+    except (IOError, OSError):
+        return sys.platform not in ("win32", "darwin")
+
+
+def sheet_listed(sheet, options):
+    # type: (Dict[str, Any], Dict[str, Any]) -> bool
+    """Apply the hidden/include/exclude sheet filters used by convert()."""
+    if sheet.get('state') in ('hidden', 'veryHidden') and options.get('exclude_hidden_sheets'):
+        return False
+    include_patterns = options.get('include_sheet_pattern') or []
+    if isinstance(include_patterns, str):  # optparser lib fix
+        include_patterns = [include_patterns]
+    if include_patterns:
+        include = False
+        for pattern in include_patterns:
+            if pattern and re.match(pattern, sheet['name']):
+                include = True
+                break
+        if not include:
+            return False
+    exclude_patterns = options.get('exclude_sheet_pattern') or []
+    if isinstance(exclude_patterns, str):  # optparser lib fix
+        exclude_patterns = [exclude_patterns]
+    for pattern in exclude_patterns:
+        if pattern and re.match(pattern, sheet['name']):
+            return False
+    return True
+
+
+class ConversionPlan:
+    """A read-only description of which sheet lands in which target CSV."""
+
+    def __init__(self, input_root=None, case_sensitive=None):
+        # type: (Optional[str], Optional[bool]) -> None
+        self.input_root = input_root
+        self.case_sensitive = case_sensitive
+        self.entries = []
+        self.conflicts = []
+        # full sheet list (filters ignored) of each source workbook, used to
+        # detect any workbook change when a saved plan is applied
+        self.workbook_sheets = {}
+
+    def add_entry(self, input_path, sheet, target):
+        # type: (str, Dict[str, Any], Optional[str]) -> Dict[str, Any]
+        entry = {
+            'input': input_path,
+            'sheet_id': sheet['index'],
+            'sheet_name': sheet['name'],
+            'sheet_state': sheet.get('state'),
+            'target': target,
+            'conflict': False,
+        }
+        self.entries.append(entry)
+        return entry
+
+    def find_conflicts(self):
+        # type: () -> List[List[Dict[str, Any]]]
+        groups = {}
+        for entry in self.entries:
+            if entry['target'] is None:
+                # streamed output does not touch the filesystem
+                continue
+            key = entry['target'] if self.case_sensitive else entry['target'].lower()
+            groups.setdefault(key, []).append(entry)
+        self.conflicts = []
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            for entry in group:
+                entry['conflict'] = True
+            self.conflicts.append(group)
+        return self.conflicts
+
+    def to_dict(self):
+        # type: () -> Dict[str, Any]
+        return {
+            'version': PLAN_FORMAT_VERSION,
+            'input_root': self.input_root,
+            'case_sensitive': self.case_sensitive,
+            'entries': self.entries,
+            'workbook_sheets': self.workbook_sheets,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        # type: (Dict[str, Any]) -> ConversionPlan
+        plan = cls(input_root=data.get('input_root'), case_sensitive=data.get('case_sensitive'))
+        plan.entries = data.get('entries', [])
+        plan.workbook_sheets = data.get('workbook_sheets', {})
+        plan.find_conflicts()
+        return plan
+
+    def save(self, path):
+        # type: (str) -> None
+        if json is None:
+            raise XlsxException("Plan files require Python 2.6 or newer")
+        with open(path, 'w') as plan_file:
+            json.dump(self.to_dict(), plan_file, indent=2)
+
+    @classmethod
+    def load(cls, path):
+        # type: (str) -> ConversionPlan
+        if json is None:
+            raise XlsxException("Plan files require Python 2.6 or newer")
+        try:
+            plan_file = open(path, 'r')
+            try:
+                data = json.load(plan_file)
+            finally:
+                plan_file.close()
+        except (IOError, ValueError) as e:
+            raise XlsxException("Cannot read plan file %s: %s" % (path, str(e)))
+        if not isinstance(data, dict) or data.get('version') != PLAN_FORMAT_VERSION:
+            raise XlsxException("Unsupported plan format version in %s" % path)
+        return cls.from_dict(data)
+
+    def validate(self, options):
+        # type: (Dict[str, Any]) -> None
+        """Re-open every source workbook and refuse to run on any change."""
+        if self.find_conflicts():
+            targets = sorted(set(group[0]['target'] for group in self.conflicts))
+            raise PlanConflictError(
+                "Conflicting target paths, resolve them before applying: %s" % ", ".join(targets))
+        stale = []
+        for input_path in sorted(self.workbook_sheets.keys()):
+            try:
+                with Xlsx2csv(input_path, **options) as xlsx2csv:
+                    current = [[s['index'], s['name'], s.get('state')]
+                               for s in xlsx2csv.workbook.sheets]
+            except Exception as e:
+                raise PlanStaleError("Cannot re-check %s: %s" % (input_path, str(e)))
+            current.sort()
+            if current != sorted(self.workbook_sheets[input_path]):
+                stale.append(input_path)
+        if stale:
+            raise PlanStaleError(
+                "Sheet list changed in %s; re-run --plan and confirm the new plan before applying"
+                % ", ".join(stale))
+
+
+def _batch_output_path(fullpath, outfile):
+    # type: (str, Any) -> Any
+    """Resolve the output path of one workbook during directory processing."""
+    if isinstance(outfile, type(sys.stdout)):
+        return fullpath[:-4] + 'csv'
+    if isinstance(outfile, str):
+        if os.path.isdir(outfile):
+            return os.path.join(outfile, os.path.basename(fullpath)[:-4] + 'csv')
+        if len(outfile) == 0 and fullpath.lower().endswith(".xlsx"):
+            return fullpath[:-4] + 'csv'
+    return outfile
+
+
+def _add_workbook_to_plan(plan, input_path, outfilepath, sheetid, sheetname, options):
+    # type: (ConversionPlan, str, Any, int, Optional[str], Dict[str, Any]) -> None
+    with Xlsx2csv(input_path, **options) as xlsx2csv:
+        plan.workbook_sheets[input_path] = [
+            [s['index'], s['name'], s.get('state')] for s in xlsx2csv.workbook.sheets]
+        sheets = [s for s in xlsx2csv.workbook.sheets if sheet_listed(s, options)]
+        if sheetname:
+            named_id = xlsx2csv.getSheetIdByName(sheetname)
+            if not named_id:
+                raise XlsxException("Sheet '%s' not found" % sheetname)
+            sheetid = named_id
+        if sheetid > 0:
+            selected = [s for s in sheets if s['index'] == sheetid]
+            if not selected:
+                raise XlsxValueError("Sheet with index %i not found or can't be handled" % sheetid)
+            target = outfilepath if isinstance(outfilepath, str) else None
+            plan.add_entry(input_path, selected[0], target)
+            return
+        if isinstance(outfilepath, str):
+            # mirrors Xlsx2csv.convert(): the per-workbook path becomes a
+            # directory holding one CSV per sheet
+            if os.path.isfile(outfilepath):
+                raise OutFileAlreadyExistsException("File " + str(outfilepath) + " already exists!")
+            for sheet in sheets:
+                target = os.path.join(outfilepath, sheet['name'] + '.csv')
+                plan.add_entry(input_path, sheet, target)
+        else:
+            # all sheets are streamed into one open output handle
+            for sheet in sheets:
+                plan.add_entry(input_path, sheet, None)
+
+
+def build_conversion_plan(infile, outfile, sheetid, sheetname, options, continue_on_error=False):
+    # type: (str, Any, int, Optional[str], Dict[str, Any], bool) -> ConversionPlan
+    if infile == "-":
+        raise XlsxException("Planning requires a file or directory path, STDIN input cannot be re-checked")
+    case_sensitive = fs_case_sensitive(outfile if isinstance(outfile, str) else os.curdir)
+    plan = ConversionPlan(input_root=infile if os.path.isdir(infile) else None,
+                          case_sensitive=case_sensitive)
+    if os.path.isdir(infile):
+        for root, dirs, files in os.walk(infile):
+            dirs.sort()
+            for name in sorted(files):
+                fullpath = os.path.join(root, name)
+                outfilepath = _batch_output_path(fullpath, outfile)
+                try:
+                    _add_workbook_to_plan(plan, fullpath, outfilepath, sheetid, sheetname, options)
+                except Exception as e:
+                    if continue_on_error:
+                        print("ERROR processing file '%s': %s" % (fullpath, str(e)), file=sys.stderr)
+                        continue
+                    if isinstance(e, zipfile.BadZipfile):
+                        raise InvalidXlsxFileException("File %s is not a zip file" % fullpath)
+                    raise
+    else:
+        if not os.path.exists(infile):
+            raise InvalidXlsxFileException("Input file not found!")
+        _add_workbook_to_plan(plan, infile, outfile, sheetid, sheetname, options)
+    plan.find_conflicts()
+    return plan
+
+
+def apply_conversion_plan(plan, options, continue_on_error=False):
+    # type: (ConversionPlan, Dict[str, Any], bool) -> None
+    plan.validate(options)
+    grouped = {}
+    for entry in plan.entries:
+        grouped.setdefault(entry['input'], []).append(entry)
+    for input_path in sorted(grouped.keys()):
+        entries = grouped[input_path]
+        streamed = [entry for entry in entries if entry['target'] is None]
+        try:
+            with Xlsx2csv(input_path, **options) as xlsx2csv:
+                if streamed:
+                    # all sheets share one open output handle; let convert()
+                    # emit them together, including sheet delimiters
+                    sheet_id = 0 if len(streamed) > 1 else streamed[0]['sheet_id']
+                    xlsx2csv.convert(sys.stdout, sheetid=sheet_id)
+                for entry in entries:
+                    target = entry['target']
+                    if target is None:
+                        continue
+                    parent = os.path.dirname(target)
+                    if parent and not os.path.isdir(parent):
+                        os.makedirs(parent)
+                    xlsx2csv.convert(target, sheetid=entry['sheet_id'])
+        except Exception as e:
+            if continue_on_error:
+                print("ERROR processing file '%s': %s" % (input_path, str(e)), file=sys.stderr)
+                continue
+            if isinstance(e, zipfile.BadZipfile):
+                raise InvalidXlsxFileException("File %s is not a zip file" % input_path)
+            raise
+
+
+def _display_path(path):
+    # type: (Optional[str]) -> str
+    if path is None:
+        return "<stdout>"
+    relative = os.path.relpath(path)
+    if relative.startswith(".."):
+        return path
+    return relative
+
+
+def format_plan_report(plan):
+    # type: (ConversionPlan) -> str
+    lines = ["# xlsx2csv conversion plan",
+             "# filesystem: %s" % ("case-sensitive" if plan.case_sensitive else "case-insensitive")]
+    current = None
+    for entry in plan.entries:
+        if entry['input'] != current:
+            current = entry['input']
+            lines.append("input: %s" % _display_path(current))
+        target = _display_path(entry['target'])
+        lines.append("  sheet %i \"%s\" -> %s" % (entry['sheet_id'], entry['sheet_name'], target))
+    if plan.conflicts:
+        lines.append("# conflicts:")
+        for group in plan.conflicts:
+            lines.append("CONFLICT: %s" % _display_path(group[0]['target']))
+            for entry in group:
+                lines.append("  - %s#%s (sheet %i)" %
+                             (_display_path(entry['input']), entry['sheet_name'], entry['sheet_id']))
+    return os.linesep.join(lines)
+
+
 class XlsxValueError(XlsxException):
     pass
 
@@ -1182,13 +1501,7 @@ def convert_recursive(path, sheetid, outfile, kwargs, continue_on_error=False, s
         if os.path.isdir(fullpath):
             convert_recursive(fullpath, sheetid, outfile, kwargs, continue_on_error, sheetname)
         else:
-            outfilepath = outfile
-            if isinstance(outfilepath, type(sys.stdout)):
-                outfilepath = fullpath[:-4] + 'csv'
-            elif os.path.isdir(outfilepath):
-                outfilepath = os.path.join(outfilepath, name[:-4] + 'csv')
-            elif len(outfilepath) == 0 and fullpath.lower().endswith(".xlsx"):
-                outfilepath = fullpath[:-4] + 'csv'
+            outfilepath = _batch_output_path(fullpath, outfile)
 
             print("Converting %s to %s" % (fullpath, outfilepath))
             try:
@@ -1280,6 +1593,12 @@ def main():
                         help="continue processing remaining files when an error occurs during batch processing")
     parser.add_argument("--ignore-percentage", dest="ignore_percentage", default=False, action="store_true",
                         help="ignore percentage formatting and output raw values")
+    parser.add_argument("--plan", dest="plan", default=False, action="store_true",
+                        help="plan mode: list input files, sheets and relative target CSV paths, "
+                             "detect target conflicts, and write no CSV files")
+    parser.add_argument("--plan-file", dest="plan_file", default=None,
+                        help="with --plan, save the confirmed plan to this path; "
+                             "without --plan, validate and apply the plan saved at this path")
 
     if argparser:
         options = parser.parse_args()
@@ -1366,7 +1685,23 @@ def main():
 
     outfile = options.outfile or sys.stdout
     try:
-        if os.path.isdir(options.infile):
+        if options.plan_file and not options.plan:
+            plan = ConversionPlan.load(options.plan_file)
+            apply_conversion_plan(plan, kwargs, options.continue_on_error)
+        elif options.plan:
+            plan = build_conversion_plan(options.infile, outfile, sheetid, options.sheetname,
+                                         kwargs, options.continue_on_error)
+            print(format_plan_report(plan))
+            if plan.conflicts:
+                if options.plan_file:
+                    sys.exit("error: %d target path conflict(s); no plan was saved, resolve them and re-run --plan\n"
+                             % len(plan.conflicts))
+                sys.exit("error: %d target path conflict(s); refusing to write two sheets to the same CSV\n"
+                         % len(plan.conflicts))
+            if options.plan_file:
+                plan.save(options.plan_file)
+                print("Saved confirmed plan to %s" % options.plan_file)
+        elif os.path.isdir(options.infile):
             convert_recursive(options.infile, sheetid, outfile, kwargs, options.continue_on_error, options.sheetname)
         elif not os.path.exists(options.infile) and options.infile != "-":
             raise InvalidXlsxFileException("Input file not found!")

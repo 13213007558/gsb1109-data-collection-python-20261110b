@@ -87,6 +87,26 @@ Usage with a folder containing multiple `xlsx` files:
 ```
 will output each file in the input directory converted to `.csv` in the output directory. If omitting the output directory, it will output the converted files in the input directory.
 
+### Plan mode
+
+Before converting a directory, use `--plan` to preview exactly which input files and sheets land in which relative target paths. No CSV files are created:
+
+```sh
+    python xlsx2csv.py --plan -a /path/to/input/dir /path/to/output/dir
+```
+
+The report lists every selected sheet with its target path and marks conflicts. Two workbooks whose flattened names collide (or sheet names that differ only in case, such as `Data` and `data`) are reported as a conflict according to the target filesystem's case rules: on a case-insensitive filesystem case-only differences are conflicts, while they are not on a case-sensitive one. The command exits non-zero on conflict rather than letting the second sheet overwrite the first.
+
+Save a confirmed plan and apply it in two steps:
+
+```sh
+    python xlsx2csv.py --plan -a --plan-file plan.json /path/to/input/dir /path/to/output/dir
+    # review the report, then later:
+    python xlsx2csv.py --plan-file plan.json /path/to/input/dir /path/to/output/dir
+```
+
+A plan with conflicts is never saved. When applying, each source workbook is re-opened and its sheet list is compared with the plan; if any sheet was added, removed or renamed, the plan is rejected and nothing is written, so re-run `--plan` to confirm the updated plan first.
+
 Usage from within Python:
 ```
   from xlsx2csv import Xlsx2csv
