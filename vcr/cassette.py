@@ -4,6 +4,7 @@ import contextlib
 import copy
 import inspect
 import logging
+import threading
 from inspect import iscoroutinefunction
 
 import wrapt
@@ -11,6 +12,8 @@ import wrapt
 from ._handle_coroutine import handle_coroutine
 from .errors import MissingMetadataError, UnhandledHTTPRequestError
 from .filters import sensitive_data_hooks
+from .flow import current_flow_group
+from .flow import flow_group as flow_group_context
 from .matchers import get_matchers_results, method, requests_match, uri
 from .patch import CassettePatcherBuilder, validate_skip_patchers
 from .persisters.filesystem import CassetteDecodeError, CassetteNotFoundError, FilesystemPersister
@@ -19,6 +22,10 @@ from .serializers import yamlserializer
 from .util import partition_dict
 
 log = logging.getLogger(__name__)
+
+# Sentinel for append(): by default an interaction joins the caller's active
+# flow group (see vcr.flow), while _load() passes the group stored on file.
+_USE_CURRENT_FLOW_GROUP = object()
 
 
 class CassetteContextDecorator:
@@ -191,6 +198,7 @@ class Cassette:
         before_save_interaction=None,
         after_load_interaction=None,
         skip_patchers=(),
+        flow_groups=(),
     ):
         self._persister = persister or FilesystemPersister
         self._path = path
@@ -204,6 +212,14 @@ class Cassette:
         self.custom_patches = custom_patches
         self.allow_playback_repeats = allow_playback_repeats
         self.drop_unused_requests = drop_unused_requests
+        # Only these flow groups may be used with this cassette. An empty tuple
+        # means grouping is disabled: interactions on file without a group stay
+        # ungrouped and any group declaration is ignored. This is what makes
+        # cassettes recorded before flow groups existed keep working unchanged.
+        self.flow_groups = tuple(flow_groups)
+        # Guards playback/recording bookkeeping when flows share one cassette
+        # across threads, so two threads can't pick the same interaction.
+        self._lock = threading.RLock()
         # Hooks run on each interaction as the cassette is saved and loaded.
         # filter_sensitive_data hides values after the user's save hooks and
         # restores them before the user's load hooks, so those see real values.
@@ -217,6 +233,9 @@ class Cassette:
 
         # self.data is the list of (req, resp) tuples
         self.data = []
+        # Flow group label per interaction in self.data, aligned by index.
+        # None means the interaction isn't assigned to a group.
+        self._flow_groups = []
         # Values stored with get_metadata, saved in the cassette next to the interactions.
         self._metadata = {}
         self.play_counts = collections.Counter()
@@ -226,6 +245,9 @@ class Cassette:
         # Subsets of self.data to store old and played interactions
         self._old_interactions = []
         self._played_interactions = []
+        # Indices into self.data of loaded interactions played back at least
+        # once, kept alongside _played_interactions for group-aware saving.
+        self._played_indices = set()
         # Number of entries at the start of self.data that came from the file
         self._loaded_count = 0
 
@@ -255,7 +277,45 @@ class Cassette:
     def write_protected(self):
         return (self.rewound and self.record_mode == RecordMode.ONCE) or self.record_mode == RecordMode.NONE
 
-    def append(self, request, response):
+    def _active_flow_group(self):
+        """The flow group the current caller declared, if this cassette groups.
+
+        Returns None when grouping is disabled (no ``flow_groups`` configured),
+        the caller declared no group, or the declared group isn't one of this
+        cassette's groups. None means playback uses the whole cassette, as it
+        did before flow groups existed.
+        """
+        if not self.flow_groups:
+            return None
+        group = current_flow_group()
+        if group is not None and group not in self.flow_groups:
+            log.warning(
+                "Flow group %r is not one of the cassette's groups %r at %s; playing back without a group.",
+                group,
+                self.flow_groups,
+                self._path,
+            )
+            return None
+        return group
+
+    @contextlib.contextmanager
+    def flow_group(self, group):
+        """Declare the flow group for requests made inside the context.
+
+        The cassette must be configured with ``flow_groups`` including
+        ``group``; otherwise the declaration is ignored and the cassette keeps
+        its ungrouped behavior. The active group is tracked per thread/task, so
+        concurrent flows sharing the cassette don't interfere.
+        """
+        if self.flow_groups and group not in self.flow_groups:
+            raise ValueError(
+                f"Unknown flow group {group!r} for cassette {self._path!r}. "
+                f"Declared groups: {', '.join(map(repr, self.flow_groups))}",
+            )
+        with flow_group_context(group if self.flow_groups else None):
+            yield
+
+    def append(self, request, response, flow_group=_USE_CURRENT_FLOW_GROUP):
         """Add a request, response pair to this cassette"""
         request = self._before_record_request(request)
         if not request:
@@ -267,7 +327,10 @@ class Cassette:
         response = self._before_record_response(response)
         if response is None:
             return
+        if flow_group is _USE_CURRENT_FLOW_GROUP:
+            flow_group = self._active_flow_group()
         self.data.append((request, response))
+        self._flow_groups.append(flow_group)
         self.dirty = True
 
     def filter_request(self, request):
@@ -279,7 +342,12 @@ class Cassette:
         the request.
         """
         request = self._before_record_request(request)
+        group = self._active_flow_group()
         for index, (stored_request, response) in enumerate(self.data):
+            if group is not None and self._flow_groups[index] != group:
+                # Another flow's interaction: never borrow it, even once this
+                # group's own matching interactions are exhausted.
+                continue
             if requests_match(request, stored_request, self._match_on):
                 yield index, response
 
@@ -297,15 +365,17 @@ class Cassette:
         Get the response corresponding to a request, but only if it
         hasn't been played back before, and mark it as played
         """
-        for index, response in self._responses(request):
-            if self.play_counts[index] == 0 or self.allow_playback_repeats:
-                # Remember each loaded interaction once, however often it's played,
-                # for drop_unused_requests. Interactions recorded now are saved anyway.
-                if self.play_counts[index] == 0 and index < self._loaded_count:
-                    # Use stored (possibly modified) request, not the raw incoming request
-                    self._played_interactions.append((self.data[index][0], response))
-                self.play_counts[index] += 1
-                return response
+        with self._lock:
+            for index, response in self._responses(request):
+                if self.play_counts[index] == 0 or self.allow_playback_repeats:
+                    # Remember each loaded interaction once, however often it's played,
+                    # for drop_unused_requests. Interactions recorded now are saved anyway.
+                    if self.play_counts[index] == 0 and index < self._loaded_count:
+                        # Use stored (possibly modified) request, not the raw incoming request
+                        self._played_interactions.append((self.data[index][0], response))
+                        self._played_indices.add(index)
+                    self.play_counts[index] += 1
+                    return response
         # The cassette doesn't contain the request asked for.
         raise UnhandledHTTPRequestError(
             f"The cassette ({self._path!r}) doesn't contain the request ({request!r}) asked for",
@@ -342,7 +412,10 @@ class Cassette:
         """
         best_matches = []
         request = self._before_record_request(request)
-        for _, (stored_request, _) in enumerate(self.data):
+        group = self._active_flow_group()
+        for index, (stored_request, _) in enumerate(self.data):
+            if group is not None and self._flow_groups[index] != group:
+                continue
             successes, fails = get_matchers_results(request, stored_request, self._match_on)
             best_matches.append((len(successes), stored_request, successes, fails))
         best_matches.sort(key=lambda t: t[0], reverse=True)
@@ -382,25 +455,42 @@ class Cassette:
 
     def _new_interactions(self):
         """List of new HTTP interactions (request/response tuples)"""
+        return [(request, response) for _, request, response in self._new_interactions_with_index()]
+
+    def _new_interactions_with_index(self):
+        """Like _new_interactions, but each entry keeps its index in self.data."""
         new_interactions = []
-        for request, response in self.data:
+        for index in range(self._loaded_count, len(self.data)):
+            request, response = self.data[index]
             if all(
                 not requests_match(request, old_request, self._match_on)
                 for old_request, _ in self._old_interactions
             ):
-                new_interactions.append((request, response))
+                new_interactions.append((index, request, response))
         return new_interactions
 
     def _as_dict(self):
-        return {"requests": self.requests, "responses": self.responses}
+        return {
+            "requests": self.requests,
+            "responses": self.responses,
+            "flow_groups": list(self._flow_groups),
+        }
 
     def _build_used_interactions_dict(self):
-        interactions = self._played_interactions + self._new_interactions()
-        cassete_dict = {
-            "requests": [request for request, _ in interactions],
-            "responses": [response for _, response in interactions],
+        # Preserve recording order: every played interaction (in cassette
+        # order), then the newly recorded ones, each with its flow group.
+        interactions = [
+            (*self.data[index], self._flow_groups[index]) for index in sorted(self._played_indices)
+        ]
+        interactions.extend(
+            (request, response, self._flow_groups[index])
+            for index, request, response in self._new_interactions_with_index()
+        )
+        return {
+            "requests": [request for request, _, _ in interactions],
+            "responses": [response for _, response, _ in interactions],
+            "flow_groups": [group for _, _, group in interactions],
         }
-        return cassete_dict
 
     def _rerecorded_interactions(self):
         """Interactions to save in "all" mode.
@@ -409,14 +499,17 @@ class Cassette:
         re-recording doesn't duplicate them. Loaded interactions that weren't
         re-recorded are kept, unless drop_unused_requests is set.
         """
-        loaded = self.data[: self._loaded_count]
-        recorded = self.data[self._loaded_count :]
+        loaded = [(*self.data[index], self._flow_groups[index]) for index in range(self._loaded_count)]
+        recorded = [
+            (*self.data[index], self._flow_groups[index])
+            for index in range(self._loaded_count, len(self.data))
+        ]
         if self.drop_unused_requests:
             return recorded
         kept = [
-            (old_request, old_response)
-            for old_request, old_response in loaded
-            if not any(requests_match(request, old_request, self._match_on) for request, _ in recorded)
+            (old_request, old_response, old_group)
+            for old_request, old_response, old_group in loaded
+            if not any(requests_match(request, old_request, self._match_on) for request, _, _ in recorded)
         ]
         return kept + recorded
 
@@ -425,8 +518,9 @@ class Cassette:
             if force or self.dirty:
                 interactions = self._rerecorded_interactions()
                 cassete_dict = {
-                    "requests": [request for request, _ in interactions],
-                    "responses": [response for _, response in interactions],
+                    "requests": [request for request, _, _ in interactions],
+                    "responses": [response for _, response, _ in interactions],
+                    "flow_groups": [group for _, _, group in interactions],
                 }
                 self._persist(cassete_dict)
                 self.dirty = False
@@ -441,9 +535,12 @@ class Cassette:
             self.dirty = False
 
     def _persist(self, cassette_dict):
+        flow_groups = cassette_dict.get("flow_groups")
         if self._before_save_interaction:
             interactions = []
-            for request, response in zip(cassette_dict["requests"], cassette_dict["responses"], strict=True):
+            for index, (request, response) in enumerate(
+                zip(cassette_dict["requests"], cassette_dict["responses"], strict=True),
+            ):
                 # Hooks get copies, so they can't change the interactions in memory.
                 interaction = _run_hooks(
                     self._before_save_interaction,
@@ -452,33 +549,41 @@ class Cassette:
                     self,
                 )
                 if interaction is not None:
-                    interactions.append(interaction)
+                    group = flow_groups[index] if flow_groups is not None else None
+                    interactions.append((*interaction, group))
             cassette_dict = {
-                "requests": [request for request, _ in interactions],
-                "responses": [response for _, response in interactions],
+                "requests": [request for request, _, _ in interactions],
+                "responses": [response for _, response, _ in interactions],
+                "flow_groups": [group for _, _, group in interactions],
             }
+        elif flow_groups is None:
+            cassette_dict = {**cassette_dict, "flow_groups": [None] * len(cassette_dict["requests"])}
         if self._metadata:
             cassette_dict = {**cassette_dict, "metadata": self._metadata}
         self._persister.save_cassette(self._path, cassette_dict, serializer=self._serializer)
 
     def _load(self):
         try:
-            # Persisters return (requests, responses), and metadata third if the cassette has any.
-            requests, responses, *metadata = self._persister.load_cassette(
+            # Persisters return (requests, responses), plus flow groups and
+            # metadata if the cassette has them. Older persisters return only
+            # the first two, which is treated as an entirely ungrouped cassette.
+            requests, responses, *extras = self._persister.load_cassette(
                 self._path,
                 serializer=self._serializer,
             )
-            for request, response in zip(requests, responses, strict=False):
+            flow_groups, metadata = _unpack_cassette_extras(extras)
+            for index, (request, response) in enumerate(zip(requests, responses, strict=False)):
                 interaction = _run_hooks(self._after_load_interaction, request, response, self)
                 if interaction is None:
                     continue
                 request, response = interaction
-                self.append(request, response)
+                group = flow_groups[index] if flow_groups is not None and index < len(flow_groups) else None
+                self.append(request, response, flow_group=group)
                 self._old_interactions.append((request, response))
             self._loaded_count = len(self.data)
             self.dirty = False
             self.rewound = True
-            self._metadata = metadata[0] if metadata else {}
+            self._metadata = metadata
         except CassetteNotFoundError:
             pass
         except CassetteDecodeError:
@@ -503,6 +608,25 @@ class Cassette:
             if self.play_counts[index] == 0 or self.allow_playback_repeats:
                 return True
         return False
+
+
+def _unpack_cassette_extras(extras):
+    """Split a persister's optional return values into (flow groups, metadata).
+
+    Current persisters may return up to four values: requests, responses,
+    flow groups, metadata. Persisters written before flow groups return only
+    (requests, responses) or (requests, responses, metadata); in both cases the
+    cassette is treated as ungrouped. A metadata mapping is recognized by type,
+    so it doesn't matter which of the two optional positions it occupies.
+    """
+    flow_groups = None
+    metadata = {}
+    for extra in extras:
+        if isinstance(extra, collections.abc.Mapping):
+            metadata = extra
+        else:
+            flow_groups = list(extra)
+    return flow_groups, metadata
 
 
 def _hooks(hooks):

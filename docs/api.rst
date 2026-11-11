@@ -15,6 +15,12 @@ API
    :members:
    :special-members: __init__
 
+:mod:`~vcr.flow`
+----------------
+
+.. automodule:: vcr.flow
+   :members:
+
 :mod:`~vcr.matchers`
 --------------------
 

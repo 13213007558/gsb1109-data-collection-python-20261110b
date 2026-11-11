@@ -53,8 +53,17 @@ def deserialize(cassette_string, serializer):
 
     requests = [Request._from_dict(r["request"]) for r in data["interactions"]]
     responses = [compat.convert_to_bytes(r["response"]) for r in data["interactions"]]
+    # Cassettes written before flow groups have no key: every interaction is
+    # ungrouped, which is all None.
+    flow_groups = data.get("flow_groups")
+    if flow_groups is not None:
+        flow_groups = list(flow_groups)
     if data.get("metadata"):
+        if flow_groups is not None:
+            return requests, responses, flow_groups, data["metadata"]
         return requests, responses, data["metadata"]
+    if flow_groups is not None:
+        return requests, responses, flow_groups
     return requests, responses
 
 
@@ -67,6 +76,11 @@ def serialize(cassette_dict, serializer):
         for request, response in zip(cassette_dict["requests"], cassette_dict["responses"], strict=False)
     ]
     data = {"version": CASSETTE_FORMAT_VERSION, "interactions": interactions}
+    # Omit the key entirely for ungrouped cassettes, so recordings without flow
+    # groups keep the exact format they had before this feature existed.
+    flow_groups = cassette_dict.get("flow_groups")
+    if flow_groups and any(group is not None for group in flow_groups):
+        data["flow_groups"] = list(flow_groups)
     if cassette_dict.get("metadata"):
         data["metadata"] = cassette_dict["metadata"]
     return serializer.serialize(data)

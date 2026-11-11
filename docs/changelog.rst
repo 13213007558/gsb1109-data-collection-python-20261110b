@@ -4,6 +4,7 @@ Changelog
 All help in providing PRs to close out bug issues is appreciated. Even if that is providing a repo that fully replicates issues. We have very generous contributors that have added these to bug issues which meant another contributor picked up the bug and closed it out.
 
 -  Unreleased
+    - New ``flow_groups`` cassette option and ``cassette.flow_group()`` context: concurrent flows that make the same request (e.g. two form-filling threads polling one URL) can each declare a group, and playback then only consumes that group's recorded interactions in recording order. A group whose own interactions are exhausted never borrows another group's response. Groups are tracked per thread/asyncio task, saved per interaction as a top-level ``flow_groups`` list, and fully backward compatible: cassettes without the list load as ungrouped, and a cassette created without ``flow_groups`` ignores group declarations. Custom persisters may return flow groups as a third value; two-value persisters keep working
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
 
 -  9.4.2

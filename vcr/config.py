@@ -56,6 +56,7 @@ class VCR:
         before_save_interaction=None,
         after_load_interaction=None,
         skip_patchers=(),
+        flow_groups=(),
     ):
         self.serializer = serializer
         self.match_on = match_on
@@ -95,6 +96,7 @@ class VCR:
         self.before_save_interaction = before_save_interaction
         self.after_load_interaction = after_load_interaction
         self.skip_patchers = validate_skip_patchers(skip_patchers)
+        self.flow_groups = _validate_flow_groups(flow_groups)
 
     def _get_serializer(self, serializer_name):
         try:
@@ -172,6 +174,7 @@ class VCR:
             "before_save_interaction": kwargs.get("before_save_interaction", self.before_save_interaction),
             "after_load_interaction": kwargs.get("after_load_interaction", self.after_load_interaction),
             "skip_patchers": kwargs.get("skip_patchers", self.skip_patchers),
+            "flow_groups": _validate_flow_groups(kwargs.get("flow_groups", self.flow_groups)),
         }
         path = kwargs.get("path")
         if path:
@@ -291,3 +294,23 @@ class VCR:
         predicate = predicate or self.is_test_method
         metaclass = auto_decorate(self.use_cassette, predicate)
         return metaclass("temporary_class", (), {})
+
+
+def _validate_flow_groups(flow_groups):
+    """Normalize the flow_groups option to a tuple of unique non-empty strings.
+
+    A single string is treated as one group rather than an iterable of
+    characters. An empty value disables grouping for the cassette, which keeps
+    playback identical to cassettes recorded before flow groups existed.
+    """
+    if not flow_groups:
+        return ()
+    if isinstance(flow_groups, str):
+        flow_groups = (flow_groups,)
+    groups = tuple(flow_groups)
+    if any(not isinstance(group, str) or not group for group in groups):
+        raise ValueError("flow_groups must contain only non-empty strings")
+    if len(set(groups)) != len(groups):
+        duplicates = sorted({group for group in groups if groups.count(group) > 1})
+        raise ValueError(f"Duplicate flow group name(s): {', '.join(map(repr, duplicates))}")
+    return groups

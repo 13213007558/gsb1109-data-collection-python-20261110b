@@ -170,6 +170,11 @@ methods.  The ``load_cassette`` method must return a deserialized cassette or ra
 either ``CassetteNotFoundError`` if no cassette is found, or ``CassetteDecodeError``
 if the cassette cannot be successfully deserialized.
 
+A cassette is returned as a ``(requests, responses)`` tuple. It may add a list of
+flow group labels (one per interaction) and a metadata mapping, in either order;
+persisters that keep returning just the two values still work, and such cassettes
+are treated as ungrouped.
+
 Once the persister class is defined, register with VCR like so...
 
 .. code:: python
@@ -680,6 +685,53 @@ recorded response instead of being sent and recorded again.
         for x in range(10):
             response = urllib.request.urlopen('http://www.zombo.com/').read()
         assert cass.all_played
+
+Flow groups
+-----------
+
+Sometimes two flows make the same request but must get different recorded
+responses: two form-filling threads polling the same URL, for example, whose
+recording contains each flow's results in turn. Without grouping the first
+thread to ask can consume the other flow's response, because VCR matches on
+the request alone and hands out identical requests in recording order.
+
+Flow groups give each flow its own slice of the cassette. Declare the groups
+a cassette may use with the ``flow_groups`` option, then wrap each flow's HTTP
+calls in the cassette's ``flow_group`` context (or the module-level
+``vcr.flow_group``). While a group is active:
+
+-  playback only matches interactions recorded with that same group;
+-  identical requests inside the group are still consumed in recording order;
+-  once the group's own interactions are exhausted, playback fails instead of
+   borrowing another group's response;
+-  the active group is tracked per thread and per asyncio task, so concurrent
+   flows sharing one cassette don't interfere.
+
+.. code:: python
+
+    import vcr
+
+    my_vcr = vcr.VCR(flow_groups=("form-a", "form-b"))
+    with my_vcr.use_cassette("polling.yaml") as cassette:
+        with cassette.flow_group("form-a"):
+            # only sees interactions recorded under "form-a"
+            ...
+        with cassette.flow_group("form-b"):
+            # only sees interactions recorded under "form-b"
+            ...
+
+Recordings made inside a ``flow_group`` block are stored with that group, and
+the labels are saved in the cassette as a top-level ``flow_groups`` list with
+one entry per interaction. Cassettes recorded before this feature have no such
+list: they load as fully ungrouped and behave exactly as before as long as no
+group is declared (declaring one only matches interactions labeled with it, so
+re-record an old cassette to give its interactions groups). Grouping is
+opt-in — a cassette created without ``flow_groups`` ignores any group
+declaration, so existing cassettes and tests keep working unchanged.
+
+An unknown group name raises ``ValueError``. A group set through
+``vcr.flow_group`` that the cassette doesn't know is ignored with a warning,
+and the request plays back ungrouped.
 
 Discards Cassette on Errors
 ---------------------------
