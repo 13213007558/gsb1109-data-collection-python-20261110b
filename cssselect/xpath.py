@@ -321,11 +321,16 @@ class GenericTranslator:
 
     def xpath_negation(self, negation: Negation) -> XPathExpr:
         xpath = self.xpath(negation.selector)
-        condition = self._xpath_match_condition(negation.subselector)
-        if condition is None:
-            # The argument matches every element, so :not() matches none.
-            return xpath.add_condition("0")
-        return xpath.add_condition(f"not({condition})")
+        conditions: list[str] = []
+        for subselector in negation.selector_list:
+            # Each argument is translated on its own: an unsupported one
+            # raises instead of being silently dropped from the list.
+            condition = self._xpath_match_condition(subselector)
+            if condition is None:
+                # This argument matches every element, so :not() matches none.
+                return xpath.add_condition("0")
+            conditions.append(condition)
+        return xpath.add_condition(f"not({_or_conditions(conditions)})")
 
     def _xpath_match_condition(self, selector: Tree) -> str | None:
         """Return a condition that holds for the elements matching *selector*,

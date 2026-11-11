@@ -48,7 +48,7 @@ exclude = [
 packages = ["cssselect"]
 
 [tool.bumpversion]
-current_version = "1.6.0"
+current_version = "1.7.0"
 commit = true
 tag = true
 

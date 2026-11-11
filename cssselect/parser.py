@@ -247,27 +247,33 @@ class Pseudo:
 
 class Negation:
     """
-    Represents selector:not(subselector)
+    Represents selector:not(selector_list)
     """
 
-    def __init__(self, selector: Tree, subselector: Tree) -> None:
+    def __init__(self, selector: Tree, selector_list: Iterable[Tree]):
         self.selector = selector
-        self.subselector = subselector
+        self.selector_list = selector_list
 
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}[{self.selector!r}:not({self.subselector!r})]"
+        args_str = ", ".join(repr(s) for s in self.selector_list)
+        return f"{self.__class__.__name__}[{self.selector!r}:not({args_str})]"
 
     def canonical(self) -> str:
-        subsel = self.subselector.canonical()
-        # Strip a redundant universal selector from e.g. "*.foo" (but not
-        # from e.g. "* > foo").
-        if len(subsel) > 1 and subsel[0] == "*" and subsel[1] in "#.[:":
-            subsel = subsel[1:]
-        return f"{self.selector.canonical()}:not({subsel})"
+        selector_arguments = []
+        for s in self.selector_list:
+            subsel = s.canonical()
+            # Strip a redundant universal selector from e.g. "*.foo" (but not
+            # from e.g. "* > foo").
+            if len(subsel) > 1 and subsel[0] == "*" and subsel[1] in "#.[:":
+                subsel = subsel[1:]
+            selector_arguments.append(subsel)
+        return f"{self.selector.canonical()}:not({', '.join(selector_arguments)})"
 
     def specificity(self) -> tuple[int, int, int]:
+        # The specificity of :not() is that of its most specific argument,
+        # each argument counted as a whole complex selector.
         a1, b1, c1 = self.selector.specificity()
-        a2, b2, c2 = self.subselector.specificity()
+        a2, b2, c2 = max(x.specificity() for x in self.selector_list)
         return a1 + a2, b1 + b2, c1 + c2
 
 
@@ -729,36 +735,40 @@ def parse_simple_selector(
                     )
                 if inside_negation:
                     raise SelectorSyntaxError("Got nested :not()")
-                argument, argument_pseudo_element = parse_simple_selector(
-                    stream, inside_negation=True
-                )
+                negation_arguments: list[Tree] = []
                 while 1:
-                    # Whitespace before the closing parenthesis is not a
-                    # descendant combinator.
-                    stream.skip_whitespace()
-                    peek = stream.peek()
-                    if argument_pseudo_element:
-                        raise SelectorSyntaxError(
-                            f"Got pseudo-element ::{argument_pseudo_element} inside :not() at {peek.pos}"
-                        )
-                    if peek == ("DELIM", ")"):
-                        stream.next()
-                        break
-                    if peek.is_delim("+", ">", "~"):
-                        argument_combinator = cast("str", stream.next().value)
-                        stream.skip_whitespace()
-                    elif peek.type == "EOF" or peek.is_delim(","):
-                        # A selector list is not supported in :not().
-                        raise SelectorSyntaxError(f"Expected ')', got {peek}")
-                    else:
-                        argument_combinator = " "
-                    next_selector, argument_pseudo_element = parse_simple_selector(
+                    argument, argument_pseudo_element = parse_simple_selector(
                         stream, inside_negation=True
                     )
-                    argument = CombinedSelector(
-                        argument, argument_combinator, next_selector
-                    )
-                result = Negation(result, argument)
+                    while 1:
+                        # Whitespace before a comma or the closing parenthesis
+                        # is not a descendant combinator.
+                        stream.skip_whitespace()
+                        peek = stream.peek()
+                        if argument_pseudo_element:
+                            raise SelectorSyntaxError(
+                                f"Got pseudo-element ::{argument_pseudo_element} inside :not() at {peek.pos}"
+                            )
+                        if peek.is_delim(",", ")"):
+                            break
+                        if peek.type == "EOF":
+                            raise SelectorSyntaxError(f"Expected ')', got {peek}")
+                        if peek.is_delim("+", ">", "~"):
+                            argument_combinator = cast("str", stream.next().value)
+                            stream.skip_whitespace()
+                        else:
+                            argument_combinator = " "
+                        next_selector, argument_pseudo_element = parse_simple_selector(
+                            stream, inside_negation=True
+                        )
+                        argument = CombinedSelector(
+                            argument, argument_combinator, next_selector
+                        )
+                    negation_arguments.append(argument)
+                    if stream.next().is_delim(")"):
+                        break
+                    stream.skip_whitespace()
+                result = Negation(result, negation_arguments)
             elif ident.lower() == "has":
                 result = Relation(result, parse_relative_selector(stream))
             elif ident.lower() in ("matches", "is"):

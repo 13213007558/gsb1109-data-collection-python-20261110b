@@ -119,9 +119,9 @@ be implemented):
   ``i`` makes the value comparison ASCII case-insensitive. ``s`` is accepted
   but has no effect, since attribute values are already compared
   case-sensitively.
-* The ``:not()`` pseudo-class with a *complex selector* argument, e.g.
-  ``:not(a.important[rel] > b)``. Limitation: it takes a single argument, so a
-  selector list is unsupported (e.g. ``:not(a, b)``).
+* The ``:not()`` pseudo-class with a *complex selector list* argument, e.g.
+  ``:not(a.important[rel] > b, .notice)``. Each argument is a complex selector;
+  the specificity of ``:not()`` is that of its most specific argument.
 
 These are non-standard extensions:
 

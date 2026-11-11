@@ -1,6 +1,22 @@
 Changelog
 =========
 
+Version 1.7.0
+-------------
+
+Unreleased.
+
+*   **Backward-incompatible change**: ``Negation``, which represents
+    ``:not()``, now takes and exposes a list of selectors as
+    ``selector_list``, replacing its ``subselector`` argument and attribute.
+
+*   ``:not()`` now supports a selector list of complex selectors, e.g.
+    ``:not(a.important, aside article, .preview + article)``. Each argument
+    is matched against the candidate element itself, the specificity of
+    ``:not()`` is that of its most specific argument, and an argument that
+    cannot be translated makes the whole ``:not()`` raise an
+    ``ExpressionError`` instead of being silently ignored.
+
 Version 1.6.0
 -------------
 
