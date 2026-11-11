@@ -14,9 +14,14 @@ from typing import Dict
 from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import Sequence
 
 from . import field_size_limit
 from .break_ties import tie_breaker
+from .column_contract import ColumnContract
+from .column_contract import ColumnContractReport
+from .column_contract import ColumnContractResult
+from .column_contract import evaluate_column_contracts
 from .cparser_util import parse_string
 from .detect_pattern import pattern_score
 from .detect_type import DEFAULT_EPS_TYPE
@@ -74,11 +79,16 @@ class ConsistencyDetector:
         skip: bool = True,
         verbose: bool = False,
         cache_capacity: int = 100_000,
+        column_contracts: Optional[Sequence[ColumnContract]] = None,
     ) -> None:
         self._skip = skip
         self._verbose = verbose
         self._type_detector = TypeDetector()
         self._cache_capacity = cache_capacity
+        self.column_contracts = (
+            list(column_contracts) if column_contracts is not None else None
+        )
+        self.column_contract_report_: Optional[ColumnContractReport] = None
 
         # NOTE: A bit ugly but allows setting the cache size dynamically
         @lru_cache(cache_capacity)
@@ -88,7 +98,10 @@ class ConsistencyDetector:
         self._cached_is_known_type = cached_is_known_type
 
     def detect(
-        self, data: str, delimiters: Optional[List[str]] = None
+        self,
+        data: str,
+        delimiters: Optional[List[str]] = None,
+        column_contracts: Optional[Sequence[ColumnContract]] = None,
     ) -> Optional[SimpleDialect]:
         """Detect the dialect using the consistency measure
 
@@ -102,6 +115,16 @@ class ConsistencyDetector:
             function is used to automatically detect this (as described in the
             paper).
 
+        column_contracts : Optional[Sequence[ColumnContract]]
+            Optional column contracts used to filter the candidate dialects.
+            All potential dialects are evaluated against the contracts and
+            only the unique satisfying dialect is returned. The contracts
+            only select or report candidates; parsed cells are never
+            changed. When no candidate satisfies the contracts, the sample
+            is insufficient, or satisfying candidates remain tied, None is
+            returned and the details are exposed in
+            :attr:`column_contract_report_`.
+
         Returns
         -------
         dialect : SimpleDialect
@@ -109,6 +132,12 @@ class ConsistencyDetector:
 
         """
         self._cached_is_known_type.cache_clear()
+        self.column_contract_report_ = None
+        contracts: Optional[List[ColumnContract]]
+        if column_contracts is not None:
+            contracts = list(column_contracts)
+        else:
+            contracts = self.column_contracts
 
         # TODO: probably some optimization there too
         dialects = get_dialects(data, delimiters=delimiters)
@@ -121,13 +150,43 @@ class ConsistencyDetector:
         scores = self.compute_consistency_scores(data, dialects)
         best_dialects = ConsistencyDetector.get_best_dialects(scores)
         result: Optional[SimpleDialect] = None
-        if len(best_dialects) == 1:
+        if contracts is not None:
+            result = self._select_with_contracts(data, dialects, contracts)
+        elif len(best_dialects) == 1:
             result = best_dialects[0]
         else:
             result = tie_breaker(data, best_dialects)
 
         field_size_limit(old_limit)
         return result
+
+    def _select_with_contracts(
+        self,
+        data: str,
+        dialects: List[SimpleDialect],
+        contracts: List[ColumnContract],
+    ) -> Optional[SimpleDialect]:
+        report = evaluate_column_contracts(
+            data,
+            dialects,
+            contracts,
+            type_detector=self._type_detector,
+        )
+        self.column_contract_report_ = report
+        if self._verbose:
+            print(
+                "Column contracts result: %s" % report.result.value,
+                flush=True,
+            )
+
+        # Only a unique satisfying dialect is returned. Every other result
+        # (no match, a missing required column, an insufficient sample, or a
+        # remaining tie) abstains so no unsupported guess ends up in the
+        # caller's long-lived configuration. The tied or rejected candidates
+        # stay available through the column contract report.
+        if report.result == ColumnContractResult.MATCHED:
+            return report.matched
+        return None
 
     def compute_consistency_scores(
         self, data: str, dialects: List[SimpleDialect]
@@ -211,10 +270,15 @@ def detect_dialect_consistency(
     delimiters: Optional[Iterable[str]] = None,
     skip: bool = True,
     verbose: bool = False,
+    column_contracts: Optional[Sequence[ColumnContract]] = None,
 ) -> Optional[SimpleDialect]:
     """Helper function that wraps ConsistencyDetector"""
     # Mostly kept for backwards compatibility
     consistency_detector = ConsistencyDetector(skip=skip, verbose=verbose)
     if delimiters is not None:
         delimiters = list(delimiters)
-    return consistency_detector.detect(data, delimiters=delimiters)
+    return consistency_detector.detect(
+        data,
+        delimiters=delimiters,
+        column_contracts=column_contracts,
+    )

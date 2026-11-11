@@ -6,6 +6,9 @@ from csv import QUOTE_NONE
 from csv import QUOTE_NONNUMERIC
 
 from .__version__ import __version__
+from .column_contract import ColumnContract
+from .column_contract import ColumnContractReport
+from .column_contract import ColumnContractResult
 from .cparser_util import field_size_limit
 from .detect import Detector
 from .detect import Detector as Sniffer
@@ -31,6 +34,9 @@ __all__ = [
     "QUOTE_NONE",
     "QUOTE_NONNUMERIC",
     "__version__",
+    "ColumnContract",
+    "ColumnContractReport",
+    "ColumnContractResult",
     "field_size_limit",
     "Detector",
     "Sniffer",

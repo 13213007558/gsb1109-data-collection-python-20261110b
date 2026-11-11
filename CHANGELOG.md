@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+* Add optional column contracts (`ColumnContract`) to dialect detection. A
+  contract names a column position, whether it is required, and an optional
+  bounded value check (a known type or a closed set of allowed values).
+  Contracts only select or report candidate dialects; they never rewrite
+  parsed cells. Detection returns `None` with a distinct result when the
+  sample is insufficient, no candidate satisfies the contracts, or
+  satisfying candidates remain tied, so unsupported guesses aren't written
+  to long-lived configuration.
+
 ## Version 0.8.5
 
 * Fix reference counting bug in C extension 

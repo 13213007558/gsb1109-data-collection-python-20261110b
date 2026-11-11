@@ -18,9 +18,11 @@ from typing import Iterator
 from typing import List
 from typing import Mapping
 from typing import Optional
+from typing import Sequence
 from typing import TypeVar
 
 from ._optional import import_optional_dependency
+from .column_contract import ColumnContract
 from .detect import Detector
 from .dialect import SimpleDialect
 from .dict_read_write import DictReader
@@ -354,6 +356,7 @@ def detect_dialect(
     verbose: bool = False,
     method: str = "auto",
     skip: bool = True,
+    column_contracts: Optional[Sequence[ColumnContract]] = None,
 ) -> Optional[SimpleDialect]:
     """Detect the dialect of a CSV file
 
@@ -385,6 +388,12 @@ def detect_dialect(
         Skip computation of the type score for dialects with a low pattern
         score.
 
+    column_contracts : Optional[Sequence[ColumnContract]]
+        Optional column contracts used to select candidate dialects. The
+        contracts only constrain which dialect is reported; cells are never
+        rewritten. When the contracts can't distinguish the candidates, None
+        is returned.
+
     Returns
     -------
     dialect : Optional[SimpleDialect]
@@ -396,7 +405,11 @@ def detect_dialect(
     with open(filename, "r", newline="", encoding=enc) as fp:
         data = fp.read(num_chars) if num_chars else fp.read()
         dialect = Detector().detect(
-            data, verbose=verbose, method=method, skip=skip
+            data,
+            verbose=verbose,
+            method=method,
+            skip=skip,
+            column_contracts=column_contracts,
         )
     return dialect
 

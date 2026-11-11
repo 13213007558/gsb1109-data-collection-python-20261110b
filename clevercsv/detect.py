@@ -13,8 +13,13 @@ from io import StringIO
 from typing import Dict
 from typing import Iterable
 from typing import Optional
+from typing import Sequence
 from typing import Union
 
+from .column_contract import ColumnContract
+from .column_contract import ColumnContractReport
+from .column_contract import ColumnContractResult
+from .column_contract import evaluate_column_contracts
 from .consistency import ConsistencyDetector
 from .dialect import SimpleDialect
 from .exceptions import NoDetectionResult
@@ -68,6 +73,7 @@ class Detector:
         verbose: bool = False,
         method: Union[DetectionMethod, str] = DetectionMethod.AUTO,
         skip: bool = True,
+        column_contracts: Optional[Sequence[ColumnContract]] = None,
     ) -> Optional[SimpleDialect]:
         """Detect the dialect of a CSV file
 
@@ -100,6 +106,16 @@ class Detector:
             :func:`ConsistencyDetector.compute_consistency_scores` for more
             details.
 
+        column_contracts : Optional[Sequence[ColumnContract]]
+            Optional column contracts that candidate dialects must satisfy.
+            Each contract names a column position, whether it is required,
+            and an optional bounded check on its values (a known type or a
+            closed set of allowed values). The contracts only select or
+            report candidates; parsed cells are never modified. When the
+            sample is insufficient, no candidate satisfies the contracts,
+            or satisfying candidates remain tied, None is returned and the
+            details are available in :attr:`column_contract_report_`.
+
         Returns
         -------
         dialect : Optional[SimpleDialect]
@@ -110,21 +126,49 @@ class Detector:
         method = DetectionMethod(method) if isinstance(method, str) else method
         if delimiters is not None:
             delimiters = list(delimiters)
+        contracts = (
+            list(column_contracts) if column_contracts is not None else None
+        )
+        self.column_contract_report_: Optional[ColumnContractReport] = None
+
         if method == DetectionMethod.NORMAL or method == DetectionMethod.AUTO:
             if verbose:
                 print("Running normal form detection ...", flush=True)
             dialect = detect_dialect_normal(
                 sample, delimiters=delimiters, verbose=verbose
             )
-            if dialect is not None:
+            if dialect is not None and contracts is None:
                 self.method_ = DetectionMethod.NORMAL
                 return dialect
+            if dialect is not None and contracts is not None:
+                report = evaluate_column_contracts(
+                    sample, [dialect], contracts
+                )
+                self.column_contract_report_ = report
+                if report.result == ColumnContractResult.MATCHED:
+                    self.method_ = DetectionMethod.NORMAL
+                    return dialect
+                if verbose:
+                    print(
+                        "Normal form dialect rejected by column contracts "
+                        "(%s)." % report.result.value,
+                        flush=True,
+                    )
+            if method == DetectionMethod.NORMAL:
+                self.method_ = DetectionMethod.NORMAL
+                return None
 
         self.method_ = DetectionMethod.CONSISTENCY
-        consistency_detector = ConsistencyDetector(skip=skip, verbose=verbose)
+        consistency_detector = ConsistencyDetector(
+            skip=skip, verbose=verbose, column_contracts=contracts
+        )
         if verbose:
             print("Running data consistency measure ...", flush=True)
-        return consistency_detector.detect(sample, delimiters=delimiters)
+        result = consistency_detector.detect(sample, delimiters=delimiters)
+        self.column_contract_report_ = (
+            consistency_detector.column_contract_report_
+        )
+        return result
 
     def has_header(self, sample: str, max_rows_to_check: int = 20) -> bool:
         """Detect if a file has a header from a sample.

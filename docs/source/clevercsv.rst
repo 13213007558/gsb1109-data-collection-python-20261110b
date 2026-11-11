@@ -28,6 +28,14 @@ clevercsv.consistency module
    :show-inheritance:
    :undoc-members:
 
+clevercsv.column\_contract module
+---------------------------------
+
+.. automodule:: clevercsv.column_contract
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 clevercsv.cparser\_util module
 ------------------------------
 
