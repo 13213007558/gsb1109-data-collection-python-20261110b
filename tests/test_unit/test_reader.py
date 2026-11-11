@@ -176,6 +176,23 @@ class ReaderTestCase(unittest.TestCase):
             quotechar='"',
         )
 
+    def test_read_return_quoted(self) -> None:
+        reader = clevercsv.reader(
+            ['a,"",c', "1,2,", 'x,"line1\nline2",z'], return_quoted=True
+        )
+        result = list(reader)
+        expect = [
+            [("a", False), ("", True), ("c", False)],
+            [("1", False), ("2", False), ("", False)],
+            [("x", False), ("line1\nline2", True), ("z", False)],
+        ]
+        self.assertEqual(result, expect)
+
+    def test_read_return_quoted_default_off(self) -> None:
+        reader = clevercsv.reader(['a,"",c', "1,2,"])
+        result = list(reader)
+        self.assertEqual(result, [["a", "", "c"], ["1", "2", ""]])
+
     def test_github_issue_130(self) -> None:
         # fmt: off
         data = """sku,features,attributes

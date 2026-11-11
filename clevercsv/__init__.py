@@ -23,6 +23,7 @@ from .wrappers import read_table
 from .wrappers import stream_dicts
 from .wrappers import stream_table
 from .wrappers import write_table
+from .write import quoted_writer
 from .write import writer
 
 __all__ = [
@@ -48,5 +49,6 @@ __all__ = [
     "stream_dicts",
     "stream_table",
     "write_table",
+    "quoted_writer",
     "writer",
 ]

@@ -114,5 +114,51 @@ class WriterTestCase(unittest.TestCase):
         )
 
 
+class QuotedWriterTestCase(unittest.TestCase):
+    def _write_rows_test(
+        self, rows: Iterable[Iterable[Any]], expect: str, **kwargs: Any
+    ) -> None:
+        kwargs.setdefault("lineterminator", "\n")
+        with tempfile.TemporaryFile("w+", newline="", prefix="ccsv_") as fp:
+            writer = clevercsv.quoted_writer(fp, **kwargs)
+            writer.writerows(rows)
+            fp.seek(0)
+            self.assertEqual(fp.read(), expect)
+
+    def test_quoted_writer_empty_fields(self) -> None:
+        # intentionally empty quoted field vs. unquoted empty field
+        self._write_rows_test([[("", True), ("", False)]], '"",\n')
+        self._write_rows_test(
+            [[("1", False), ("", True), ("", False)]], '1,"",\n'
+        )
+
+    def test_quoted_writer_quoted_newline(self) -> None:
+        self._write_rows_test(
+            [[("x", False), ("line1\nline2", True), ("z", False)]],
+            'x,"line1\nline2",z\n',
+        )
+
+    def test_quoted_writer_plain_values(self) -> None:
+        self._write_rows_test([["a", 1, "p,q"]], 'a,1,"p,q"\n')
+        self._write_rows_test([[None, ""]], ",\n")
+
+    def test_quoted_writer_round_trip(self) -> None:
+        data = (
+            "sku,features,attributes\n"
+            '22221,"","11,room"\n'
+            '33331,"line1\nline2",\n'
+        )
+        with tempfile.TemporaryFile("r+", newline="", prefix="ccsv_") as fp:
+            fp.write(data)
+            fp.seek(0)
+            rows = list(clevercsv.reader(fp, return_quoted=True))
+            out = tempfile.TemporaryFile("w+", newline="", prefix="ccsv_")
+            writer = clevercsv.quoted_writer(out, lineterminator="\n")
+            writer.writerows(rows)
+            out.seek(0)
+            self.assertEqual(out.read(), data)
+            out.close()
+
+
 if __name__ == "__main__":
     unittest.main()

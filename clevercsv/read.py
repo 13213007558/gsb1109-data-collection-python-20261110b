@@ -12,9 +12,10 @@ import csv
 
 from typing import Any
 from typing import Iterable
-from typing import Iterator
 from typing import List
 from typing import Optional
+from typing import Tuple
+from typing import Union
 
 from . import field_size_limit
 from ._types import _DialectLike
@@ -29,10 +30,35 @@ class reader:
         self,
         csvfile: Iterable[str],
         dialect: _DialectLike = "excel",
+        return_quoted: bool = False,
         **fmtparams: Any,
     ):
+        """Create a reader for the given CSV file
+
+        Parameters
+        ----------
+        csvfile : iterable
+            The CSV file as an iterable of strings.
+
+        dialect : _DialectLike
+            The dialect to use for parsing.
+
+        return_quoted : bool
+            If True, return each cell as a tuple ``(value, is_quoted)`` where
+            the second element indicates whether the cell was quoted in the
+            input. This preserves the field provenance, so that an
+            intentionally empty quoted cell (``""``) can be distinguished
+            from an unquoted empty cell (i.e. nothing between two
+            delimiters). If False (the default), rows are returned as lists
+            of strings.
+
+        fmtparams : dict
+            Formatting parameters that override those of the dialect.
+
+        """
         self.csvfile = csvfile
         self.original_dialect = dialect
+        self.return_quoted = return_quoted
         self._dialect = self._make_simple_dialect(dialect, **fmtparams)
         self.line_num: int = 0
         self.parser_gen: Optional[Parser] = None
@@ -58,7 +84,7 @@ class reader:
         sd.validate()
         return sd
 
-    def __iter__(self) -> Iterator[List[str]]:
+    def __iter__(self) -> "reader":
         self.parser_gen = Parser(
             self.csvfile,
             delimiter=self._dialect.delimiter,
@@ -66,10 +92,11 @@ class reader:
             escapechar=self._dialect.escapechar,
             field_limit=field_size_limit(),
             strict=self._dialect.strict,
+            return_quoted=self.return_quoted,
         )
         return self
 
-    def __next__(self) -> List[str]:
+    def __next__(self) -> Union[List[str], List[Tuple[str, bool]]]:
         if self.parser_gen is None:
             self.__iter__()
         assert self.parser_gen is not None
