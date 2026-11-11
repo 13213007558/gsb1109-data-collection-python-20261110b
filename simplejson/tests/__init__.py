@@ -38,11 +38,13 @@ def additional_tests(suite=None, project_dir=None):
     import simplejson
     import simplejson.encoder
     import simplejson.decoder
+    import simplejson.canonical
 
     if suite is None:
         suite = unittest.TestSuite()
     import doctest
-    for mod in (simplejson, simplejson.encoder, simplejson.decoder):
+    for mod in (simplejson, simplejson.encoder, simplejson.decoder,
+                simplejson.canonical):
         suite.addTest(doctest.DocTestSuite(mod))
     if project_dir is not None:
         suite.addTest(

@@ -458,6 +458,82 @@ Basic Usage
     as it is rare to parse non-compliant JSON containing these values.
 
 
+Canonical JSON output
+---------------------
+
+.. function:: dumps_canonical(obj)
+
+    Serialize *obj* to a canonical JSON :class:`str` with a fixed,
+    fully specified format. Equivalent inputs always produce
+    byte-identical output, so two machines can independently compute
+    the same digest of the same record. The output does not depend on
+    dict insertion order, on whether the optional C speedups extension
+    is active, or on the host platform. Unlike :func:`dumps`, there
+    are no options to choose.
+
+    .. versionadded:: 4.3.0
+
+    Only the following values are supported; anything else raises
+    :exc:`TypeError`:
+
+    * ``None``, ``True``, ``False``
+    * :class:`int` (any size)
+    * :class:`float`, finite only
+    * :class:`decimal.Decimal`, finite only
+    * :class:`str`
+    * :class:`list` and :class:`tuple` (including subclasses, encoded
+      as JSON arrays)
+    * :class:`dict` with :class:`str` keys
+
+    Out-of-range floats (``nan``, ``inf``, ``-inf``) and non-finite
+    Decimals raise :exc:`ValueError`.
+
+    The canonical form is defined as follows:
+
+    * Objects are written as ``{"key":value,...}`` with members sorted
+      by key in Unicode code point order. Keys must be strings.
+    * Arrays are written as ``[value,...]``.
+    * No whitespace appears anywhere in the output.
+    * Strings are ASCII-only: ``"``, ``\`` and control characters use
+      the short escapes ``\"``, ``\\``, ``\b``, ``\f``, ``\n``,
+      ``\r``, ``\t`` where defined and ``\uXXXX`` (lowercase hex)
+      otherwise; every non-ASCII character is escaped as ``\uXXXX``,
+      with characters outside the Basic Multilingual Plane written as
+      a surrogate pair.
+    * Integers are written in decimal with no leading zeros.
+    * Floats are written exactly as ``repr(float)``: the shortest
+      string that round-trips. Integral floats keep a trailing
+      ``.0`` (``1.0``); negative zero is written ``-0.0``; magnitudes
+      that need an exponent use a lowercase ``e`` with an explicit
+      sign and no leading zeros in the exponent (``1e+16``,
+      ``1e-05``).
+    * Decimals are written in positional notation with no exponent and
+      no trailing zeros: the coefficient's trailing zeros are stripped
+      and an exponent input form is expanded, so numerically equal
+      values always produce the same output (``Decimal('1.50')``,
+      ``Decimal('1.5')`` and ``Decimal('15E-1')`` all serialize as
+      ``1.5``). Zero is written ``0`` and negative zero ``-0``.
+
+    ::
+
+        >>> import simplejson as json
+        >>> json.dumps_canonical({'b': 1.0, 'a': 2})
+        '{"a":2,"b":1.0}'
+        >>> json.dumps_canonical({'b': 1, 'a': 2}) == json.dumps_canonical({'a': 2, 'b': 1})
+        True
+        >>> from decimal import Decimal
+        >>> json.dumps_canonical([Decimal('1.50'), Decimal('1E+2'), -0.0, 1e-5])
+        '[1.5,100,-0.0,1e-05]'
+
+.. function:: dump_canonical(obj, fp)
+
+    Serialize *obj* as a canonical JSON stream to *fp* (a
+    ``.write()``-supporting file-like object). The output is identical
+    to :func:`dumps_canonical`.
+
+    .. versionadded:: 4.3.0
+
+
 Encoders and decoders
 ---------------------
 

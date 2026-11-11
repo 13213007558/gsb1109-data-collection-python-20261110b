@@ -34,6 +34,13 @@ Compact encoding::
     >>> json.dumps(obj, separators=(',',':'), sort_keys=True)
     '[1,2,3,{"4":5,"6":7}]'
 
+Canonical encoding (fixed format, byte-identical across machines,
+see :mod:`simplejson.canonical` for the specification)::
+
+    >>> import simplejson as json
+    >>> json.dumps_canonical({'b': 1.0, 'a': 2})
+    '{"a":2,"b":1.0}'
+
 Pretty printing::
 
     >>> import simplejson as json
@@ -121,6 +128,7 @@ from __future__ import absolute_import
 __version__ = '4.2.0'
 __all__ = [
     'dump', 'dumps', 'load', 'loads',
+    'dump_canonical', 'dumps_canonical',
     'JSONDecoder', 'JSONDecodeError', 'JSONEncoder',
     'OrderedDict', 'simple_first', 'RawJSON'
 ]
@@ -133,6 +141,7 @@ from .errors import JSONDecodeError
 from .raw_json import RawJSON
 from .decoder import JSONDecoder
 from .encoder import JSONEncoder, JSONEncoderForHTML
+from .canonical import dumps as dumps_canonical, dump as dump_canonical
 
 def _import_OrderedDict():
     import collections

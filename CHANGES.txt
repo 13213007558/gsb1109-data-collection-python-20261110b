@@ -1,3 +1,16 @@
+Version 4.3.0 (unreleased)
+
+* Add ``dumps_canonical`` and ``dump_canonical`` (also available as
+  ``simplejson.canonical.dumps``/``dump``), a canonical JSON output
+  entry point with a fixed, fully specified format: sorted string
+  keys, no whitespace, ASCII-only strings, ``repr(float)`` number
+  formatting, and normalized positional Decimals. Equivalent inputs
+  produce byte-identical output regardless of dict insertion order
+  and of whether the C speedups extension is active, so two machines
+  can independently compute the same digest of the same record.
+  Values outside the documented domain raise ``TypeError`` or
+  ``ValueError``. The regular ``dumps`` is unchanged.
+
 Version 4.2.0 released 2026-10-02
 
 * Start building wheels for Python 3.15 and drop Python 3.8 support
