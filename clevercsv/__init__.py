@@ -24,6 +24,7 @@ from .wrappers import stream_dicts
 from .wrappers import stream_table
 from .wrappers import write_table
 from .write import writer
+from .compat import csv_compat_report
 
 __all__ = [
     "QUOTE_ALL",
@@ -31,6 +32,7 @@ __all__ = [
     "QUOTE_NONE",
     "QUOTE_NONNUMERIC",
     "__version__",
+    "csv_compat_report",
     "field_size_limit",
     "Detector",
     "Sniffer",
