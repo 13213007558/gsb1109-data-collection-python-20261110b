@@ -2,6 +2,16 @@
 
 ## Development
 
+* Added cancellable asynchronous iterables
+  (`basic_parse_cancellable_async`, `parse_cancellable_async`,
+  `items_cancellable_async` and `kvitems_cancellable_async`, plus the
+  `ijson.asyncio` module) for streams whose individual reads are subject to
+  timeouts. Cancelling a `next()` coroutine between records or while a record
+  is half built leaves the reader in a consistent state from which parsing
+  resumes without re-emitting records already returned; if a cancellation
+  interrupts the underlying `read()` and byte consumption cannot be
+  determined, the reader raises `UnrecoverableStreamError` on further use
+  unless `recoverable_reads=True` is given.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

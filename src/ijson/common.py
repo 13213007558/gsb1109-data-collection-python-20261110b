@@ -519,5 +519,10 @@ def enrich_backend(backend, **capabilities_overrides):
         if async_name not in backend:
             factory = getattr(utils35, '_make_' + async_name)
             backend[async_name] = factory(backend)
+        cancellable_async_name = name + '_cancellable_async'
+        if cancellable_async_name not in backend:
+            from ijson import asyncio as ijson_asyncio
+            factory = getattr(ijson_asyncio, '_make_' + cancellable_async_name)
+            backend[cancellable_async_name] = factory(backend)
         factory = globals()['_make_' + name]
         backend[name] = factory(backend)

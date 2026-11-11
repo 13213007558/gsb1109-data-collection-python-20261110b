@@ -255,6 +255,57 @@ In fact in ijson version 3.0
 this was the only way to access
 the ``asyncio`` support.
 
+Resumable reads with timeouts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some services (e.g. a crawler) put a time limit on each individual
+read while still reusing the same response stream on the next attempt.
+For that scenario ijson provides the
+``basic_parse_cancellable_async``, ``parse_cancellable_async``,
+``items_cancellable_async`` and ``kvitems_cancellable_async`` functions.
+They accept the same arguments as their ``*_async`` counterparts and return
+an object that supports the usual ``async for`` iteration, but whose
+``next()`` coroutine can safely be cancelled (for example with
+``asyncio.wait_for`` and a timeout):
+
+.. code-block:: python
+
+   reader = ijson.items_cancellable_async(f, 'item')
+   while True:
+       try:
+           item = await asyncio.wait_for(reader.next(), timeout=5)
+       except StopAsyncIteration:
+           break
+       except asyncio.TimeoutError:
+           # the attempt timed out; retry with the same stream
+           continue
+       except ijson.asyncio.UnrecoverableStreamError:
+           # the timeout hit read() itself and the stream is now unsafe:
+           # reopen the connection and start a new reader
+           break
+
+The guarantees are:
+
+* records already returned are never produced again;
+* if the cancellation happens between two records,
+  parsing resumes with the next record on the following ``next()``;
+* if it happens while a record is only half built,
+  the partial record is kept and finished on subsequent calls,
+  so no already-read content is lost.
+
+If a cancellation interrupts the underlying ``read()`` itself,
+it might be impossible to tell whether the stream consumed bytes
+before the cancellation took effect.
+By default the reader then marks itself as unrecoverable:
+the cancellation is raised to the caller as usual,
+and later uses raise ``ijson.asyncio.UnrecoverableStreamError``
+instead of silently returning records built from the wrong
+byte offset. If your reader guarantees that a cancelled ``read()``
+consumes nothing (like ``asyncio.StreamReader`` does),
+pass ``recoverable_reads=True`` to keep using the reader normally.
+Use ``aclose()`` to release the internal parsing state
+of a reader that is abandoned before reaching EOF.
+
 
 Intercepting events
 -------------------
