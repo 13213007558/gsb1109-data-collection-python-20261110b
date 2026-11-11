@@ -49,6 +49,16 @@ class SelectorSyntaxError(SelectorError, SyntaxError):
     """Parsing a selector that does not match the grammar."""
 
 
+class NamespaceConfigError(SelectorError):
+    """A selector uses a namespace prefix that no translation mapping defines.
+
+    Raised when a translator is given a ``namespaces`` mapping and the
+    selector references a prefix that is not in it, so that the generated
+    XPath expression can be evaluated without any namespace prefix table.
+
+    """
+
+
 #### Parsed objects
 
 Tree: TypeAlias = Union[

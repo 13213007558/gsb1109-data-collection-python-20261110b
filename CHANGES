@@ -1,6 +1,24 @@
 Changelog
 =========
 
+Version 1.7.0
+-------------
+
+Unreleased.
+
+*   Added an optional ``namespaces`` argument to ``GenericTranslator`` and
+    ``HTMLTranslator``. It maps the namespace prefixes used in CSS selectors
+    to namespace URIs; those URIs are inlined into the generated XPath, so
+    the expression can be evaluated without passing a namespace prefix
+    mapping to the XPath engine. This makes one alias match documents that
+    bind different prefixes to the same URI, while elements and attributes
+    with another URI or no namespace stay distinct, and unprefixed
+    attributes never inherit an element's default namespace.
+
+*   Added ``NamespaceConfigError``. It is raised when a translator with a
+    ``namespaces`` mapping meets a selector prefix that the mapping does
+    not define, and is a subclass of ``SelectorError``.
+
 Version 1.6.0
 -------------
 

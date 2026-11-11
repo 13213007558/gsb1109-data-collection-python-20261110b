@@ -181,4 +181,37 @@ XPath implementation.
 namespace. The same rules apply to attribute names, e.g.
 ``[*|attrib]`` and ``[|attrib]``.
 
+Resolving prefixes while translating
+------------------------------------
+
+By default a CSS prefix is kept verbatim as the XPath prefix, so the
+XPath engine that evaluates the expression has to map it to a URI. That
+is inconvenient when the same expression is handed to several workers
+that do not share a namespace prefix table, or when different suppliers
+write different prefixes for the same namespace.
+
+Passing a ``namespaces`` mapping to a translator resolves the CSS
+prefixes to URIs while translating and inlines the URIs in the
+expression, which then needs no prefix mapping when it is evaluated::
+
+    translator = GenericTranslator(namespaces={"part": "https://example.test/part"})
+    translator.css_to_xpath("part|item")
+    # descendant-or-self::*[local-name() = 'item' and
+    #   namespace-uri() = 'https://example.test/part']
+
+With this option:
+
+- A prefix resolves through the mapping regardless of how a document
+  spells it: ``p|item`` in one feed and ``m|item`` in another match when
+  both prefixes are bound to the URI configured for the alias.
+- The same local name in another namespace URI stays a different
+  element, and a URI mapped to the empty string means "no namespace".
+- Unprefixed attributes keep an unprefixed node test: they never inherit
+  the default namespace of their element.
+- ``*|element``, ``|element`` and bare ``element`` keep their usual
+  meaning and ignore the mapping.
+- A selector prefix that the mapping does not define raises
+  :class:`~cssselect.NamespaceConfigError`, a subclass of
+  :class:`~cssselect.SelectorError`.
+
 .. include:: ../CHANGES

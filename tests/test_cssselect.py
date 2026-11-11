@@ -29,6 +29,8 @@ from cssselect import (
     ExpressionError,
     GenericTranslator,
     HTMLTranslator,
+    NamespaceConfigError,
+    SelectorError,
     SelectorSyntaxError,
     parse,
 )
@@ -1074,6 +1076,105 @@ class TestCssselect(unittest.TestCase):
         with pytest.raises(TypeError):
             GenericTranslator().selector_to_xpath("foo")  # type: ignore[arg-type]
 
+    def test_translation_with_namespace_mapping(self) -> None:
+        # A namespaces mapping inlines the resolved URIs into the XPath, so
+        # the expression needs no namespace prefix table at evaluation time.
+        translator = GenericTranslator(namespaces={"ns": "urn:x", "empty": ""})
+
+        def xpath(css: str) -> str:
+            return str(translator.css_to_xpath(css, prefix=""))
+
+        # Prefixes become local-name/namespace-uri comparisons, not prefixes.
+        assert xpath("ns|f") == ("*[local-name() = 'f' and namespace-uri() = 'urn:x']")
+        assert xpath("ns|*") == "*[namespace-uri() = 'urn:x']"
+        # An empty URI is an explicit "no namespace".
+        assert xpath("empty|f") == ("*[local-name() = 'f' and namespace-uri() = '']")
+        assert xpath("empty|*") == "*[namespace-uri() = '']"
+        # The wildcard and the no-namespace syntax ignore the mapping.
+        assert xpath("*|f") == "*[local-name() = 'f']"
+        assert xpath("|f") == "f"
+        assert xpath("f") == "f"
+
+        # The same local name in another URI stays a different element.
+        assert xpath("f > ns|g") == (
+            "f/*[local-name() = 'g' and namespace-uri() = 'urn:x']"
+        )
+        assert xpath("ns|f ns|g") == (
+            "*[local-name() = 'f' and namespace-uri() = 'urn:x']"
+            "/descendant::*[local-name() = 'g' and namespace-uri() = 'urn:x']"
+        )
+        assert xpath("x + ns|f") == (
+            "x/following-sibling::*[(local-name() = 'f' and "
+            "namespace-uri() = 'urn:x') and (position() = 1)]"
+        )
+
+        # -of-type pseudo-classes compare the expanded name (URI + local).
+        assert xpath("ns|f:first-of-type") == (
+            "*[(local-name() = 'f' and namespace-uri() = 'urn:x') and "
+            "(not(preceding-sibling::*[local-name() = 'f' and "
+            "namespace-uri() = 'urn:x'][1]))]"
+        )
+        assert xpath("ns|f:nth-of-type(2)") == (
+            "*[(local-name() = 'f' and namespace-uri() = 'urn:x') and "
+            "(preceding-sibling::*[local-name() = 'f' and "
+            "namespace-uri() = 'urn:x'][1] and "
+            "not(preceding-sibling::*[local-name() = 'f' and "
+            "namespace-uri() = 'urn:x'][2]))]"
+        )
+        assert xpath("ns|f:only-of-type") == (
+            "*[(local-name() = 'f' and namespace-uri() = 'urn:x') and "
+            "(not(preceding-sibling::*[local-name() = 'f' and "
+            "namespace-uri() = 'urn:x'][1]) and "
+            "not(following-sibling::*[local-name() = 'f' and "
+            "namespace-uri() = 'urn:x'][1]))]"
+        )
+
+        # Predicate positions inline the URI as well.
+        assert xpath("e:is(ns|f)") == (
+            "e[local-name() = 'f' and namespace-uri() = 'urn:x']"
+        )
+        assert xpath("*:not(ns|f)") == (
+            "*[not(local-name() = 'f' and namespace-uri() = 'urn:x')]"
+        )
+        assert xpath("ns|f:has(ns|g)") == (
+            "*[(local-name() = 'f' and namespace-uri() = 'urn:x') and "
+            "(descendant::*[local-name() = 'g' and "
+            "namespace-uri() = 'urn:x'])]"
+        )
+
+        # Prefixed attributes are inlined; unprefixed ones keep an unprefixed
+        # node test and therefore never inherit a default namespace.
+        assert xpath("e[ns|h]") == (
+            "e[attribute::*[local-name() = 'h' and namespace-uri() = 'urn:x']]"
+        )
+        assert xpath("e[empty|h]") == (
+            "e[attribute::*[local-name() = 'h' and namespace-uri() = '']]"
+        )
+        assert xpath('e[ns|h="v"]') == (
+            "e[attribute::*[local-name() = 'h' and namespace-uri() = 'urn:x'] = 'v']"
+        )
+        assert xpath("e[h]") == "e[@h]"
+        assert xpath("e[*|h]") == "e[attribute::*[local-name() = 'h']]"
+
+        # Namespace wildcards still reject -of-type pseudo-classes.
+        with pytest.raises(ExpressionError):
+            xpath("ns|*:first-of-type")
+
+    def test_namespace_config_error(self) -> None:
+        translator = GenericTranslator(namespaces={"ns": "urn:x"})
+        # A prefix absent from the mapping is a configuration error, raised
+        # wherever the prefix appears in the selector. It is a SelectorError,
+        # like the other translation failures.
+        assert issubclass(NamespaceConfigError, SelectorError)
+        for css in (
+            "unknown|f",
+            "ns|f[unknown|h]",
+            "e:is(unknown|f)",
+            "e:has(unknown|f)",
+        ):
+            with self.subTest(css=css), pytest.raises(NamespaceConfigError):
+                translator.css_to_xpath(css)
+
     def test_translation_customization_api(self) -> None:
         # XPathExpr.add_star_prefix() constrains the context to a single
         # parent; it is part of the customization API rather than used by
@@ -1995,6 +2096,91 @@ class TestCssselect(unittest.TestCase):
         # ... and since "f" does not match the default-namespaced <f>,
         # :not(f) must not exclude it.
         assert pcss("*:not(f)") == ["nil", "x", "dns-f"]
+
+    def test_select_with_inlined_namespaces(self) -> None:
+        # Two suppliers bind different prefixes ("p" and "m") to the same
+        # namespace URI. The collector configures a single alias ("c") for
+        # that URI; the resulting XPath must run unchanged on both documents
+        # with *no* namespace prefix table handed to the XPath engine.
+        documents = {
+            "A": etree.XML(
+                '<root xmlns:p="urn:parts" xmlns:o="urn:other" '
+                'xmlns="urn:default">'
+                '<p:part id="A1" plain="x"/>'
+                '<o:part id="A2"/>'
+                '<part xmlns="" id="A3"/>'
+                '<p:bolt id="A4"/>'
+                "</root>"
+            ),
+            "B": etree.XML(
+                '<root xmlns:m="urn:parts" xmlns:o="urn:other" '
+                'xmlns="urn:default">'
+                '<m:part id="B1" plain="y"/>'
+                '<o:part id="B2"/>'
+                '<part xmlns="" id="B3"/>'
+                '<m:bolt id="B4"/>'
+                "</root>"
+            ),
+        }
+        translator = GenericTranslator(namespaces={"c": "urn:parts"})
+
+        def pcss(css: str) -> dict[str, list[str]]:
+            xpath = translator.css_to_xpath(css)
+            return {
+                label: [
+                    element.get("id", "nil")
+                    for element in typing.cast(
+                        "list[etree._Element]", document.xpath(xpath)
+                    )
+                ]
+                for label, document in documents.items()
+            }
+
+        # The alias resolves to the URI regardless of the document prefix.
+        assert pcss("c|part") == {"A": ["A1"], "B": ["B1"]}
+        assert pcss("c|bolt") == {"A": ["A4"], "B": ["B4"]}
+        # Same local name, another URI: not confused with the alias.
+        assert pcss("*|part") == {
+            "A": ["A1", "A2", "A3"],
+            "B": ["B1", "B2", "B3"],
+        }
+        # Bare and "|" selectors only see no-namespace elements. The
+        # default-namespaced <root> does not make "part" match the prefixed
+        # elements.
+        assert pcss("part") == {"A": ["A3"], "B": ["B3"]}
+        assert pcss("|part") == {"A": ["A3"], "B": ["B3"]}
+
+        # Prefixed attributes resolve through the URI; an unprefixed
+        # attribute never inherits the element's default namespace.
+        attr_doc = etree.XML(
+            '<r xmlns="urn:default" xmlns:p="urn:parts">'
+            '<p:part id="p1" title="no-ns" p:title="in-ns"/></r>'
+        )
+
+        def attr_ids(css: str, translator: GenericTranslator) -> list[str]:
+            xpath = translator.css_to_xpath(css) + "/@id"
+            return typing.cast("list[str]", attr_doc.xpath(xpath))
+
+        # The namespaced attribute (p:title) is matched by c|title only.
+        assert attr_ids("c|part[c|title]", translator) == ["p1"]
+        # The unprefixed "title" attribute is matched by an unprefixed
+        # selector, never by the element's default namespace.
+        assert attr_ids("c|part[title]", translator) == ["p1"]
+        # An alias mapped to the empty URI explicitly means "no namespace".
+        no_ns = GenericTranslator(namespaces={"c": ""})
+        assert attr_ids("c|part[c|title]", no_ns) == []
+        assert attr_ids("*[c|title]", no_ns) == ["p1"]
+
+        # -of-type counts same expanded-name siblings across both documents.
+        typed = etree.XML(
+            '<r xmlns:p="urn:parts">'
+            '<p:part id="1"/><p:part id="2"/><p:other id="3"/></r>'
+        )
+        typed_xpath = translator.css_to_xpath("c|part:last-of-type")
+        assert [
+            element.get("id")
+            for element in typing.cast("list[etree._Element]", typed.xpath(typed_xpath))
+        ] == ["2"]
 
     def test_select_shakespeare(self) -> None:
         document = html.document_fromstring(HTML_SHAKESPEARE)

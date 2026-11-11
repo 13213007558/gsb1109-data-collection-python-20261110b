@@ -25,6 +25,7 @@ from cssselect.parser import (
     Function,
     Hash,
     Matching,
+    NamespaceConfigError,
     Negation,
     Pseudo,
     PseudoElement,
@@ -39,7 +40,7 @@ from cssselect.parser import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
 
 
 class ExpressionError(SelectorError, RuntimeError):
@@ -56,10 +57,18 @@ class XPathExpr:
         element: str = "*",
         condition: str = "",
         star_prefix: bool = False,
+        namespace_uri: str | None = None,
+        local_element: str | None = None,
     ) -> None:
         self.path = path
         self.element = element
         self.condition = condition
+        # The resolved namespace URI of a prefixed type selector, and its
+        # local name, when the translator inlines URIs instead of keeping
+        # XPath prefixes. Needed by the -of-type pseudo-classes, which count
+        # same-type siblings. local_element is None for namespace wildcards.
+        self.namespace_uri = namespace_uri
+        self.local_element = local_element
 
     def __str__(self) -> str:
         path = str(self.path) + str(self.element)
@@ -96,6 +105,41 @@ class XPathExpr:
             )
         self.element = "*"
 
+    def has_safe_node_test(self) -> bool:
+        """Whether :attr:`element` is usable directly as an XPath node test."""
+        prefix, colon, local = self.element.partition(":")
+        return bool(
+            is_safe_name(prefix) and (not colon or local == "*" or is_safe_name(local))
+        )
+
+    def node_axis_test(self, axis: str) -> str:
+        """A node test on *axis* (e.g. ``"preceding-sibling"``).
+
+        A literal ``name()`` comparison cannot be expressed as a node test
+        on an explicit axis: it becomes a wildcard step with a predicate.
+        """
+        if self.has_safe_node_test():
+            return f"{axis}::{self.element}"
+        return f"{axis}::*[name() = {GenericTranslator.xpath_literal(self.element)}]"
+
+    def of_type_axis_test(self, axis: str) -> str:
+        """A same-type node test on *axis* for the current element.
+
+        When the namespace URI is inlined, same-type matching compares the
+        expanded element name (namespace URI and local name) rather than the
+        qualified name as written in the document, and needs no XPath prefix
+        mapping. Otherwise the plain node test (which the XPath engine
+        resolves through its prefix mapping) is used.
+        """
+        if self.namespace_uri is not None and self.local_element is not None:
+            return (
+                f"{axis}::*[local-name() = "
+                f"{GenericTranslator.xpath_literal(self.local_element)} "
+                f"and namespace-uri() = "
+                f"{GenericTranslator.xpath_literal(self.namespace_uri)}]"
+            )
+        return self.node_axis_test(axis)
+
     def add_star_prefix(self) -> None:
         """
         Append '*/' to the path to keep the context constrained
@@ -111,6 +155,8 @@ class XPathExpr:
         self.path = path
         self.element = other.element
         self.condition = other.condition
+        self.namespace_uri = other.namespace_uri
+        self.local_element = other.local_element
         return self
 
 
@@ -211,6 +257,31 @@ class GenericTranslator:
     # class used to represent and xpath expression
     xpathexpr_cls = XPathExpr
 
+    def __init__(self, namespaces: Mapping[str, str] | None = None) -> None:
+        """
+        :param namespaces:
+            Maps the namespace prefixes used in CSS selectors to namespace
+            URIs. When given, prefixes are resolved to their URIs while
+            translating, so the resulting XPath is self-contained and can be
+            evaluated without passing a namespace prefix mapping. A selector
+            prefix absent from this mapping raises
+            :class:`~cssselect.NamespaceConfigError`. When ``None`` (the
+            default), CSS prefixes are kept verbatim as XPath prefixes and
+            the evaluating XPath engine must map them to URIs itself.
+        """
+        self.namespaces = dict(namespaces) if namespaces is not None else None
+
+    def _namespace_uri(self, prefix: str) -> str:
+        """Return the URI of a CSS namespace *prefix* used in a selector."""
+        if self.namespaces is None:
+            return ""
+        try:
+            return self.namespaces[prefix]
+        except KeyError:
+            raise NamespaceConfigError(
+                f"Undefined namespace prefix {prefix!r} in selector"
+            ) from None
+
     def css_to_xpath(self, css: str, prefix: str = "descendant-or-self::") -> str:
         """Translate a *group of selectors* to XPath.
 
@@ -225,7 +296,9 @@ class GenericTranslator:
         :raises:
             :class:`~cssselect.SelectorSyntaxError` on invalid selectors,
             :class:`ExpressionError` on unknown/unsupported selectors,
-            including pseudo-elements.
+            including pseudo-elements,
+            :class:`~cssselect.NamespaceConfigError` when a selector prefix
+            is not in the translator's ``namespaces`` mapping.
         :returns:
             The equivalent XPath 1.0 expression as a string.
 
@@ -438,6 +511,23 @@ class GenericTranslator:
             # none. XPath 1.0 has no "*:name" name test for this, so match
             # by local name instead.
             attrib = f"attribute::*[local-name() = {self.xpath_literal(name)}]"
+        elif selector.namespace and self.namespaces is not None:
+            # Resolve the CSS prefix to its URI and inline it, so the
+            # expression is independent of any XPath prefix mapping. Only
+            # prefixed attributes get a namespace: an unprefixed attribute
+            # never inherits the element's default namespace.
+            uri = self._namespace_uri(selector.namespace)
+            uri_literal = self.xpath_literal(uri)
+            name_literal = self.xpath_literal(name)
+            if not uri:
+                # An explicit mapping to the empty URI means "no namespace":
+                # an unprefixed-style node test matches exactly that.
+                attrib = f"attribute::*[local-name() = {name_literal} and namespace-uri() = '']"
+            else:
+                attrib = (
+                    "attribute::*[local-name() = "
+                    f"{name_literal} and namespace-uri() = {uri_literal}]"
+                )
         else:
             safe = is_safe_name(name)
             if selector.namespace:
@@ -504,6 +594,29 @@ class GenericTranslator:
                 xpath = self.xpathexpr_cls(element="*")
                 xpath.add_condition(f"local-name() = {self.xpath_literal(element)}")
                 return xpath
+        if (
+            selector.namespace
+            and selector.namespace != "*"
+            and self.namespaces is not None
+        ):
+            # Resolve the caller's alias to its URI and inline it, so the
+            # generated XPath carries no dependency on an XPath prefix
+            # mapping. The same local name in another namespace URI is a
+            # different element, and an empty URI means no namespace.
+            uri = self._namespace_uri(selector.namespace)
+            xpath = self.xpathexpr_cls(
+                element="*",
+                namespace_uri=uri,
+                local_element=None if element == "*" else element,
+            )
+            if element == "*":
+                xpath.add_condition(f"namespace-uri() = {self.xpath_literal(uri)}")
+            else:
+                xpath.add_condition(
+                    f"local-name() = {self.xpath_literal(element)} "
+                    f"and namespace-uri() = {self.xpath_literal(uri)}"
+                )
+            return xpath
         if selector.namespace and selector.namespace != "*":
             # Namespace prefixes are case-sensitive.
             # http://www.w3.org/TR/css3-namespace/#prefixes
@@ -650,14 +763,11 @@ class GenericTranslator:
 
         # `add_name_test` boolean is inverted and somewhat counter-intuitive:
         #
-        # nth_of_type() calls nth_child(add_name_test=False)
-        nodetest = "*" if add_name_test else f"{xpath.element}"
-
-        # siblings before or after the element
-        if not last:
-            siblings = f"preceding-sibling::{nodetest}"
-        else:
-            siblings = f"following-sibling::{nodetest}"
+        # nth_of_type() calls nth_child(add_name_test=False). Same-type
+        # siblings then match a resolved namespace by its inlined URI rather
+        # than through an XPath prefix mapping.
+        axis = "preceding-sibling" if not last else "following-sibling"
+        siblings = f"{axis}::*" if add_name_test else xpath.of_type_axis_test(axis)
         siblings_count = f"count({siblings})"
 
         # count(***-sibling::***) >= k is tested as ***-sibling::***[k],
@@ -731,11 +841,13 @@ class GenericTranslator:
 
         For "*" and namespace wildcards like "ns:*" the type of the element is
         not known, and counting same-type siblings cannot be expressed as an
-        XPath 1.0 node test.
+        XPath 1.0 node test. When URIs are inlined, the wildcard is the
+        universal element test with no known local name.
         """
-        element = xpath.element
-        if element == "*" or element.endswith(":*"):
-            css_element = element.replace(":", "|")
+        if xpath.element.endswith(":*") or (
+            xpath.element == "*" and xpath.local_element is None
+        ):
+            css_element = xpath.element.replace(":", "|")
             raise ExpressionError(f"{css_element}:{pseudo} is not implemented")
 
     def xpath_nth_of_type_function(
@@ -794,11 +906,15 @@ class GenericTranslator:
 
     def xpath_first_of_type_pseudo(self, xpath: XPathExpr) -> XPathExpr:
         self._check_of_type_element(xpath, "first-of-type")
-        return xpath.add_condition(f"not(preceding-sibling::{xpath.element}[1])")
+        return xpath.add_condition(
+            f"not({xpath.of_type_axis_test('preceding-sibling')}[1])"
+        )
 
     def xpath_last_of_type_pseudo(self, xpath: XPathExpr) -> XPathExpr:
         self._check_of_type_element(xpath, "last-of-type")
-        return xpath.add_condition(f"not(following-sibling::{xpath.element}[1])")
+        return xpath.add_condition(
+            f"not({xpath.of_type_axis_test('following-sibling')}[1])"
+        )
 
     def xpath_only_child_pseudo(self, xpath: XPathExpr) -> XPathExpr:
         # Test siblings, not the parent's children: the root element has
@@ -810,8 +926,8 @@ class GenericTranslator:
     def xpath_only_of_type_pseudo(self, xpath: XPathExpr) -> XPathExpr:
         self._check_of_type_element(xpath, "only-of-type")
         return xpath.add_condition(
-            f"not(preceding-sibling::{xpath.element}[1]) "
-            f"and not(following-sibling::{xpath.element}[1])"
+            f"not({xpath.of_type_axis_test('preceding-sibling')}[1]) "
+            f"and not({xpath.of_type_axis_test('following-sibling')}[1])"
         )
 
     def xpath_empty_pseudo(self, xpath: XPathExpr) -> XPathExpr:
@@ -933,12 +1049,20 @@ class HTMLTranslator(GenericTranslator):
     :param xhtml:
         If false (the default), element names and attribute names
         are case-insensitive.
+    :param namespaces:
+        Maps the namespace prefixes used in CSS selectors to namespace
+        URIs. See :class:`GenericTranslator` for details.
 
     """
 
     lang_attribute = "lang"
 
-    def __init__(self, xhtml: bool = False) -> None:
+    def __init__(
+        self,
+        xhtml: bool = False,
+        namespaces: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(namespaces)
         self.xhtml = xhtml  # Might be useful for sub-classes?
         if not xhtml:
             # See their definition in GenericTranslator.
