@@ -193,6 +193,10 @@ class HTMLUnicodeInputStream(object):
         self.chunkOffset = 0
         self.errors = []
 
+        # Absolute character offset of self.chunk[0] within the normalized
+        # source (CR LF and CR normalized to LF), used by sourcePosition()
+        self.globalOffset = 0
+
         # number of (complete) lines in previous chunks
         self.prevNumLines = 0
         # number of columns in the last line of the previous chunk
@@ -231,6 +235,15 @@ class HTMLUnicodeInputStream(object):
         line, col = self._position(self.chunkOffset)
         return (line + 1, col)
 
+    def sourcePosition(self):
+        """Return the absolute character offset of the current position.
+
+        The offset is relative to the start of the normalized stream (with
+        CR and CR LF converted to LF), which is the same character indexing
+        used for the source text when it is parsed as a unicode string.
+        """
+        return self.globalOffset + self.chunkOffset
+
     def char(self):
         """ Read one character from the stream or queue if available. Return
             EOF when EOF is reached.
@@ -251,6 +264,7 @@ class HTMLUnicodeInputStream(object):
             chunkSize = self._defaultChunkSize
 
         self.prevNumLines, self.prevNumCols = self._position(self.chunkSize)
+        self.globalOffset += self.chunkSize
 
         self.chunk = ""
         self.chunkSize = 0
@@ -370,6 +384,7 @@ class HTMLUnicodeInputStream(object):
                 # chunk:
                 self.chunk = char + self.chunk
                 self.chunkSize += 1
+                self.globalOffset -= 1
             else:
                 self.chunkOffset -= 1
                 assert self.chunk[self.chunkOffset] == char

@@ -32,6 +32,13 @@ html5lib Package
     :show-inheritance:
     :special-members: __init__
 
+``sourceattrs`` Module
+----------------------
+
+.. automodule:: html5lib.sourceattrs
+    :members:
+    :show-inheritance:
+
 Subpackages
 -----------
 
