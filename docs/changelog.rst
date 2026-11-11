@@ -4,6 +4,7 @@ Changelog
 All help in providing PRs to close out bug issues is appreciated. Even if that is providing a repo that fully replicates issues. We have very generous contributors that have added these to bug issues which meant another contributor picked up the bug and closed it out.
 
 -  Unreleased
+    - New ``update_strategy`` option. The default ``'replace'`` keeps writing the cassette directly as before. ``'replace_on_success'`` stages every refresh in a unique ``.candidate`` file and atomically replaces the cassette only when the whole scenario finishes without an error, so a crash keeps the previous usable cassette and leaves the failed candidate for debugging. It also guards concurrent refreshes: a process whose cassette changed since it started raises ``CassetteConflictError`` instead of silently overwriting the earlier finisher, and a first recording with no existing cassette is handled explicitly
     - CI: also test with urllib3 1.26, which vcrpy supports but CI didn't test, so #1092 wasn't caught
 
 -  9.4.2

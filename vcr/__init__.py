@@ -4,6 +4,7 @@ from logging import NullHandler
 from .config import VCR
 from .record_mode import RecordMode as mode  # noqa: F401
 from .request import Request  # noqa: F401
+from .update_strategy import UpdateStrategy  # noqa: F401
 
 __version__ = "9.4.2"
 

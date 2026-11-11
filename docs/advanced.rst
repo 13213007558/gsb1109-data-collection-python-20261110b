@@ -170,6 +170,13 @@ methods.  The ``load_cassette`` method must return a deserialized cassette or ra
 either ``CassetteNotFoundError`` if no cassette is found, or ``CassetteDecodeError``
 if the cassette cannot be successfully deserialized.
 
+To support the ``'replace_on_success'`` update strategy, a persister can
+optionally also implement ``save_candidate``, ``commit_candidate`` and
+``version_signature`` (see
+:class:`vcr.persisters.filesystem.FilesystemPersister`). A persister without
+them still works; cassettes using that strategy simply fall back to the
+direct-write ``save_cassette`` behavior.
+
 Once the persister class is defined, register with VCR like so...
 
 .. code:: python
@@ -706,6 +713,55 @@ If you want to save the cassette only when the test succeeds, set the Cassette
 
     # Since there was an exception, the cassette file hasn't been created.
     assert not os.path.exists('fixtures/vcr_cassettes/synopsis.yaml')
+
+Safe cassette refresh
+---------------------
+
+When you re-record a cassette, the default ``update_strategy`` is
+``'replace'``: VCR writes the new recording straight to the cassette path. If
+the scenario raises halfway through, the cassette can be left half-written,
+replacing the previous, still-usable recording.
+
+Set ``update_strategy='replace_on_success'`` for an explicit refresh policy:
+
+- The recording is first written to a unique *candidate* file next to the
+  cassette (a hidden file ending in ``.candidate``). The cassette path is only
+  replaced atomically once the whole scenario finishes without an error.
+- If the scenario fails, the previous cassette stays in place and remains what
+  the next test loads. The failed candidate is kept for debugging, but VCR
+  never reads a candidate back as a cassette.
+- Two refreshes that start from the same old version can't clobber each other.
+  When the later one finishes, it checks that the cassette on disk is still the
+  version it started from; if another process already committed a replacement,
+  it raises :class:`vcr.persisters.filesystem.CassetteConflictError` and keeps
+  its candidate instead of silently overwriting the earlier result.
+- The first recording is a defined case too: with no existing cassette the
+  baseline is "missing", so a successful run creates the cassette while a failed
+  run leaves only a candidate and no cassette at all.
+
+.. code:: python
+
+    import glob
+    import os
+    import vcr
+
+    my_vcr = vcr.VCR(update_strategy="replace_on_success")
+    path = "fixtures/vcr_cassettes/synopsis.yaml"
+
+    try:
+        with my_vcr.use_cassette(path):
+            ...  # your HTTP interactions here
+    except RuntimeError:
+        # The old cassette is untouched. The partial recording is in a hidden
+        # .candidate file next to it, available for inspection.
+        pattern = os.path.join(
+            os.path.dirname(path),
+            "." + os.path.basename(path) + ".*.candidate",
+        )
+        candidates = glob.glob(pattern)
+
+Candidates are specific to the filesystem persister. Custom persisters that
+don't implement the candidate protocol keep the direct-write behavior.
 
 Drop unused requests
 --------------------

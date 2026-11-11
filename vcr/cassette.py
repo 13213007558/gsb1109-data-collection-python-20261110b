@@ -16,9 +16,17 @@ from .patch import CassettePatcherBuilder, validate_skip_patchers
 from .persisters.filesystem import CassetteDecodeError, CassetteNotFoundError, FilesystemPersister
 from .record_mode import RecordMode
 from .serializers import yamlserializer
+from .update_strategy import UpdateStrategy, validate_update_strategy
 from .util import partition_dict
 
 log = logging.getLogger(__name__)
+
+# Baseline signature for persisters that can't report cassette versions.
+# Such persisters never go through the candidate/commit path anyway.
+_BASELINE_UNAVAILABLE = object()
+
+# Methods a persister must implement to support the REPLACE_ON_SUCCESS strategy.
+_CANDIDATE_PROTOCOL = ("save_candidate", "commit_candidate", "version_signature")
 
 
 class CassetteContextDecorator:
@@ -95,17 +103,25 @@ class CassetteContextDecorator:
     def __exit__(self, *exc_info):
         exception_was_raised = any(exc_info)
         record_on_exception = self._args_getter().get("record_on_exception", True)
-        if record_on_exception or not exception_was_raised:
-            self.__cassette._save()
-            self.__cassette = None
-        # Fellow programmer, don't remove this `next`, if `self.__finish` is
-        # not consumed the unpatcher functions accumulated in the `exit_stack`
-        # object created in `_patch_generator` will not be called until
-        # `exit_stack` is not garbage collected.
-        # This works in CPython but not in Pypy, where the unpatchers will not
-        # be called until much later.
-        next(self.__finish, None)
-        self.__finish = None
+        # The candidate strategy always stages the recording so a failed run's
+        # partial recording stays in its candidate for debugging; it only
+        # declines to replace the working cassette. Other strategies keep the
+        # record_on_exception=False behavior of not writing anything at all.
+        try:
+            if record_on_exception or not exception_was_raised or self.__cassette._uses_candidate_updates:
+                # _save can raise CassetteConflictError under the candidate
+                # strategy; unpatching still has to run, hence the finally.
+                self.__cassette._save(exception_was_raised=exception_was_raised)
+                self.__cassette = None
+        finally:
+            # Fellow programmer, don't remove this `next`, if `self.__finish` is
+            # not consumed the unpatcher functions accumulated in the `exit_stack`
+            # object created in `_patch_generator` will not be called until
+            # `exit_stack` is not garbage collected.
+            # This works in CPython but not in Pypy, where the unpatchers will not
+            # be called until much later.
+            next(self.__finish, None)
+            self.__finish = None
 
     @wrapt.decorator
     def __call__(self, function, instance, args, kwargs):
@@ -191,6 +207,7 @@ class Cassette:
         before_save_interaction=None,
         after_load_interaction=None,
         skip_patchers=(),
+        update_strategy=UpdateStrategy.REPLACE,
     ):
         self._persister = persister or FilesystemPersister
         self._path = path
@@ -204,6 +221,7 @@ class Cassette:
         self.custom_patches = custom_patches
         self.allow_playback_repeats = allow_playback_repeats
         self.drop_unused_requests = drop_unused_requests
+        self.update_strategy = validate_update_strategy(update_strategy)
         # Hooks run on each interaction as the cassette is saved and loaded.
         # filter_sensitive_data hides values after the user's save hooks and
         # restores them before the user's load hooks, so those see real values.
@@ -228,6 +246,12 @@ class Cassette:
         self._played_interactions = []
         # Number of entries at the start of self.data that came from the file
         self._loaded_count = 0
+
+        # Candidate-based update strategy (UpdateStrategy.REPLACE_ON_SUCCESS).
+        # _baseline_signature identifies the cassette version this run started
+        # from; _candidate_path is set once a refresh has written its candidate.
+        self._baseline_signature = _BASELINE_UNAVAILABLE
+        self._candidate_path = None
 
     @property
     def path(self):
@@ -254,6 +278,14 @@ class Cassette:
     @property
     def write_protected(self):
         return (self.rewound and self.record_mode == RecordMode.ONCE) or self.record_mode == RecordMode.NONE
+
+    @property
+    def _uses_candidate_updates(self):
+        """Whether saves go through stage-then-commit instead of direct writes."""
+        return (
+            self.update_strategy == UpdateStrategy.REPLACE_ON_SUCCESS
+            and self._baseline_signature is not _BASELINE_UNAVAILABLE
+        )
 
     def append(self, request, response):
         """Add a request, response pair to this cassette"""
@@ -420,27 +452,57 @@ class Cassette:
         ]
         return kept + recorded
 
-    def _save(self, force=False):
+    def _save(self, force=False, exception_was_raised=False):
+        candidate_strategy = self._uses_candidate_updates
         if self.record_mode == RecordMode.ALL:
             if force or self.dirty:
                 interactions = self._rerecorded_interactions()
-                cassete_dict = {
+                cassette_dict = {
                     "requests": [request for request, _ in interactions],
                     "responses": [response for _, response in interactions],
                 }
-                self._persist(cassete_dict)
+                self._write(cassette_dict, candidate_strategy, exception_was_raised)
                 self.dirty = False
             return
         if self.drop_unused_requests and len(self._played_interactions) < len(self._old_interactions):
-            cassete_dict = self._build_used_interactions_dict()
+            cassette_dict = self._build_used_interactions_dict()
             force = True
         else:
-            cassete_dict = self._as_dict()
+            cassette_dict = self._as_dict()
         if force or self.dirty:
-            self._persist(cassete_dict)
+            self._write(cassette_dict, candidate_strategy, exception_was_raised)
             self.dirty = False
 
+    def _write(self, cassette_dict, candidate_strategy, exception_was_raised):
+        if candidate_strategy:
+            # Stage the recording and only replace the cassette when the whole
+            # scenario finished cleanly. On an error the candidate stays for
+            # debugging, while the previous cassette remains the one loaded.
+            self._persist_candidate(cassette_dict, commit=not exception_was_raised)
+        else:
+            self._persist(cassette_dict)
+
+    def _persist_candidate(self, cassette_dict, commit):
+        cassette_dict = self._apply_save_hooks(cassette_dict)
+        self._candidate_path = self._persister.save_candidate(
+            self._path,
+            cassette_dict,
+            serializer=self._serializer,
+        )
+        if commit:
+            # Raises CassetteConflictError if another process committed first;
+            # the candidate is deliberately kept in that case.
+            self._persister.commit_candidate(
+                self._path,
+                self._candidate_path,
+                expected_signature=self._baseline_signature,
+            )
+
     def _persist(self, cassette_dict):
+        cassette_dict = self._apply_save_hooks(cassette_dict)
+        self._persister.save_cassette(self._path, cassette_dict, serializer=self._serializer)
+
+    def _apply_save_hooks(self, cassette_dict):
         if self._before_save_interaction:
             interactions = []
             for request, response in zip(cassette_dict["requests"], cassette_dict["responses"], strict=True):
@@ -459,7 +521,7 @@ class Cassette:
             }
         if self._metadata:
             cassette_dict = {**cassette_dict, "metadata": self._metadata}
-        self._persister.save_cassette(self._path, cassette_dict, serializer=self._serializer)
+        return cassette_dict
 
     def _load(self):
         try:
@@ -489,6 +551,20 @@ class Cassette:
                 self._path,
                 exc_info=True,
             )
+        if self.update_strategy == UpdateStrategy.REPLACE_ON_SUCCESS:
+            self._capture_baseline_signature()
+
+    def _capture_baseline_signature(self):
+        """Remember the cassette version this refresh started from.
+
+        Persisters that don't implement the full candidate/commit protocol
+        can't take part in the safe refresh, so they keep the direct-write
+        behavior instead of failing at save time.
+        """
+        if not all(callable(getattr(self._persister, name, None)) for name in _CANDIDATE_PROTOCOL):
+            return
+        # None means the cassette doesn't exist yet: the first recording.
+        self._baseline_signature = self._persister.version_signature(self._path)
 
     def __str__(self):
         return f"<Cassette containing {len(self)} recorded response(s)>"
