@@ -1,4 +1,4 @@
-from xmltodict import parse, ParsingInterrupted
+from xmltodict import parse, ParsingInterrupted, NamespaceCollisionError
 import collections
 import pytest
 from io import BytesIO
@@ -720,3 +720,221 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+NAMESPACES = {"http://a.com/": None, "http://b.com/": None}
+
+
+def test_namespace_collision_legacy_still_merges():
+    # Without the opt-in flag, the historical behavior is preserved.
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item>
+        <a:status>open</a:status>
+        <b:status>closed</b:status>
+      </item>
+    </root>
+    """
+    result = parse(xml, process_namespaces=True, namespaces=NAMESPACES)
+    assert result == {
+        'root': {
+            '@xmlns': {'a': 'http://a.com/', 'b': 'http://b.com/'},
+            'item': {'status': ['open', 'closed']},
+        }
+    }
+
+
+def test_namespace_collision_elements_raise():
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item>
+        <a:status>open</a:status>
+        <b:status>closed</b:status>
+      </item>
+    </root>
+    """
+    with pytest.raises(NamespaceCollisionError) as exc_info:
+        parse(xml, process_namespaces=True, namespaces=NAMESPACES,
+              raise_on_namespace_collision=True)
+    err = exc_info.value
+    assert err.path == ['root', 'item']
+    assert err.key == 'status'
+    assert err.existing_name == 'http://a.com/:status'
+    assert err.conflicting_name == 'http://b.com/:status'
+    assert 'status' in str(err)
+    assert 'http://a.com/:status' in str(err)
+    assert 'http://b.com/:status' in str(err)
+
+
+def test_namespace_collision_repeated_same_name_becomes_list():
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item>
+        <a:status>open</a:status>
+        <a:status>closed</a:status>
+      </item>
+    </root>
+    """
+    result = parse(xml, process_namespaces=True, namespaces=NAMESPACES,
+                   raise_on_namespace_collision=True)
+    assert result == {
+        'root': {
+            '@xmlns': {'a': 'http://a.com/', 'b': 'http://b.com/'},
+            'item': {'status': ['open', 'closed']},
+        }
+    }
+
+
+def test_namespace_collision_attributes_raise():
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item a:status="open" b:status="closed"/>
+    </root>
+    """
+    with pytest.raises(NamespaceCollisionError) as exc_info:
+        parse(xml, process_namespaces=True, namespaces=NAMESPACES,
+              raise_on_namespace_collision=True)
+    err = exc_info.value
+    assert err.path == ['root', 'item']
+    assert err.key == '@status'
+    assert err.existing_name == 'http://a.com/:status'
+    assert err.conflicting_name == 'http://b.com/:status'
+
+
+def test_namespace_collision_attr_and_element_are_distinct_keys():
+    # The attr_prefix keeps attributes and child elements in separate key
+    # namespaces, so sharing a local name is not a collision.
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item a:status="open"><b:status>closed</b:status></item>
+    </root>
+    """
+    result = parse(xml, process_namespaces=True, namespaces=NAMESPACES,
+                   raise_on_namespace_collision=True)
+    assert result['root']['item'] == {'@status': 'open', 'status': 'closed'}
+
+
+def test_namespace_collision_deep_path():
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <outer><inner><a:x>1</a:x><b:x>2</b:x></inner></outer>
+    </root>
+    """
+    with pytest.raises(NamespaceCollisionError) as exc_info:
+        parse(xml, process_namespaces=True, namespaces=NAMESPACES,
+              raise_on_namespace_collision=True)
+    err = exc_info.value
+    assert err.path == ['root', 'outer', 'inner']
+    assert err.key == 'x'
+    assert err.existing_name == 'http://a.com/:x'
+    assert err.conflicting_name == 'http://b.com/:x'
+
+
+def test_namespace_collision_with_force_list_still_raises():
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item>
+        <a:status>open</a:status>
+        <b:status>closed</b:status>
+      </item>
+    </root>
+    """
+    with pytest.raises(NamespaceCollisionError):
+        parse(xml, process_namespaces=True, namespaces=NAMESPACES,
+              force_list=('status',), raise_on_namespace_collision=True)
+
+
+def test_namespace_collision_streaming_skips_bad_callback_record():
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item><a:status>ok</a:status></item>
+      <item>
+        <a:status>open</a:status>
+        <b:status>closed</b:status>
+      </item>
+    </root>
+    """
+    seen = []
+
+    def callback(path, item):
+        seen.append(item)
+        return True
+
+    with pytest.raises(NamespaceCollisionError) as exc_info:
+        parse(xml, process_namespaces=True, namespaces=NAMESPACES,
+              raise_on_namespace_collision=True,
+              item_depth=2, item_callback=callback)
+    # The good record was delivered; the collapsed record never reached the
+    # callback.
+    assert seen == [{'status': 'ok'}]
+    assert exc_info.value.path == ['root', 'item']
+
+
+def test_namespace_collision_streaming_first_record_bad():
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item>
+        <a:status>open</a:status>
+        <b:status>closed</b:status>
+      </item>
+      <item><a:status>ok</a:status></item>
+    </root>
+    """
+    seen = []
+    with pytest.raises(NamespaceCollisionError):
+        parse(xml, process_namespaces=True, namespaces=NAMESPACES,
+              raise_on_namespace_collision=True,
+              item_depth=2,
+              item_callback=lambda path, item: seen.append(item) or True)
+    assert seen == []
+
+
+def test_namespace_collision_streaming_generator_input():
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item><a:status>ok</a:status></item>
+      <item>
+        <a:status>open</a:status>
+        <b:status>closed</b:status>
+      </item>
+    </root>
+    """
+    chunks = (xml[i:i + 25] for i in range(0, len(xml), 25))
+    seen = []
+    with pytest.raises(NamespaceCollisionError):
+        parse(chunks, process_namespaces=True, namespaces=NAMESPACES,
+              raise_on_namespace_collision=True,
+              item_depth=2,
+              item_callback=lambda path, item: seen.append(item) or True)
+    assert seen == [{'status': 'ok'}]
+
+
+def test_raise_on_namespace_collision_without_namespace_processing():
+    # The flag is a no-op when namespaces are not processed; ordinary
+    # repeated elements still form lists.
+    xml = '<a><b>1</b><b>2</b></a>'
+    assert parse(xml, raise_on_namespace_collision=True) == \
+        {'a': {'b': ['1', '2']}}
+
+
+def test_namespace_collision_shorthand_prefixes_raise():
+    # Collisions can also happen when two URIs map to the same shorthand.
+    xml = """
+    <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+      <item>
+        <a:status>open</a:status>
+        <b:status>closed</b:status>
+      </item>
+    </root>
+    """
+    namespaces = {
+        'http://a.com/': 'ns',
+        'http://b.com/': 'ns',
+    }
+    with pytest.raises(NamespaceCollisionError) as exc_info:
+        parse(xml, process_namespaces=True, namespaces=namespaces,
+              raise_on_namespace_collision=True)
+    err = exc_info.value
+    assert err.key == 'ns:status'
+    assert err.existing_name == 'http://a.com/:status'
+    assert err.conflicting_name == 'http://b.com/:status'

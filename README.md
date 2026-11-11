@@ -74,6 +74,27 @@ It also lets you collapse certain namespaces to shorthand prefixes, or skip them
 True
 ```
 
+Collapsing namespaces can make elements or attributes from different namespaces map to the same dictionary key, silently merging them (or turning them into a list). Pass `raise_on_namespace_collision=True` to treat that as a data error instead:
+
+```python
+>>> xml = """
+... <root xmlns:a="http://a.com/" xmlns:b="http://b.com/">
+...   <item>
+...     <a:status>open</a:status>
+...     <b:status>closed</b:status>
+...   </item>
+... </root>
+... """
+>>> xmltodict.parse(xml, process_namespaces=True,
+...                 namespaces={'http://a.com/': None, 'http://b.com/': None},
+...                 raise_on_namespace_collision=True)
+Traceback (most recent call last):
+...
+xmltodict.NamespaceCollisionError: Namespace collision at element path ['root', 'item']: dictionary key 'status' is produced by both 'http://a.com/:status' and 'http://b.com/:status'
+```
+
+The exception exposes `path` (the containing element path), `key` (the colliding dictionary key), `existing_name` and `conflicting_name` (the two original, un-collapsed XML names). Attributes are checked separately from child elements, so an attribute and an element sharing a local name do not collide. Repeated occurrences of the same XML name still produce a list. In streaming mode (`item_depth` > 0), the error is raised before `item_callback` runs, so a callback never receives a record whose keys have already been collapsed.
+
 ## Streaming mode
 
 `xmltodict` is very fast ([Expat](http://docs.python.org/library/pyexpat.html)-based) and has a streaming mode with a small memory footprint, suitable for big XML dumps like [Discogs](http://discogs.com/data/) or [Wikipedia](http://dumps.wikimedia.org/):
@@ -205,6 +226,7 @@ Parse XML input into a Python dictionary.
 - `expat=expat`: XML parser module to use.
 - `process_namespaces=False`: Expand XML namespaces if True.
 - `namespace_separator=':'`: Separator between namespace URI and local name.
+- `raise_on_namespace_collision=False`: When True, raise `NamespaceCollisionError` if distinct element or attribute names from different namespaces collapse to the same dictionary key. The error carries the element path and both original XML names. Repeated occurrences of the same XML name still form lists. In streaming mode the error is raised before the callback receives the record.
 - `disable_entities=True`: Disable entity parsing for security.
 - `process_comments=False`: Include XML comments if True. Comments can be preserved when enabled, but by default they are ignored. Multiple top-level comments may not be preserved in exact order.
 - `xml_attribs=True`: Include attributes in output dict (with `attr_prefix`).

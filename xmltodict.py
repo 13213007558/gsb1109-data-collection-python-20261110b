@@ -12,6 +12,26 @@ class ParsingInterrupted(Exception):
     pass
 
 
+class NamespaceCollisionError(ValueError):
+    """Raised when distinct XML names collapse to the same dictionary key.
+
+    This only happens when ``raise_on_namespace_collision`` is enabled.
+    Repeated occurrences of the same XML name are not collisions and still
+    produce list values.
+    """
+
+    def __init__(self, path, key, existing_name, conflicting_name):
+        self.path = path
+        self.key = key
+        self.existing_name = existing_name
+        self.conflicting_name = conflicting_name
+        super().__init__(
+            "Namespace collision at element path %r: dictionary key %r is "
+            "produced by both %r and %r"
+            % (path, key, existing_name, conflicting_name)
+        )
+
+
 class _DictSAXHandler:
     def __init__(
         self,
@@ -29,6 +49,7 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        raise_on_namespace_collision=False,
     ):
         self.path = []
         self.stack = []
@@ -49,6 +70,11 @@ class _DictSAXHandler:
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        self.raise_on_namespace_collision = raise_on_namespace_collision
+        # Maps the built keys of ``self.item`` to the original (not collapsed)
+        # XML names they came from. Only maintained when collision checking is
+        # enabled.
+        self.item_origins = {}
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -71,6 +97,17 @@ class _DictSAXHandler:
             return attrs
         return self.dict_constructor(zip(attrs[0::2], attrs[1::2]))
 
+    def _element_path(self, exclude_current=False):
+        path = self.path[:-1] if exclude_current else self.path
+        return [element_name for element_name, _ in path]
+
+    def _raise_collision(self, key, existing_name, conflicting_name,
+                         exclude_current=False):
+        raise NamespaceCollisionError(
+            self._element_path(exclude_current),
+            key, existing_name, conflicting_name,
+        )
+
     def startNamespaceDecl(self, prefix, uri):
         self.namespace_declarations[prefix or ''] = uri
 
@@ -84,22 +121,38 @@ class _DictSAXHandler:
             self.namespace_declarations = self.dict_constructor()
         self.path.append((name, attrs or None))
         if len(self.path) >= self.item_depth:
-            self.stack.append((self.item, self.data))
+            self.stack.append((self.item, self.data, self.item_origins))
             if self.xml_attribs:
                 attr_entries = []
+                attr_origins = {}
                 for key, value in attrs.items():
+                    original_name = key
                     key = self.attr_prefix+self._build_name(key)
                     if self.postprocessor:
                         entry = self.postprocessor(self.path, key, value)
                     else:
                         entry = (key, value)
                     if entry:
+                        final_key = entry[0]
+                        if self.raise_on_namespace_collision:
+                            existing_name = attr_origins.get(final_key)
+                            if existing_name is not None:
+                                self._raise_collision(
+                                    final_key,
+                                    existing_name,
+                                    original_name,
+                                )
+                            attr_origins[final_key] = original_name
                         attr_entries.append(entry)
                 attrs = self.dict_constructor(attr_entries)
             else:
                 attrs = None
             self.item = attrs or None
             self.data = []
+            self.item_origins = (
+                attr_origins if self.xml_attribs
+                and self.raise_on_namespace_collision else {}
+            )
 
     def endElement(self, full_name):
         name = self._build_name(full_name)
@@ -126,17 +179,18 @@ class _DictSAXHandler:
             # Reset state for the parent context without keeping a reference to
             # the emitted item.
             if self.stack:
-                self.item, self.data = self.stack.pop()
+                self.item, self.data, self.item_origins = self.stack.pop()
             else:
                 self.item = None
                 self.data = []
+                self.item_origins = {}
             self.path.pop()
             return
         if self.stack:
             data = (None if not self.data
                     else self.cdata_separator.join(self.data))
             item = self.item
-            self.item, self.data = self.stack.pop()
+            self.item, self.data, self.item_origins = self.stack.pop()
             if self.strip_whitespace and data:
                 data = data.strip() or None
             if data and self._should_force_cdata(name, data) and item is None:
@@ -144,12 +198,19 @@ class _DictSAXHandler:
             if item is not None:
                 if data:
                     self.push_data(item, self.cdata_key, data)
-                self.item = self.push_data(self.item, name, item)
+                self.item = self.push_data(
+                    self.item, name, item, full_name,
+                    exclude_current_from_path=True,
+                )
             else:
-                self.item = self.push_data(self.item, name, data)
+                self.item = self.push_data(
+                    self.item, name, data, full_name,
+                    exclude_current_from_path=True,
+                )
         else:
             self.item = None
             self.data = []
+            self.item_origins = {}
         self.path.pop()
 
     def characters(self, data):
@@ -163,7 +224,8 @@ class _DictSAXHandler:
             data = data.strip()
         self.item = self.push_data(self.item, self.comment_key, data)
 
-    def push_data(self, item, key, data):
+    def push_data(self, item, key, data, original_name=None,
+                  exclude_current_from_path=False):
         if self.postprocessor is not None:
             result = self.postprocessor(self.path, key, data)
             if result is None:
@@ -171,6 +233,13 @@ class _DictSAXHandler:
             key, data = result
         if item is None:
             item = self.dict_constructor()
+        if self.raise_on_namespace_collision and original_name is not None:
+            existing_name = self.item_origins.get(key)
+            if existing_name is not None and existing_name != original_name:
+                self._raise_collision(
+                    key, existing_name, original_name,
+                    exclude_current=exclude_current_from_path,
+                )
         try:
             value = item[key]
             if isinstance(value, list):
@@ -182,6 +251,8 @@ class _DictSAXHandler:
                 item[key] = [data]
             else:
                 item[key] = data
+        if self.raise_on_namespace_collision and original_name is not None:
+            self.item_origins.setdefault(key, original_name)
         return item
 
     def _should_force_list(self, key, value):
@@ -206,7 +277,8 @@ class _DictSAXHandler:
 
 
 def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
-          namespace_separator=':', disable_entities=True, process_comments=False, **kwargs):
+          namespace_separator=':', disable_entities=True, process_comments=False,
+          raise_on_namespace_collision=False, **kwargs):
     """Parse the given XML input and convert it into a dictionary.
 
     `xml_input` can either be a `string`, a file-like object, or a generator of strings.
@@ -342,9 +414,24 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         at the default `True`, comments will have leading and trailing
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
+
+    If `raise_on_namespace_collision` is `True`, collapsing distinct XML
+    names (elements or attributes from different namespaces, via
+    `process_namespaces` and `namespaces`) onto the same dictionary key
+    raises :class:`NamespaceCollisionError` instead of silently merging
+    them into one key or list. The exception exposes the element path
+    (`path`), the colliding dictionary key (`key`) and the two original
+    names (`existing_name`, `conflicting_name`). Repeated occurrences of
+    the same XML name still produce a list as usual. In streaming mode
+    (`item_depth` > 0) the error is raised before `item_callback` is
+    invoked, so callbacks never receive a record whose keys have already
+    been collapsed.
     """
-    handler = _DictSAXHandler(namespace_separator=namespace_separator,
-                              **kwargs)
+    handler = _DictSAXHandler(
+        namespace_separator=namespace_separator,
+        raise_on_namespace_collision=raise_on_namespace_collision,
+        **kwargs,
+    )
     if isinstance(xml_input, str):
         encoding = encoding or 'utf-8'
         xml_input = xml_input.encode(encoding)
