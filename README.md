@@ -79,6 +79,9 @@ Also works standalone with only the *xlsx2csv.py* script.
                         exclude sheets with names matching the given pattern, only
                         affects when -a option is enabled.
   -m, --merge-cells     merge cells
+  --columns D-H         comma-separated source columns to export, e.g.
+                        'D-H' or 'B,D,F'; letters are source sheet coordinates,
+                        not positions after dropping columns
 ```
 
 Usage with a folder containing multiple `xlsx` files:

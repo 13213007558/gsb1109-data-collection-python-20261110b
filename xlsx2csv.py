@@ -157,6 +157,58 @@ CONTENT_TYPES = set((
 DEFAULT_APP_PATH = "/xl"
 DEFAULT_WORKBOOK_PATH = DEFAULT_APP_PATH + "/workbook.xml"
 
+COLUMN_REF_RE = re.compile(r"^([A-Z]+)(\d+)$")
+
+
+def column_index(col_name):
+    # type: (str) -> int
+    """Convert an Excel column letter (A, B, ..., Z, AA) to a 0-based index."""
+    index = 0
+    for letter in col_name:
+        index = index * 26 + ord(letter) - 64
+    return index - 1
+
+
+def column_name(col_index):
+    # type: (int) -> str
+    """Convert a 0-based column index back to an Excel column letter."""
+    name = ""
+    col_index += 1
+    while col_index > 0:
+        col_index, remainder = divmod(col_index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def parse_column_selection(value):
+    # type: (str) -> List[int]
+    """Parse a column selection such as 'D-H' or 'B,D,F' into sorted 0-based
+    column indexes. Columns always refer to the source sheet coordinates."""
+    columns = set()
+    for part in str(value).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bounds = part.split("-")
+        if len(bounds) == 1:
+            start = end = bounds[0].strip()
+        elif len(bounds) == 2:
+            start, end = bounds[0].strip(), bounds[1].strip()
+        else:
+            raise XlsxValueError("invalid column range: %s" % part)
+        if not re.match(r"^[A-Za-z]+$", start) or not re.match(r"^[A-Za-z]+$", end):
+            raise XlsxValueError("invalid column range: %s" % part)
+        start_index = column_index(start.upper())
+        end_index = column_index(end.upper())
+        if start_index > end_index:
+            raise XlsxValueError("invalid column range: %s" % part)
+        for index in range(start_index, end_index + 1):
+            columns.add(index)
+    if not columns:
+        raise XlsxValueError("no columns selected: %s" % value)
+    return sorted(columns)
+
+
 class XlsxException(Exception):
     pass
 
@@ -203,6 +255,9 @@ class Xlsx2csv:
        exclude_sheet_pattern - exclude sheets named matching given pattern
        exclude_hidden_sheets - exclude hidden sheets
        skip_hidden_rows - skip hidden rows
+       columns - list of 0-based source column indexes to project to the output,
+                 or a range string such as 'D-H'/'B,D,F'; columns are identified
+                 by their source sheet coordinates
     """
 
     def __init__(self, xlsxfile, **options):
@@ -229,6 +284,13 @@ class Xlsx2csv:
         options.setdefault("skip_hidden_rows", True)
         options.setdefault("ignore_invalid_char_data", False)
         options.setdefault("ignore_percentage", False)
+        options.setdefault("columns", None)
+
+        columns = options["columns"]
+        if isinstance(columns, str):
+            options["columns"] = parse_column_selection(columns)
+        elif columns is not None:
+            options["columns"] = sorted(set(int(index) for index in columns))
 
         self.options = options
         self.py3 = sys.version_info[0] == 3
@@ -279,7 +341,7 @@ class Xlsx2csv:
     def close(self):
         # type: () -> None
         """Explicitly close the underlying zip file handle."""
-        if self.ziphandle:
+        if getattr(self, 'ziphandle', None):
             self.ziphandle.close()
             self.ziphandle = None
 
@@ -424,6 +486,7 @@ class Xlsx2csv:
                 sheet.set_skip_hidden_rows(self.options['skip_hidden_rows'])
                 sheet.set_no_line_breaks(self.options['no_line_breaks'])
                 sheet.set_ignore_percentage(self.options['ignore_percentage'])
+                sheet.set_columns(self.options['columns'])
                 if self.options['escape_strings'] and sheet.filedata:
                     sheet.filedata = re.sub(r"(<v>[^<>]+)&#10;([^<>]+</v>)", r"\1\\n\2",
                                             re.sub(r"(<v>[^<>]+)&#9;([^<>]+</v>)", r"\1\\t\2",
@@ -739,6 +802,7 @@ class Sheet:
         self.skip_hidden_rows = False
         self.no_line_breaks = False
         self.ignore_percentage = False
+        self.selected_columns = None
 
         self.colIndex = 0
         self.colNum = ""
@@ -774,6 +838,17 @@ class Sheet:
 
     def set_ignore_percentage(self, ignore_percentage):
         self.ignore_percentage = ignore_percentage
+
+    def set_columns(self, columns):
+        # columns: sorted list of 0-based source column indexes, or None
+        if columns:
+            self.selected_columns = list(columns)
+
+    def _project_row(self, row_data):
+        # type: (List[Any]) -> List[Any]
+        """Project a row (indexed by source column position) onto the selected
+        source columns. Missing source cells become empty fields."""
+        return [row_data[index] if index < len(row_data) else "" for index in self.selected_columns]
 
     def set_merge_cells(self, mergecells):
         if not mergecells:
@@ -1121,6 +1196,27 @@ class Sheet:
                 if self.columns_count < 0:
                     self.columns_count = len(d)
 
+                if self.mergeCells and self.selected_columns is not None:
+                    # carry merged values into retained member cells that hold
+                    # no value of their own, including members without any <c>
+                    # element in the sheet (the anchor cell stays outside the
+                    # projection but is still parsed)
+                    for source_col in self.selected_columns:
+                        if source_col < len(d) and d[source_col] != "":
+                            continue
+                        cell_ref = column_name(source_col) + self.rowNum
+                        merge = self.mergeCells.get(cell_ref)
+                        if not merge:
+                            continue
+                        anchor = merge.get('copyFrom')
+                        if anchor and anchor in self.mergeCells and 'value' in self.mergeCells[anchor]:
+                            while len(d) <= source_col:
+                                d.append("")
+                            d[source_col] = self.mergeCells[anchor]['value']
+
+                if self.selected_columns is not None:
+                    d = self._project_row(d)
+
                 # write empty lines
                 if not self.skip_empty_lines:
                     for i in range(self.lastRowNum, int(self.rowNum) - 1):
@@ -1129,10 +1225,13 @@ class Sheet:
 
                 # write line to csv
                 if not self.skip_empty_lines or d.count('') != len(d):
-                    while len(d) < self.columns_count:
-                        d.append("")
+                    if self.selected_columns is None:
+                        while len(d) < self.columns_count:
+                            d.append("")
 
-                    if self.skip_trailing_columns:
+                    # projection fixes the output width, so empty trailing
+                    # selected columns must not be dropped or narrowed
+                    if self.skip_trailing_columns and self.selected_columns is None:
                         if self.max_columns < 0:
                             self.max_columns = len(d)
                             while len(d) > 0 and d[-1] == "":
@@ -1280,6 +1379,9 @@ def main():
                         help="continue processing remaining files when an error occurs during batch processing")
     parser.add_argument("--ignore-percentage", dest="ignore_percentage", default=False, action="store_true",
                         help="ignore percentage formatting and output raw values")
+    parser.add_argument("--columns", dest="columns", default=None,
+                        help="comma-separated source columns to export, e.g. 'D-H' or 'B,D,F'; "
+                             "letters identify source sheet coordinates, not positions after dropping columns")
 
     if argparser:
         options = parser.parse_args()
@@ -1358,7 +1460,8 @@ def main():
         'lineterminator': options.lineterminator,
         'ignore_formats': options.ignore_formats,
         'skip_hidden_rows': not options.include_hidden_rows,
-        'ignore_percentage': options.ignore_percentage
+        'ignore_percentage': options.ignore_percentage,
+        'columns': options.columns
     }
     sheetid = options.sheetid
     if options.all:

@@ -92,6 +92,28 @@ compare("quoted_literals")
 compare("date1904_0")
 compare("date1904_1")
 compare("hidden_rows")
+compare("column_projection", ["--columns", "D-H", "-m"])
+
+
+def test_column_projection_geometry():
+    # projection addresses source coordinates; without -m merged values stay
+    # empty, hidden rows are skipped, and empty trailing selected columns and
+    # merges outside the projection must not change row/column counts
+    out = subprocess.check_output(
+        [sys.executable, "./xlsx2csv.py", "--columns", "D-H", "test/column_projection.xlsx"]
+    ).decode('utf-8').replace('\r', '')
+    rows = out.split("\n")
+    assert rows[-1] == "", "expected trailing newline"
+    rows = rows[:-1]
+    assert len(rows) == 5, "hidden row must not add a line, got %i rows: %r" % (len(rows), rows)
+    assert all(len(row.split(",")) == 5 for row in rows), "every row must have exactly D-H columns"
+    assert rows[0] == ",,f1,g1,h1", "without -m the C-anchored merge must not be copied"
+    assert rows[2] == "d4,e4,,,", "empty trailing selected columns must be kept"
+    assert "outside merge" not in out, "merges outside the projection must not leak in"
+    print("OK: column_projection_geometry")
+
+
+test_column_projection_geometry()
 
 
 def test_dir_sheetname():

@@ -1,4 +1,10 @@
 unreleased:
+ * Add --columns option to project the output onto source sheet columns (e.g.
+   'D-H' or 'B,D,F'); selection uses source coordinates rather than positions
+   after dropping columns. With -m, merged values are carried into retained
+   member cells even when the anchor cell is outside the selection, while
+   hidden rows, empty trailing selected columns and merges outside the
+   selection do not change the output shape
  * Fix custom number formats with quoted literal text (e.g. 0 "pcs", 0.0 "mm", #,##0 "days")
    being misdetected as dates, or having the literal text counted as decimal places
  * Fix date1904="0" in workbookPr being treated as the 1904 date system (only "1" and "true" enable it)
