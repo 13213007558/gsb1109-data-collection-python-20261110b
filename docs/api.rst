@@ -37,6 +37,13 @@ Functions
 
 .. autofunction:: detect_format
 
+.. autofunction:: detect_formats
+
+.. autoclass:: FormatCandidate
+   :members:
+
+.. autofunction:: resolve_format
+
 .. autofunction:: import_set
 
 

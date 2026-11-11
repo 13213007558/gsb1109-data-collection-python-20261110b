@@ -11,6 +11,7 @@
 __lazy_modules__ = {
     "copy",
     "operator",
+    "tablib.detection",
     "tablib.exceptions",
     "tablib.utils",
 }
@@ -18,6 +19,7 @@ __lazy_modules__ = {
 from copy import copy
 from operator import itemgetter
 
+from .detection import FormatCandidate, detect_formats, resolve_format
 from .exceptions import (
     HeadersNeeded,
     InvalidDatasetIndex,
@@ -420,7 +422,12 @@ class Dataset:
 
         stream = normalize_input(in_stream)
         if not format:
-            format = detect_format(stream)
+            format = resolve_format(stream)
+        if format is None:
+            raise UnsupportedFormat(
+                'Could not detect the input format. Use detect_formats() to '
+                'inspect the possible formats and their evidence.'
+            )
 
         fmt = registry.get_format(format)
         if not hasattr(fmt, 'import_set'):
@@ -912,7 +919,12 @@ class Databook:
 
         stream = normalize_input(in_stream)
         if not format:
-            format = detect_format(stream)
+            format = resolve_format(stream)
+        if format is None:
+            raise UnsupportedFormat(
+                'Could not detect the input format. Use detect_formats() to '
+                'inspect the possible formats and their evidence.'
+            )
 
         fmt = registry.get_format(format)
         if not hasattr(fmt, 'import_book'):
@@ -935,20 +947,17 @@ class Databook:
 
 
 def detect_format(stream):
-    """Return format name of given stream (file-like object, string, or bytestring)."""
-    stream = normalize_input(stream)
-    fmt_title = None
-    for fmt in registry.formats():
-        try:
-            if fmt.detect(stream):
-                fmt_title = fmt.title
-                break
-        except AttributeError:
-            pass
-        finally:
-            if hasattr(stream, 'seek'):
-                stream.seek(0)
-    return fmt_title
+    """Return format name of given stream (file-like object, string, or bytestring).
+
+    Backwards-compatible wrapper around :func:`detect_formats`: it returns the
+    first importable, strongly supported candidate. When the payload only
+    matches formats whose optional dependencies are missing,
+    :class:`~tablib.exceptions.UnsupportedFormat` is raised with installation
+    instructions instead of silently guessing another format. Inspect
+    :func:`detect_formats` directly when several candidates remain plausible
+    and an operator must choose between them.
+    """
+    return resolve_format(stream)
 
 
 def import_set(stream, format=None, **kwargs):

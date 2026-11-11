@@ -123,6 +123,12 @@ registered.
             ...
             # returns True if given stream is parsable as xxx
 
+   Builtin formats are identified through lightweight structural probes;
+   custom formats registered through :data:`tablib.formats.registry` are
+   consulted via their own ``detect()`` method and appear as candidates in
+   :func:`tablib.detect_formats` when it returns a truthy value. The stream
+   is rewound between calls when it is seekable.
+
    .. admonition:: Excluding Support
 
        If the format excludes support for an import/export mechanism (*e.g.*

@@ -13,10 +13,13 @@ except ImportError:
 from .core import (  # noqa: F401
     Databook,
     Dataset,
+    FormatCandidate,
     InvalidDatasetType,
     InvalidDimensions,
     UnsupportedFormat,
     detect_format,
+    detect_formats,
     import_book,
     import_set,
+    resolve_format,
 )

@@ -111,6 +111,31 @@ Creating a :class:`tablib.Dataset` object by importing a pre-existing file is si
 
 This detects what sort of data is being passed in, and uses an appropriate formatter to do the import. So you can import from a variety of different file types.
 
+When the filename (for example an upload called ``export``) or its extension
+cannot be trusted, inspect the candidates before importing.
+:func:`tablib.detect_formats` returns every plausible format together with the
+evidence behind each guess, ordered by autodetection priority. Seekable
+streams are rewound afterwards, so the same object can still be passed to
+:meth:`Dataset.load`::
+
+    >>> import tablib
+    >>> candidates = tablib.detect_formats(upload)
+    >>> for candidate in candidates:
+    ...     print(candidate, candidate.evidence)
+    json [strong] ['payload parses as valid JSON']
+    yaml [provisional] ['YAML structure detected (...); YAML is a JSON superset']
+
+If more than one candidate remains plausible, let an operator choose and pass
+the format explicitly: ``Dataset().load(upload, format='yaml')``.
+
+When a candidate matches but its optional dependency is missing,
+``candidate.available`` is ``False`` and ``candidate.reason`` explains how to
+enable it. Such inputs raise
+:class:`~tablib.exceptions.UnsupportedFormat` with installation instructions
+instead of being silently imported through a different format.
+:func:`tablib.detect_format` keeps the historical single-format return value
+for callers that do not need the full report.
+
 .. admonition:: Source without headers
 
     When the format is :class:`csv <Dataset.csv>`, :class:`tsv <Dataset.tsv>`, :class:`dbf <Dataset.dbf>`, :class:`xls <Dataset.xls>` or :class:`xlsx <Dataset.xlsx>`, and the data source does not have headers, the import should be done as follows ::
