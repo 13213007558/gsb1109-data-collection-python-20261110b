@@ -217,6 +217,7 @@ Parse XML input into a Python dictionary.
 - `strip_whitespace=True`: Remove leading/trailing whitespace in text nodes. Default is True; this trims whitespace in text nodes. Set to False to preserve whitespace exactly. When `process_comments=True`, this same flag also trims comment text; disable `strip_whitespace` if you need to preserve comment indentation or padding. If you preserve whitespace text nodes, avoid combining this with `unparse(..., pretty=True)`: the preserved text nodes and pretty-print indentation/newlines will both be emitted.
 - `namespaces=None`: Mapping of namespaces to prefixes, or None to keep full URIs.
 - `force_list=None`: Force list values for specific elements. Can be a boolean (True/False), a tuple of element names to force lists for, or a callable function that receives (path, key, value) and returns True/False. Useful for elements that may appear once or multiple times to ensure consistent list output.
+- `path_rules=None`: Declarative cardinality rules as a `{path: 'list' | 'single'}` mapping, suitable for plain config files (no Python callbacks needed). Paths are `/`-separated element names from the document root; `*` matches any single element. Names match the keys in the output dict (after namespace processing), so same-named elements in different namespaces never share a rule. Overlapping rules are resolved by specificity (most literal segments wins; equally specific conflicts raise `ValueError`). A `'single'` rule raises `CardinalityError` with the offending path when a second element appears, instead of silently keeping the first. Takes precedence over `force_list` on covered paths.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
@@ -288,6 +289,28 @@ The `force_list` parameter can be used to selectively force list values for spec
 >>> xmltodict.parse(xml, force_list=should_force_list)
 {'a': {'b': ['data1', 'data2'], 'c': 'data3'}}
 ```
+
+### Declarative path_rules
+
+When the configuration lives in a file (JSON/YAML) and cannot hold a Python
+callback, `path_rules` declares the cardinality of each element path:
+
+```python
+>>> xml = '''<order>
+...   <shipping><contact>alice</contact></shipping>
+...   <warehouses><warehouse><contact>bob</contact></warehouse></warehouses>
+... </order>'''
+>>> xmltodict.parse(xml, path_rules={
+...     'order/shipping/contact': 'single',
+...     'order/warehouses/warehouse/contact': 'list',
+... })
+{'order': {'shipping': {'contact': 'alice'},
+           'warehouses': {'warehouse': {'contact': ['bob']}}}}
+```
+
+A `*` segment matches any element name. If a second `<contact>` shows up
+under `shipping`, parsing fails with `CardinalityError` carrying the path
+`order/shipping/contact` instead of silently keeping only the first value.
 
 ## Ok, how do I get it?
 

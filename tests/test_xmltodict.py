@@ -1,4 +1,4 @@
-from xmltodict import parse, ParsingInterrupted
+from xmltodict import parse, ParsingInterrupted, CardinalityError
 import collections
 import pytest
 from io import BytesIO
@@ -495,6 +495,110 @@ def test_force_list_callable():
         },
     }
     assert parse(xml, force_list=force_list, dict_constructor=dict) == expectedResult
+
+
+def test_path_rules_list_and_single():
+    xml = """
+    <order>
+      <shipping>
+        <contact>alice</contact>
+      </shipping>
+      <warehouses>
+        <warehouse>
+          <contact>bob</contact>
+        </warehouse>
+      </warehouses>
+    </order>
+    """
+    rules = {
+        'order/shipping/contact': 'single',
+        'order/warehouses/warehouse/contact': 'list',
+    }
+    assert parse(xml, path_rules=rules) == {
+        'order': {
+            'shipping': {'contact': 'alice'},
+            'warehouses': {'warehouse': {'contact': ['bob']}},
+        }
+    }
+
+
+def test_path_rules_single_violation_reports_path():
+    xml = """
+    <order>
+      <shipping>
+        <contact>alice</contact>
+        <contact>bob</contact>
+      </shipping>
+    </order>
+    """
+    rules = {'order/shipping/contact': 'single'}
+    with pytest.raises(CardinalityError) as excinfo:
+        parse(xml, path_rules=rules)
+    assert excinfo.value.path == ('order', 'shipping', 'contact')
+    assert 'order/shipping/contact' in str(excinfo.value)
+
+
+def test_path_rules_specificity_and_wildcard():
+    xml = """
+    <root>
+      <a><item>1</item></a>
+      <b><item>2</item></b>
+    </root>
+    """
+    # The more specific rule (more literal segments) wins over the wildcard.
+    rules = {'root/*/item': 'list', 'root/b/item': 'single'}
+    assert parse(xml, path_rules=rules) == {
+        'root': {
+            'a': {'item': ['1']},
+            'b': {'item': '2'},
+        }
+    }
+
+
+def test_path_rules_conflicting_rules_rejected():
+    xml = '<root><a><item>1</item></a></root>'
+    rules = {'root/*/item': 'list', 'root/a/*': 'single'}
+    with pytest.raises(ValueError, match='conflicting path rules'):
+        parse(xml, path_rules=rules)
+
+
+def test_path_rules_invalid_cardinality_rejected():
+    with pytest.raises(ValueError, match='invalid cardinality'):
+        parse('<a/>', path_rules={'a/b': 'maybe'})
+
+
+def test_path_rules_namespaces_do_not_collide():
+    xml = """
+    <root xmlns:a="http://a" xmlns:b="http://b">
+      <a:contact>alice</a:contact>
+      <b:contact>bob</b:contact>
+    </root>
+    """
+    namespaces = {'http://a': 'a', 'http://b': 'b'}
+    rules = {'root/a:contact': 'single', 'root/b:contact': 'list'}
+    assert parse(xml, process_namespaces=True, namespaces=namespaces,
+                 path_rules=rules) == {
+        'root': {
+            '@xmlns': {'a': 'http://a', 'b': 'http://b'},
+            'a:contact': 'alice',
+            'b:contact': ['bob'],
+        }
+    }
+    # A rule for one namespace must not force the other into a list.
+    rules = {'root/a:contact': 'list'}
+    result = parse(xml, process_namespaces=True, namespaces=namespaces,
+                   path_rules=rules)
+    assert result['root']['a:contact'] == ['alice']
+    assert result['root']['b:contact'] == 'bob'
+
+
+def test_path_rules_take_precedence_over_force_list():
+    xml = '<root><item>1</item></root>'
+    # force_list wraps the uncovered root, but the ruled path stays single.
+    assert parse(xml, force_list=True,
+                 path_rules={'root/item': 'single'}) == {
+        'root': [{'item': '1'}],
+    }
 
 
 def test_disable_entities_true_rejects_xmlbomb():

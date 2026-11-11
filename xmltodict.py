@@ -12,6 +12,75 @@ class ParsingInterrupted(Exception):
     pass
 
 
+class CardinalityError(ValueError):
+    """Raised when a `path_rules` cardinality constraint is violated.
+
+    The `path` attribute holds the element names from the document root to
+    the offending element, e.g. `('order', 'shipping', 'contact')`.
+    """
+    def __init__(self, path):
+        self.path = tuple(path)
+        super().__init__(
+            "multiple elements found for single-value path '%s'"
+            % "/".join(self.path)
+        )
+
+
+def _compile_path_rules(path_rules):
+    """Turn a declarative {path: cardinality} mapping into matchable rules.
+
+    Each pattern is a `/`-separated path of element names from the document
+    root (a leading `/` is optional); `*` matches any single element name.
+    Names are matched against the keys as they appear in the resulting
+    dictionary, i.e. after namespace processing, so identically named
+    elements from different namespaces never share a rule. The cardinality
+    must be either `'list'` or `'single'`.
+    """
+    compiled = []
+    for pattern, cardinality in path_rules.items():
+        if cardinality not in ("list", "single"):
+            raise ValueError(
+                "invalid cardinality %r for path rule %r: "
+                "expected 'list' or 'single'" % (cardinality, pattern)
+            )
+        if not isinstance(pattern, str):
+            raise ValueError("path rule pattern must be a string")
+        segments = tuple(s for s in pattern.split("/") if s)
+        if not segments:
+            raise ValueError("path rule pattern must not be empty")
+        compiled.append((segments, cardinality))
+    return compiled
+
+
+def _match_path_rule(rules, names):
+    """Return the cardinality for `names`, or None if no rule matches.
+
+    Overlapping rules are resolved by specificity: the rule with the most
+    literal (non-wildcard) segments wins. If several equally specific rules
+    match with conflicting cardinalities, a ValueError is raised.
+    """
+    matches = []
+    for segments, cardinality in rules:
+        if len(segments) != len(names):
+            continue
+        if not all(s == "*" or s == n for s, n in zip(segments, names)):
+            continue
+        literal_count = sum(1 for s in segments if s != "*")
+        matches.append((literal_count, cardinality, segments))
+    if not matches:
+        return None
+    best_count = max(m[0] for m in matches)
+    best = [m for m in matches if m[0] == best_count]
+    cardinalities = {m[1] for m in best}
+    if len(cardinalities) > 1:
+        raise ValueError(
+            "conflicting path rules %s both match '%s'"
+            % (", ".join(repr("/".join(m[2])) for m in best),
+               "/".join(names))
+        )
+    return best[0][1]
+
+
 class _DictSAXHandler:
     def __init__(
         self,
@@ -28,6 +97,7 @@ class _DictSAXHandler:
         namespace_separator=":",
         namespaces=None,
         force_list=None,
+        path_rules=None,
         comment_key="#comment",
     ):
         self.path = []
@@ -48,6 +118,8 @@ class _DictSAXHandler:
         self.namespaces = namespaces
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
+        self.path_rules = (_compile_path_rules(path_rules)
+                           if path_rules else None)
         self.comment_key = comment_key
 
     def _build_name(self, full_name):
@@ -171,18 +243,33 @@ class _DictSAXHandler:
             key, data = result
         if item is None:
             item = self.dict_constructor()
+        rule = self._path_rule_for(key)
         try:
             value = item[key]
+            if rule == "single":
+                raise CardinalityError(self._names_for(key))
             if isinstance(value, list):
                 value.append(data)
             else:
                 item[key] = [value, data]
         except KeyError:
-            if self._should_force_list(key, data):
+            if rule == "list" or (rule is None
+                                  and self._should_force_list(key, data)):
                 item[key] = [data]
             else:
                 item[key] = data
         return item
+
+    def _names_for(self, key):
+        names = tuple(name for name, _ in self.path)
+        if not names or names[-1] != key:
+            names += (key,)
+        return names
+
+    def _path_rule_for(self, key):
+        if not self.path_rules:
+            return None
+        return _match_path_rule(self.path_rules, self._names_for(key))
 
     def _should_force_list(self, key, value):
         if not self.force_list:
@@ -308,6 +395,28 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         `force_list` can also be a callable that receives `path`, `key` and
         `value`. This is helpful in cases where the logic that decides whether
         a list should be forced is more complex.
+
+    The optional `path_rules` argument is a declarative alternative to a
+    `force_list` callback, suitable for plain config files (JSON/YAML). It
+    maps `/`-separated element paths from the document root to a
+    cardinality, either `'list'` or `'single'`::
+
+        >>> xmltodict.parse(xml, path_rules={
+        ...     'shipping/contact': 'single',
+        ...     'warehouses/warehouse/contact': 'list',
+        ... })
+
+    A `*` segment matches any single element name. Names are matched
+    against the keys as they appear in the resulting dictionary (i.e. after
+    namespace processing), so identically named elements from different
+    namespaces never share a rule. When several rules match the same
+    element, the one with the most literal (non-wildcard) segments wins;
+    equally specific rules with conflicting cardinalities raise
+    `ValueError`. A `'list'` rule forces a list even for a single element;
+    a `'single'` rule raises :class:`CardinalityError` (carrying the
+    offending `path`) when a second element appears, instead of silently
+    keeping only the first one. `path_rules` takes precedence over
+    `force_list` for the paths it covers.
 
 
         If `process_comments` is `True`, comments will be added using `comment_key`
