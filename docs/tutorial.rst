@@ -326,6 +326,47 @@ Using chaining you can get a filter type and. ::
 
 It's that simple. The original :class:`Dataset` is untouched.
 
+.. _sources:
+
+-------------------------
+Tracking Row Sources
+-------------------------
+
+When rows are collected from different places (*e.g.* crawled from different
+pages), you can attach source information to each row with the ``source``
+parameter. The source is stored as row meta-data — never as a column — so it
+cannot clash with a business column that happens to share its name, and it is
+never exported into your data. ::
+
+    records = tablib.Dataset(headers=['name', 'price'])
+
+    records.append(['widget', '10'], source={'page': 1})
+    records.append(['gadget', '20'], source={'page': 2})
+    records.append(['widget', '10'], source={'page': 3})
+
+The source follows its row through :meth:`Dataset.filter`,
+:meth:`Dataset.sort`, :meth:`Dataset.subset`, :meth:`Dataset.stack` and
+copies, so you can always trace a row back to its origin even after
+reordering. ::
+
+    >>> records.sort('name').sources
+    [{'page': 2}, {'page': 1}, {'page': 3}]
+
+You can locate rows by their source and modify them in place; assigning new
+values to a row keeps its source, so manually fixed rows remain traceable. ::
+
+    >>> records.rows_with_source({'page': 3})
+    [2]
+    >>> records[2] = ['widget', '12']
+    >>> records.get_source(2)
+    {'page': 3}
+
+When merging datasets with :meth:`Dataset.stack`, every row keeps its own
+source — sources are never rewritten. When copying a single row into another
+dataset by appending a :class:`Row` object, its source is carried over unless
+you pass an explicit ``source``. Rows appended as plain values start with no
+source (``None``).
+
 Open an Excel Workbook and read first sheet
 -------------------------------------------
 

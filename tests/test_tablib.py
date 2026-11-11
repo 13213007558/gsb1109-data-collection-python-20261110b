@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Tests for Tablib."""
 
+import copy
 import datetime as dt
 import doctest
 import json
@@ -755,6 +756,147 @@ class TablibTestCase(BaseTestCase):
 
         # Act / Assert
         self.assertTrue(john.has_tag(["tag2", "tag1"]))
+
+
+class RowSourceTests(unittest.TestCase):
+    """Tests for optional row source (provenance) information."""
+
+    def setUp(self):
+        self.headers = ('name', 'sku', 'price')
+        self.data = tablib.Dataset(headers=self.headers)
+        self.data.append(('widget', 'A-1', '10'), source={'page': 1})
+        self.data.append(('gadget', 'B-2', '20'), source={'page': 2})
+        # Same content as row 0, but collected from a different page.
+        self.data.append(('widget', 'A-1', '10'), source={'page': 3})
+
+    def test_source_defaults_to_none(self):
+        """Rows appended without a source have none."""
+        data = tablib.Dataset(headers=self.headers)
+        data.append(('widget', 'A-1', '10'))
+        self.assertIsNone(data.get_source(0))
+        self.assertEqual(data.sources, [None])
+
+    def test_get_source_and_sources(self):
+        """Source information is readable per row and in bulk."""
+        self.assertEqual(self.data.get_source(0), {'page': 1})
+        self.assertEqual(self.data.get_source(-1), {'page': 3})
+        self.assertEqual(
+            self.data.sources, [{'page': 1}, {'page': 2}, {'page': 3}])
+
+    def test_set_source(self):
+        """Source information can be attached or fixed after collection."""
+        self.data.set_source(1, {'page': 22})
+        self.assertEqual(self.data.get_source(1), {'page': 22})
+
+    def test_rows_with_source(self):
+        """Rows are locatable by their source information."""
+        self.assertEqual(self.data.rows_with_source({'page': 3}), [2])
+        self.assertEqual(self.data.rows_with_source({'page': 99}), [])
+
+    def test_source_is_not_a_business_column(self):
+        """A header named 'source' does not clash with row sources."""
+        data = tablib.Dataset(headers=('name', 'source'))
+        data.append(('widget', 'manual'), source={'page': 1})
+
+        # The business column is untouched by row source information.
+        self.assertEqual(data['source'], ['manual'])
+        self.assertEqual(data.dict, [{'name': 'widget', 'source': 'manual'}])
+        # The provenance lives outside the row values.
+        self.assertEqual(data.get_source(0), {'page': 1})
+        self.assertNotIn({'page': 1}, data[0])
+
+    def test_source_survives_sort(self):
+        """Sorting moves sources along with their rows."""
+        sorted_data = self.data.sort('name', reverse=True)
+        self.assertEqual(sorted_data[0], ('widget', 'A-1', '10'))
+        self.assertEqual(
+            sorted_data.sources, [{'page': 1}, {'page': 3}, {'page': 2}])
+
+    def test_source_survives_filter(self):
+        """Filtering keeps sources attached to their rows."""
+        data = tablib.Dataset(headers=self.headers)
+        data.append(('widget', 'A-1', '10'), tags=['needs-review'],
+                    source={'page': 1})
+        data.append(('gadget', 'B-2', '20'), source={'page': 2})
+
+        filtered = data.filter('needs-review')
+        self.assertEqual(filtered.height, 1)
+        self.assertEqual(filtered.get_source(0), {'page': 1})
+
+    def test_source_survives_copy(self):
+        """Copying a dataset or a row keeps source information."""
+        self.assertEqual(copy.copy(self.data).sources, self.data.sources)
+        self.assertEqual(copy.deepcopy(self.data).sources, self.data.sources)
+        self.assertEqual(pickle.loads(pickle.dumps(self.data)).sources,
+                         self.data.sources)
+
+        row_copy = self.data._data[0].copy()
+        self.assertEqual(row_copy.source, {'page': 1})
+
+    def test_row_unpickles_legacy_state(self):
+        """Rows pickled before sources existed still load."""
+        row = Row()
+        row.__setstate__((['widget', 'A-1', '10'], ['tag1']))
+        self.assertIsNone(row.source)
+        self.assertEqual(row.tags, ['tag1'])
+
+    def test_stack_keeps_each_rows_source(self):
+        """Merging datasets never rewrites row sources."""
+        other = tablib.Dataset(headers=self.headers)
+        other.append(('sprocket', 'C-3', '30'), source={'page': 9})
+        other.append(('widget', 'A-1', '10'))  # no source
+
+        merged = self.data.stack(other)
+        self.assertEqual(
+            merged.sources,
+            [{'page': 1}, {'page': 2}, {'page': 3}, {'page': 9}, None])
+
+    def test_subset_keeps_row_sources(self):
+        """Subsetting carries sources over."""
+        subset = self.data.subset(rows=(0, 2), cols=('name', 'sku'))
+        self.assertEqual(subset.sources, [{'page': 1}, {'page': 3}])
+
+    def test_setting_row_values_keeps_source(self):
+        """Fixing a row's values in place keeps its source."""
+        self.data[1] = ('gadget', 'B-2', '25')
+        self.assertEqual(self.data[1], ('gadget', 'B-2', '25'))
+        self.assertEqual(self.data.get_source(1), {'page': 2})
+
+    def test_setting_row_object_adopts_its_source(self):
+        """Assigning a Row replaces the row's identity, source included."""
+        self.data[1] = Row(('gadget', 'B-2', '25'), source={'page': 7})
+        self.assertEqual(self.data.get_source(1), {'page': 7})
+
+    def test_appending_row_object_carries_source(self):
+        """Copying a Row into another dataset carries its source."""
+        target = tablib.Dataset(headers=self.headers)
+        target.append(self.data._data[0])
+        self.assertEqual(target.get_source(0), {'page': 1})
+
+        # An explicit source wins over the carried one.
+        target.append(self.data._data[0], source={'page': 42})
+        self.assertEqual(target.get_source(1), {'page': 42})
+
+    def test_identical_rows_stay_distinguishable(self):
+        """Two identical rows from different pages remain separately
+        locatable and modifiable after sorting and copying."""
+        self.assertEqual(self.data[0], self.data[2])
+
+        working = copy.deepcopy(self.data).sort('name')
+
+        # Both duplicates are still traceable to their own page.
+        page_one = working.rows_with_source({'page': 1})
+        page_three = working.rows_with_source({'page': 3})
+        self.assertEqual(len(page_one), 1)
+        self.assertEqual(len(page_three), 1)
+        self.assertNotEqual(page_one, page_three)
+
+        # Fixing values on one duplicate leaves the other untouched.
+        working[page_three[0]] = ('widget', 'A-1', '12')
+        self.assertEqual(working[page_three[0]], ('widget', 'A-1', '12'))
+        self.assertEqual(working.get_source(page_three[0]), {'page': 3})
+        self.assertEqual(working[page_one[0]], ('widget', 'A-1', '10'))
+        self.assertEqual(working.get_source(page_one[0]), {'page': 1})
 
 
 class HTMLTests(BaseTestCase):

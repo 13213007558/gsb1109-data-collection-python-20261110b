@@ -10,13 +10,11 @@
 
 __lazy_modules__ = {
     "copy",
-    "operator",
     "tablib.exceptions",
     "tablib.utils",
 }
 
 from copy import copy
-from operator import itemgetter
 
 from .exceptions import (
     HeadersNeeded,
@@ -38,11 +36,12 @@ __docformat__ = 'restructuredtext'
 class Row:
     """Internal Row object. Mainly used for filtering."""
 
-    __slots__ = ['_row', 'tags']
+    __slots__ = ['_row', 'tags', 'source']
 
-    def __init__(self, row=(), tags=()):
+    def __init__(self, row=(), tags=(), source=None):
         self._row = list(row)
         self.tags = list(tags)
+        self.source = source
 
     def __iter__(self):
         return (col for col in self._row)
@@ -63,10 +62,15 @@ class Row:
         del self._row[i]
 
     def __getstate__(self):
-        return self._row, self.tags
+        return self._row, self.tags, self.source
 
     def __setstate__(self, state):
-        self._row, self.tags = state
+        if len(state) == 2:
+            # State pickled before row sources existed.
+            self._row, self.tags = state
+            self.source = None
+        else:
+            self._row, self.tags, self.source = state
 
     def rpush(self, value):
         self.insert(len(self._row), value)
@@ -81,7 +85,7 @@ class Row:
         self._row.insert(index, value)
 
     def copy(self):
-        return Row(self._row.copy(), self.tags.copy())
+        return Row(self._row.copy(), self.tags.copy(), self.source)
 
     def __contains__(self, item):
         return item in self._row
@@ -192,7 +196,15 @@ class Dataset:
 
     def __setitem__(self, key, value):
         self._validate(value)
-        self._data[key] = Row(value)
+        if isinstance(value, Row):
+            # Assigning a Row replaces the row's identity, source included.
+            self._data[key] = Row(value, source=value.source)
+        elif isinstance(key, int):
+            # Assigning plain values keeps the existing row's source, so that
+            # manually fixed rows remain traceable to their origin.
+            self._data[key] = Row(value, source=self._data[key].source)
+        else:
+            self._data[key] = Row(value)
 
     def __delitem__(self, key):
         if isinstance(key, str):
@@ -445,7 +457,7 @@ class Dataset:
     # Rows
     # ----
 
-    def insert(self, index, row, tags=()):
+    def insert(self, index, row, tags=(), source=None):
         """Inserts a row to the :class:`Dataset` at the given index.
 
         Rows inserted must be the correct size (height or width).
@@ -456,43 +468,51 @@ class Dataset:
         You can add :ref:`tags <tags>` to the row you are inserting.
         This gives you the ability to :method:`filter <Dataset.filter>` your
         :class:`Dataset` later.
+
+        You can also attach :ref:`source <sources>` information to the row
+        (*e.g.* which page it was collected from). The source is stored as
+        row meta-data, never as a column, so it cannot clash with a header
+        of the same name. If `row` is itself a :class:`Row` and no explicit
+        `source` is given, the row's own source is carried over.
         """
 
         self._validate(row)
+        if source is None and isinstance(row, Row):
+            source = row.source
         if len(row) < self.width:
             for pos, func in self._dynamic_columns.items():
                 row = list(row)
                 row.insert(pos, func(row))
-        self._data.insert(index, Row(row, tags=tags))
+        self._data.insert(index, Row(row, tags=tags, source=source))
 
-    def rpush(self, row, tags=()):
+    def rpush(self, row, tags=(), source=None):
         """Adds a row to the end of the :class:`Dataset`.
         See :method:`Dataset.insert` for additional documentation.
         """
 
-        self.insert(self.height, row=row, tags=tags)
+        self.insert(self.height, row=row, tags=tags, source=source)
 
-    def lpush(self, row, tags=()):
+    def lpush(self, row, tags=(), source=None):
         """Adds a row to the top of the :class:`Dataset`.
         See :method:`Dataset.insert` for additional documentation.
         """
 
-        self.insert(0, row=row, tags=tags)
+        self.insert(0, row=row, tags=tags, source=source)
 
-    def append(self, row, tags=()):
+    def append(self, row, tags=(), source=None):
         """Adds a row to the :class:`Dataset`.
         See :method:`Dataset.insert` for additional documentation.
         """
 
-        self.rpush(row, tags)
+        self.rpush(row, tags, source=source)
 
-    def extend(self, rows, tags=()):
+    def extend(self, rows, tags=(), source=None):
         """Adds a list of rows to the :class:`Dataset` using
         :method:`Dataset.append`
         """
 
         for row in rows:
-            self.append(row, tags)
+            self.append(row, tags, source=source)
 
     def lpop(self):
         """Removes and returns the first row of the :class:`Dataset`."""
@@ -522,6 +542,31 @@ class Dataset:
             return self[index]
 
         raise TypeError('Row indices must be integers.')
+
+    @property
+    def sources(self):
+        """The :ref:`source <sources>` information of every row, in row order.
+        Entries are ``None`` for rows without source information.
+        """
+        return [row.source for row in self._data]
+
+    def get_source(self, index):
+        """Returns the :ref:`source <sources>` information of the row at the
+        given index, or ``None`` if the row has none."""
+
+        return self._data[index].source
+
+    def set_source(self, index, source):
+        """Sets the :ref:`source <sources>` information of the row at the
+        given index."""
+
+        self._data[index].source = source
+
+    def rows_with_source(self, source):
+        """Returns the indices of all rows whose :ref:`source <sources>`
+        information equals the given value, in row order."""
+
+        return [i for i, row in enumerate(self._data) if row.source == source]
 
     # -------
     # Columns
@@ -647,7 +692,8 @@ class Dataset:
 
     def filter(self, tag):
         """Returns a new instance of the :class:`Dataset`, excluding any rows
-        that do not contain the given :ref:`tags <tags>`.
+        that do not contain the given :ref:`tags <tags>`. Rows keep their
+        :ref:`source <sources>` information.
         """
         _dset = copy(self)
         _dset._data = [row for row in _dset._data if row.has_tag(tag)]
@@ -660,34 +706,19 @@ class Dataset:
         setting ``reverse`` to ``True``.
 
         Returns a new :class:`Dataset` instance where columns have been
-        sorted.
+        sorted. Row tags and :ref:`source <sources>` information move along
+        with their rows.
         """
 
         if isinstance(col, str):
-
             if not self.headers:
                 raise HeadersNeeded
+            col = self.headers.index(col)
 
-            _sorted = sorted(self.dict, key=itemgetter(col), reverse=reverse)
-            _dset = Dataset(headers=self.headers, title=self.title)
+        _dset = Dataset(headers=self.headers, title=self.title)
 
-            for item in _sorted:
-                row = [item[key] for key in self.headers]
-                _dset.append(row=row)
-
-        else:
-            if self.headers:
-                col = self.headers[col]
-
-            _sorted = sorted(self.dict, key=itemgetter(col), reverse=reverse)
-            _dset = Dataset(headers=self.headers, title=self.title)
-
-            for item in _sorted:
-                if self.headers:
-                    row = [item[key] for key in self.headers]
-                else:
-                    row = item
-                _dset.append(row=row)
+        for row in sorted(self._data, key=lambda row: row[col], reverse=reverse):
+            _dset.append(row=row.list, tags=row.tags, source=row.source)
 
         return _dset
 
@@ -747,7 +778,10 @@ class Dataset:
     def stack(self, other):
         """Stack two :class:`Dataset` instances together by
         joining at the row level, and return new combined
-        ``Dataset`` instance."""
+        ``Dataset`` instance. Every row keeps its own
+        :ref:`source <sources>` information; sources are never
+        rewritten when merging.
+        """
 
         if not isinstance(other, Dataset):
             raise TypeError("'other' must be a Dataset instance")
@@ -821,7 +855,8 @@ class Dataset:
 
     def subset(self, rows=None, cols=None):
         """Returns a new instance of the :class:`Dataset`,
-        including only specified rows and columns.
+        including only specified rows and columns. Row
+        :ref:`source <sources>` information is carried over.
         """
 
         # Don't return if no data
@@ -854,7 +889,7 @@ class Dataset:
                     raise KeyError
 
             if row_no in rows:
-                _dset.append(row=Row(data_row))
+                _dset.append(row=Row(data_row, source=row.source))
 
         return _dset
 
