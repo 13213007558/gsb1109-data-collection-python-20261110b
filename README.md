@@ -79,7 +79,23 @@ Also works standalone with only the *xlsx2csv.py* script.
                         exclude sheets with names matching the given pattern, only
                         affects when -a option is enabled.
   -m, --merge-cells     merge cells
+  --strict-sheet-relationships
+                        locate worksheets strictly via their declared relationship
+                        targets and raise a specific error (missing relationship,
+                        wrong type, external address, or path outside the package)
+                        instead of falling back to conventional sheet locations
 ```
+
+Worksheets are located through the relationship `Target` declared in the workbook,
+so packages that keep sheets outside `xl/worksheets/` still convert. A target that is
+an external address (an absolute URL or `TargetMode="External"`) or that climbs outside
+the package root via `..` is never followed, so the host file system cannot be reached.
+Use `--strict-sheet-relationships` (or `strict_sheet_relationships=True` in the API) to
+turn relationship problems into distinct exceptions: `SheetRelationshipMissingException`,
+`SheetRelationshipTypeException`, `ExternalSheetTargetException`, and
+`SheetTargetOutsidePackageException` (all subclassing `SheetRelationshipException`, which
+reports the offending relationship id and target). By default the converter stays lenient
+and falls back to the conventional worksheet locations when a declaration is broken.
 
 Usage with a folder containing multiple `xlsx` files:
 ```

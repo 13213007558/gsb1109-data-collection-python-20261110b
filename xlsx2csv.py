@@ -157,6 +157,10 @@ CONTENT_TYPES = set((
 DEFAULT_APP_PATH = "/xl"
 DEFAULT_WORKBOOK_PATH = DEFAULT_APP_PATH + "/workbook.xml"
 
+# relationship Type suffixes as defined by the OOXML/OPC specification
+WORKSHEET_RELATION_TYPE = "/worksheet"
+EXTERNAL_RELATION_MODE = "External"
+
 class XlsxException(Exception):
     pass
 
@@ -169,12 +173,111 @@ class SheetNotFoundException(XlsxException):
     pass
 
 
+class SheetRelationshipException(XlsxException):
+    """Base class for problems with a sheet relationship, so that the
+    offending relationship id and target can be reported precisely."""
+
+    def __init__(self, relation_id, target, message):
+        # type: (Optional[str], Optional[str], str) -> None
+        self.relation_id = relation_id
+        self.target = target
+        details = []
+        if relation_id is not None:
+            details.append("relationship %s" % relation_id)
+        if target is not None:
+            details.append("target '%s'" % target)
+        if details:
+            message = message + " (" + ", ".join(details) + ")"
+        super(SheetRelationshipException, self).__init__(message)
+
+
+class SheetRelationshipMissingException(SheetRelationshipException):
+    """The workbook references a relationship id that does not exist,
+    or the relationship has no usable target."""
+    pass
+
+
+class SheetRelationshipTypeException(SheetRelationshipException):
+    """The referenced relationship exists but is not a worksheet
+    relationship (e.g. it points at styles or a shared string table)."""
+    pass
+
+
+class SheetRelationshipTargetException(SheetRelationshipException):
+    """Base class for relationship targets that cannot be read inside
+    the package: external references or paths escaping the package root."""
+    pass
+
+
+class ExternalSheetTargetException(SheetRelationshipTargetException):
+    """The relationship target is an external reference (an absolute URL
+    or a TargetMode="External" link) and therefore not part of the package."""
+    pass
+
+
+class SheetTargetOutsidePackageException(SheetRelationshipTargetException):
+    """The relationship target resolves to a location outside the package
+    root, so accessing it would touch the host file system."""
+    pass
+
+
 class OutFileAlreadyExistsException(XlsxException):
     pass
 
 
 class XlsxValueError(XlsxException):
     pass
+
+
+def _is_external_target(target):
+    # type: (str) -> bool
+    """A target is external when it is an absolute URL (http://, https://,
+    ftp://, mailto:, file:) or a Windows drive/UNC path such as C:\\ or \\\\host."""
+    if target is None:
+        return False
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", target):
+        return True
+    if re.match(r"^[a-zA-Z]:[\\/]", target):
+        return True
+    if target.startswith("\\\\"):
+        return True
+    return False
+
+
+def resolve_package_target(base_part, target):
+    # type: (str, str) -> str
+    """Resolve a package-relative relationship target into an absolute
+    package part path (always starting with '/').
+
+    'base_part' is the absolute path of the part owning the relationship
+    (e.g. '/xl/workbook.xml'); a relative target is resolved against its
+    directory. Targets beginning with '/' are already absolute package paths.
+
+    Raises SheetTargetOutsidePackageException if the resolved path escapes
+    the package root (for example through '..' segments). Only the path is
+    checked here; the part may still be missing from the package.
+    """
+    if target.startswith("/"):
+        absolute = target
+    else:
+        base_dir = os.path.dirname(base_part)
+        absolute = base_dir + "/" + target
+    # resolve segment by segment: os.path.normpath would silently drop '..'
+    # segments that climb above an absolute root, hiding an escape
+    absolute = absolute.replace("\\", "/")
+    resolved = []
+    for segment in absolute.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if not resolved:
+                raise SheetTargetOutsidePackageException(
+                    None, target,
+                    "Relationship target escapes the package root")
+            resolved.pop()
+        else:
+            resolved.append(segment)
+    return "/" + "/".join(resolved)
 
 
 class Xlsx2csv:
@@ -229,6 +332,7 @@ class Xlsx2csv:
         options.setdefault("skip_hidden_rows", True)
         options.setdefault("ignore_invalid_char_data", False)
         options.setdefault("ignore_percentage", False)
+        options.setdefault("strict_sheet_relationships", False)
 
         self.options = options
         self.py3 = sys.version_info[0] == 3
@@ -375,37 +479,44 @@ class Xlsx2csv:
                 raise XlsxValueError("Sheet with index %i not found or can't be handled" % sheet_index)
 
             sheet_path = None
-            # using sheet relation information
-            if 'relation_id' in sheets_filtered[0] and sheets_filtered[0]['relation_id'] is not None:
-
-                relation_id = sheets_filtered[0]['relation_id']
-                if relation_id in self.workbook.relationships.relationships and \
-                                'target' in self.workbook.relationships.relationships[relation_id]:
-                    relationship = self.workbook.relationships.relationships[relation_id]
-                    sheet_path = relationship['target']
-                    if not (sheet_path.startswith("/xl/") or sheet_path.startswith("xl/")):
-                        sheet_path = "/xl/" + sheet_path
-
             sheet_file = None
+            relation_id = sheets_filtered[0].get('relation_id')
+
+            if relation_id is not None:
+                # resolve strictly through the relationship declaration
+                try:
+                    resolved_path = self._resolve_sheet_relation(relation_id)
+                    sheet_file = self._filehandle(resolved_path)
+                    if sheet_file is None:
+                        # the relationship is valid and internal, but its part is absent
+                        raise SheetRelationshipMissingException(
+                            relation_id, resolved_path,
+                            "Worksheet part referenced by the relationship was not found inside the package")
+                    sheet_path = resolved_path
+                except SheetRelationshipException:
+                    if self.options['strict_sheet_relationships']:
+                        raise
+                    # lenient default: ignore the broken declaration and try
+                    # conventional worksheet locations instead
+                    sheet_path = None
+                    sheet_file = None
+
             if sheet_path is None:
-                sheet_path = "/xl/worksheets/sheet%i.xml" % sheet_index
-                sheet_file = self._filehandle(sheet_path)
+                # no usable relationship declaration: fall back to conventional locations
+                for candidate in ("/xl/worksheets/sheet%i.xml" % sheet_index,
+                                  "/xl/worksheets/worksheet%i.xml" % sheet_index):
+                    sheet_file = self._filehandle(candidate)
+                    if sheet_file is not None:
+                        sheet_path = candidate
+                        break
+                if sheet_file is None and sheet_index == 1:
+                    candidate = self.content_types.types["worksheet"]
+                    if candidate:
+                        sheet_file = self._filehandle(candidate)
+                        if sheet_file is not None:
+                            sheet_path = candidate
                 if sheet_file is None:
-                    sheet_path = None
-            if sheet_path is None:
-                sheet_path = "/xl/worksheets/worksheet%i.xml" % sheet_index
-                sheet_file = self._filehandle(sheet_path)
-                if sheet_file is None:
-                    sheet_path = None
-            if sheet_path is None and sheet_index == 1:
-                sheet_path = self.content_types.types["worksheet"]
-                sheet_file = self._filehandle(sheet_path)
-                if sheet_file is None:
-                    sheet_path = None
-            if sheet_file is None and sheet_path is not None:
-                sheet_file = self._filehandle(sheet_path)
-            if sheet_file is None:
-                raise SheetNotFoundException("Sheet %i not found" % sheet_index)
+                    raise SheetNotFoundException("Sheet %i not found" % sheet_index)
             sheet = Sheet(self.workbook, self.shared_strings, self.styles, sheet_file)
             try:
                 relationships_path = os.path.join(os.path.dirname(sheet_path),
@@ -435,6 +546,59 @@ class Xlsx2csv:
         finally:
             if closefile:
                 outfile.close()
+
+    def _resolve_sheet_relation(self, relation_id):
+        # type: (str) -> Optional[str]
+        """Resolve a workbook sheet relationship to an in-package part path.
+
+        The relationship declared in the workbook's .rels is authoritative:
+        the worksheet is located through its Target instead of a guessed
+        directory. Returns the absolute package part path (starting with '/').
+
+        Distinct exceptions make the failing relationship easy to locate:
+          * SheetRelationshipMissingException - the id is unknown or has no
+            target (the referenced target cannot be found in the declaration)
+          * SheetRelationshipTypeException - the target exists but the
+            relationship is not a worksheet relationship (wrong type)
+          * ExternalSheetTargetException - an external URL / TargetMode
+          * SheetTargetOutsidePackageException - a path escaping the package
+        None of these ever touches the host file system.
+        """
+        relationship = self.workbook.relationships.relationships.get(relation_id)
+        if relationship is None:
+            raise SheetRelationshipMissingException(
+                relation_id, None,
+                "Workbook references a relationship that is not declared")
+
+        target = relationship.get('target')
+        if not target:
+            raise SheetRelationshipMissingException(
+                relation_id, target,
+                "Relationship declares no target")
+
+        target_mode = relationship.get('target_mode')
+        if target_mode and target_mode.lower() == EXTERNAL_RELATION_MODE.lower():
+            raise ExternalSheetTargetException(
+                relation_id, target,
+                "Relationship target is external and is not part of the package")
+        if _is_external_target(target):
+            raise ExternalSheetTargetException(
+                relation_id, target,
+                "Relationship target is an external address and cannot be read from the package")
+
+        rel_type = relationship.get('type')
+        if rel_type and not rel_type.endswith(WORKSHEET_RELATION_TYPE):
+            raise SheetRelationshipTypeException(
+                relation_id, target,
+                "Relationship type is not a worksheet")
+
+        workbook_path = self.content_types.types["workbook"] or DEFAULT_WORKBOOK_PATH
+        try:
+            return resolve_package_target(workbook_path, target)
+        except SheetTargetOutsidePackageException:
+            raise SheetTargetOutsidePackageException(
+                relation_id, target,
+                "Relationship target escapes the package root")
 
     def _filehandle(self, filename):
         for name in filter(lambda f: filename and f.lower() == filename.lower()[1:], self.ziphandle.namelist()):
@@ -581,9 +745,11 @@ class Relationships:
             if rId:
                 vtype = attrs.get('Type')
                 target = attrs.get('Target')
+                target_mode = attrs.get('TargetMode')
                 self.relationships[str(rId.value)] = {
                     "type": vtype and str(vtype.value) or None,
-                    "target": target and str(target.value) or None
+                    "target": target and str(target.value) or None,
+                    "target_mode": target_mode and str(target_mode.value) or None
                 }
 
 
@@ -1278,6 +1444,10 @@ def main():
                         help="include hidden rows")
     parser.add_argument("--continue-on-error", dest="continue_on_error", default=False, action="store_true",
                         help="continue processing remaining files when an error occurs during batch processing")
+    parser.add_argument("--strict-sheet-relationships", dest="strict_sheet_relationships", default=False, action="store_true",
+                        help="locate worksheets strictly through their declared relationships and fail with a "
+                             "specific error when a relationship is missing, has the wrong type, points outside "
+                             "the package, or references an external address instead of falling back")
     parser.add_argument("--ignore-percentage", dest="ignore_percentage", default=False, action="store_true",
                         help="ignore percentage formatting and output raw values")
 
@@ -1358,7 +1528,8 @@ def main():
         'lineterminator': options.lineterminator,
         'ignore_formats': options.ignore_formats,
         'skip_hidden_rows': not options.include_hidden_rows,
-        'ignore_percentage': options.ignore_percentage
+        'ignore_percentage': options.ignore_percentage,
+        'strict_sheet_relationships': options.strict_sheet_relationships
     }
     sheetid = options.sheetid
     if options.all:

@@ -1,4 +1,17 @@
 unreleased:
+ * Locate worksheets through the relationship Target declared in the workbook
+   instead of guessing fixed directories, so exports that place sheets in
+   uncommon package paths (e.g. xl/custom/spaces/table1.xml) convert correctly;
+   relative and absolute in-package targets are resolved against the workbook part
+ * Reject relationship targets that point outside the package: external addresses
+   (absolute URLs or TargetMode="External") raise ExternalSheetTargetException and
+   targets escaping the package root via ".." raise SheetTargetOutsidePackageException,
+   so the host file system is never accessed
+ * Add a strict reading mode (--strict-sheet-relationships / strict_sheet_relationships
+   option) with distinct, locatable errors for a missing relationship or target
+   (SheetRelationshipMissingException), a non-worksheet relationship type
+   (SheetRelationshipTypeException), an external target, and an out-of-package target;
+   the default mode keeps the previous lenient fallback to conventional sheet locations
  * Fix custom number formats with quoted literal text (e.g. 0 "pcs", 0.0 "mm", #,##0 "days")
    being misdetected as dates, or having the literal text counted as decimal places
  * Fix date1904="0" in workbookPr being treated as the 1904 date system (only "1" and "true" enable it)

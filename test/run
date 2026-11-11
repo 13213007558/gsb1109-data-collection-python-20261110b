@@ -117,3 +117,220 @@ def test_dir_sheetname():
     print("OK: dir_sheetname")
 
 test_dir_sheetname()
+
+
+def test_sheet_relationships():
+    # Worksheets must be located through their declared relationship Target,
+    # and a relationship that is missing, wrongly typed, external or escaping
+    # the package root must be reported with a distinct, locatable error.
+    import zipfile, tempfile, shutil
+    from io import StringIO
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, repo_root)
+    import xlsx2csv
+
+    NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    WS_TYPE = NS_REL + "/worksheet"
+    STYLES_TYPE = NS_REL + "/styles"
+    CT_WB = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+    CT_REL = "application/vnd.openxmlformats-package.relationships+xml"
+    CT_WS = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+
+    def worksheet_xml(value):
+        return ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<worksheet xmlns="%s"><sheetData><row r="1">'
+                '<c r="A1" t="inlineStr"><is><t>%s</t></is></c>'
+                '</row></sheetData></worksheet>' % (NS_MAIN, value))
+
+    def workbook_xml(rid):
+        return ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<workbook xmlns="%s" xmlns:r="%s">'
+                '<sheets><sheet name="Odd" sheetId="1" r:id="%s"/></sheets>'
+                '</workbook>' % (NS_MAIN, NS_REL, rid))
+
+    def rels_xml(relationships):
+        body = ""
+        for rid, rtype, target, mode in relationships:
+            target_attr = (' Target="%s"' % target) if target is not None else ""
+            mode_attr = (' TargetMode="%s"' % mode) if mode else ""
+            body += '<Relationship Id="%s" Type="%s"%s%s/>' % (rid, rtype, target_attr, mode_attr)
+        return ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">%s</Relationships>' % body)
+
+    def content_types_xml(parts):
+        overrides = "".join(
+            '<Override PartName="%s" ContentType="%s"/>' % (name, ctype) for name, ctype in parts)
+        return ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">%s</Types>' % overrides)
+
+    def build(path, files, wb_part, rels_part, ws_parts):
+        ct_parts = [(wb_part, CT_WB), (rels_part, CT_REL)] + [(part, CT_WS) for part in ws_parts]
+        all_files = dict(files)
+        all_files["[Content_Types].xml"] = content_types_xml(ct_parts)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in all_files.items():
+                archive.writestr(name.lstrip("/"), data)
+
+    def convert(path, strict=False):
+        out = StringIO()
+        with xlsx2csv.Xlsx2csv(path, strict_sheet_relationships=strict) as conv:
+            conv.convert(out, sheetid=1)
+        return out.getvalue()
+
+    def expect_error(path, strict, exc_type, fragments):
+        try:
+            convert(path, strict=strict)
+        except exc_type as exc:
+            message = str(exc)
+            for fragment in fragments:
+                if fragment not in message:
+                    print("FAILED: sheet relationship message missing '%s': %s" % (fragment, message))
+                    sys.exit(1)
+            return
+        print("FAILED: expected %s for %s" % (exc_type.__name__, path))
+        sys.exit(1)
+
+    tmp = tempfile.mkdtemp()
+    try:
+        def p(name):
+            return os.path.join(tmp, name)
+
+        wb_part = "/xl/workbook.xml"
+        rels_part = "/xl/_rels/workbook.xml.rels"
+        base_files = {
+            "xl/workbook.xml": workbook_xml("rId1"),
+        }
+
+        # 1. normal relative Target into an uncommon package path still converts
+        files = dict(base_files)
+        files["xl/_rels/workbook.xml.rels"] = rels_xml([("rId1", WS_TYPE, "custom/spaces/table1.xml", None)])
+        files["xl/custom/spaces/table1.xml"] = worksheet_xml("hello")
+        build(p("ok_relative.xlsx"), files, wb_part, rels_part, ["/xl/custom/spaces/table1.xml"])
+        if convert(p("ok_relative.xlsx")) != "hello\n":
+            print("FAILED: relative relationship target not followed")
+            sys.exit(1)
+        if convert(p("ok_relative.xlsx"), strict=True) != "hello\n":
+            print("FAILED: strict mode broke a valid relative target")
+            sys.exit(1)
+
+        # 2. absolute in-package Target
+        files = dict(base_files)
+        files["xl/_rels/workbook.xml.rels"] = rels_xml([("rId1", WS_TYPE, "/xl/custom/spaces/table2.xml", None)])
+        files["xl/custom/spaces/table2.xml"] = worksheet_xml("abs")
+        build(p("ok_absolute.xlsx"), files, wb_part, rels_part, ["/xl/custom/spaces/table2.xml"])
+        if convert(p("ok_absolute.xlsx"), strict=True) != "abs\n":
+            print("FAILED: absolute package target not followed")
+            sys.exit(1)
+
+        # 3. relative Target containing '..' that stays inside the package
+        files = dict(base_files)
+        files["xl/_rels/workbook.xml.rels"] = rels_xml([("rId1", WS_TYPE, "../xl/custom/spaces/table1.xml", None)])
+        files["xl/custom/spaces/table1.xml"] = worksheet_xml("dotdot")
+        build(p("ok_dotdot.xlsx"), files, wb_part, rels_part, ["/xl/custom/spaces/table1.xml"])
+        if convert(p("ok_dotdot.xlsx"), strict=True) != "dotdot\n":
+            print("FAILED: in-package '..' target rejected")
+            sys.exit(1)
+
+        # 4. declared target part is absent from the package
+        files = dict(base_files)
+        files["xl/_rels/workbook.xml.rels"] = rels_xml([("rId1", WS_TYPE, "missing/sheet.xml", None)])
+        build(p("missing_part.xlsx"), files, wb_part, rels_part, [])
+        expect_error(p("missing_part.xlsx"), True, xlsx2csv.SheetRelationshipMissingException,
+                     ["rId1", "missing/sheet.xml"])
+        expect_error(p("missing_part.xlsx"), False, xlsx2csv.SheetNotFoundException, [])
+
+        # 5. relationship exists but has the wrong (non-worksheet) type
+        files = dict(base_files)
+        files["xl/_rels/workbook.xml.rels"] = rels_xml([("rId1", STYLES_TYPE, "styles.xml", None)])
+        files["xl/styles.xml"] = "<styleSheet xmlns=\"%s\"/>" % NS_MAIN
+        build(p("wrong_type.xlsx"), files, wb_part, rels_part, [])
+        expect_error(p("wrong_type.xlsx"), True, xlsx2csv.SheetRelationshipTypeException,
+                     ["rId1", "styles.xml"])
+        expect_error(p("wrong_type.xlsx"), False, xlsx2csv.SheetNotFoundException, [])
+
+        # 6. external target declared with TargetMode="External"
+        files = dict(base_files)
+        files["xl/_rels/workbook.xml.rels"] = rels_xml(
+            [("rId1", WS_TYPE, "http://evil.example.com/sheet1.xml", "External")])
+        build(p("external_mode.xlsx"), files, wb_part, rels_part, [])
+        expect_error(p("external_mode.xlsx"), True, xlsx2csv.ExternalSheetTargetException,
+                     ["rId1", "http://evil.example.com/sheet1.xml"])
+        expect_error(p("external_mode.xlsx"), False, xlsx2csv.SheetNotFoundException, [])
+
+        # 7. plain external URL / file URL without TargetMode must also be refused
+        for url in ("https://evil.example.org/sheet.xml", "file:///host/secret.xml"):
+            files = dict(base_files)
+            files["xl/_rels/workbook.xml.rels"] = rels_xml([("rId1", WS_TYPE, url, None)])
+            name = "external_" + str(abs(hash(url))) + ".xlsx"
+            build(p(name), files, wb_part, rels_part, [])
+            expect_error(p(name), True, xlsx2csv.ExternalSheetTargetException, ["rId1", url])
+
+        # 8. relative target climbing above the package root must never touch the host fs
+        files = dict(base_files)
+        files["xl/_rels/workbook.xml.rels"] = rels_xml([("rId1", WS_TYPE, "../../../../etc/passwd", None)])
+        build(p("traversal.xlsx"), files, wb_part, rels_part, [])
+        expect_error(p("traversal.xlsx"), True, xlsx2csv.SheetTargetOutsidePackageException,
+                     ["rId1", "../../../../etc/passwd"])
+        expect_error(p("traversal.xlsx"), False, xlsx2csv.SheetNotFoundException, [])
+
+        # 9. workbook points at an undeclared relationship id
+        files = {
+            "xl/workbook.xml": workbook_xml("rId9"),
+            "xl/_rels/workbook.xml.rels": rels_xml([("rId1", WS_TYPE, "custom/spaces/table1.xml", None)]),
+            "xl/custom/spaces/table1.xml": worksheet_xml("hello"),
+        }
+        build(p("unknown_id.xlsx"), files, wb_part, rels_part, ["/xl/custom/spaces/table1.xml"])
+        expect_error(p("unknown_id.xlsx"), True, xlsx2csv.SheetRelationshipMissingException, ["rId9"])
+
+        # 10. relationship without a Target attribute
+        files = dict(base_files)
+        files["xl/_rels/workbook.xml.rels"] = rels_xml([("rId1", WS_TYPE, None, None)])
+        build(p("no_target.xlsx"), files, wb_part, rels_part, [])
+        expect_error(p("no_target.xlsx"), True, xlsx2csv.SheetRelationshipMissingException, ["rId1"])
+
+        # the failure modes are distinct but share one locatable base type
+        distinct = (xlsx2csv.SheetRelationshipMissingException,
+                    xlsx2csv.SheetRelationshipTypeException,
+                    xlsx2csv.ExternalSheetTargetException,
+                    xlsx2csv.SheetTargetOutsidePackageException)
+        if len(set(distinct)) != len(distinct):
+            print("FAILED: relationship exception classes are not distinct")
+            sys.exit(1)
+        for exc_type in distinct:
+            if not issubclass(exc_type, xlsx2csv.SheetRelationshipException):
+                print("FAILED: %s not a SheetRelationshipException" % exc_type.__name__)
+                sys.exit(1)
+
+        # helper-level checks for external recognition and package-root containment
+        for external in ("http://a/x", "https://a/x", "file:///x", "C:\\\\x", "\\\\\\\\host\\\\share"):
+            if not xlsx2csv._is_external_target(external):
+                print("FAILED: external target not detected: %s" % external)
+                sys.exit(1)
+        if xlsx2csv._is_external_target("worksheets/sheet1.xml"):
+            print("FAILED: internal target misdetected as external")
+            sys.exit(1)
+        try:
+            xlsx2csv.resolve_package_target("/xl/workbook.xml", "../../etc/passwd")
+        except xlsx2csv.SheetTargetOutsidePackageException:
+            pass
+        else:
+            print("FAILED: traversal not rejected by resolve_package_target")
+            sys.exit(1)
+
+        # CLI: strict mode accepts a valid package and rejects an external target
+        ok = subprocess.run([sys.executable, "./xlsx2csv.py", "--strict-sheet-relationships",
+                             p("ok_relative.xlsx")], capture_output=True)
+        if ok.returncode != 0 or ok.stdout.decode("utf-8") != "hello\n":
+            print("FAILED: CLI strict mode on valid package: %s" % ok.stderr.decode("utf-8"))
+            sys.exit(1)
+        bad = subprocess.run([sys.executable, "./xlsx2csv.py", "--strict-sheet-relationships",
+                              p("external_mode.xlsx")], capture_output=True)
+        if bad.returncode == 0 or "external" not in bad.stderr.decode("utf-8").lower():
+            print("FAILED: CLI strict mode did not reject external target")
+            sys.exit(1)
+    finally:
+        shutil.rmtree(tmp)
+    print("OK: test_sheet_relationships")
+
+test_sheet_relationships()
