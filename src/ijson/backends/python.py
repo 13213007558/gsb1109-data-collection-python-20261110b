@@ -140,7 +140,7 @@ inf = float("inf")
 neg_inf = float("-inf")
 
 @utils.coroutine
-def parse_value(target, multivalue, use_float):
+def parse_value(target, multivalue, use_float, number_lexeme=False):
     """
     Parses results coming out of the Lexer into ijson events, which are sent to
     `target`. A stack keeps track of the type of object being parsed at the time
@@ -247,6 +247,8 @@ def parse_value(target, multivalue, use_float):
                         raise
                     raise UnexpectedSymbol(symbol, pos)
                 else:
+                    if number_lexeme:
+                        number = common.NumberLexeme(number, symbol)
                     send(('number', number))
                     pop()
 
@@ -289,7 +291,7 @@ def parse_string(symbol):
 
 
 def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
-                         use_float=False):
+                         use_float=False, number_lexeme=False):
     '''
     Iterator yielding unprefixed events.
 
@@ -299,7 +301,7 @@ def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
     '''
     if allow_comments:
         raise ValueError("Comments are not supported by the python backend")
-    return utf8_encoder(Lexer(parse_value(target, multiple_values, use_float)))
+    return utf8_encoder(Lexer(parse_value(target, multiple_values, use_float, number_lexeme)))
 
 
 common.enrich_backend(globals(), c_comments=False)

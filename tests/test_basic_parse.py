@@ -195,3 +195,61 @@ def test_multiple_values(adaptor):
         adaptor.basic_parse(multiple_json, multiple_values=False)
     result = adaptor.basic_parse(multiple_json, multiple_values=True)
     assert JSON_EVENTS + JSON_EVENTS + JSON_EVENTS == result
+
+
+@pytest.mark.parametrize(
+    "json, expected_value, expected_lexeme",
+    (
+        (b'1.2300', Decimal('1.2300'), '1.2300'),
+        (b'123e-2', Decimal('123e-2'), '123e-2'),
+        (b'-0', 0, '-0'),
+        (b'1E2', Decimal('1E2'), '1E2'),
+        (b'42', 42, '42'),
+        (b'-17.5e+10', Decimal('-17.5e+10'), '-17.5e+10'),
+    )
+)
+def test_number_lexeme(adaptor, json, expected_value, expected_lexeme):
+    """number_lexeme=True reports both the numeric value and the original lexeme"""
+    if not adaptor.backend.capabilities.number_lexeme:
+        pytest.skip("backend doesn't support number_lexeme")
+    events = adaptor.basic_parse(json, number_lexeme=True)
+    assert 1 == len(events)
+    event, value = events[0]
+    assert 'number' == event
+    assert isinstance(value, common.NumberLexeme)
+    assert expected_value == value.value
+    assert expected_lexeme == value.lexeme
+    assert (expected_value, expected_lexeme) == value
+
+
+def test_number_lexeme_default_unchanged(adaptor):
+    """Without number_lexeme, number events keep their usual values"""
+    events = adaptor.basic_parse(b'[1.2300, -0, 123e-2]')
+    values = [value for event, value in events if event == 'number']
+    assert [Decimal('1.2300'), 0, Decimal('123e-2')] == values
+    assert not any(isinstance(value, common.NumberLexeme) for value in values)
+
+
+def test_number_lexeme_quoted_strings_stay_strings(adaptor):
+    """Quoted numbers are still strings, even with number_lexeme=True"""
+    if not adaptor.backend.capabilities.number_lexeme:
+        pytest.skip("backend doesn't support number_lexeme")
+    events = adaptor.basic_parse(b'["123", "1.2300"]', number_lexeme=True)
+    values = [value for event, value in events if event == 'string']
+    assert ['123', '1.2300'] == values
+
+
+def test_number_lexeme_parse(adaptor):
+    """number_lexeme values also flow through the parse routine"""
+    if not adaptor.backend.capabilities.number_lexeme:
+        pytest.skip("backend doesn't support number_lexeme")
+    events = adaptor.parse(b'{"a": 1.2300}', number_lexeme=True)
+    assert ('a', 'number', common.NumberLexeme(Decimal('1.2300'), '1.2300')) in events
+
+
+def test_number_lexeme_raises_if_not_supported(adaptor):
+    """Backends not supporting number_lexeme must raise instead of faking lexemes"""
+    if adaptor.backend.capabilities.number_lexeme:
+        pytest.skip("backend supports number_lexeme")
+    with pytest.raises(ValueError):
+        adaptor.basic_parse(b'1', number_lexeme=True)

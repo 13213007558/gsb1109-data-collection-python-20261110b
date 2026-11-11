@@ -2,6 +2,15 @@
 
 ## Development
 
+* Added a new `number_lexeme` option (defaults to `False`).
+  When enabled, `number` events carry a `NumberLexeme` named tuple
+  with both the parsed numeric `value` and the original `lexeme`
+  as it appeared in the input (e.g., `1.2300`, `123e-2`, `-0`),
+  even when the number spans multiple read chunks.
+  Backends unable to provide the original lexeme
+  (currently only `yajl2_c`) raise a `ValueError` instead,
+  as do the `yajl`, `yajl2` and `yajl2_cffi` backends
+  when combined with `use_float=True`.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

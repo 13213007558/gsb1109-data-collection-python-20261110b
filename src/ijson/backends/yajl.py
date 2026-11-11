@@ -20,7 +20,7 @@ class Config(Structure):
 
 @utils.coroutine
 def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
-                         use_float=False):
+                         use_float=False, number_lexeme=False):
     '''
     Iterator yielding unprefixed events.
 
@@ -33,7 +33,9 @@ def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
     '''
     if multiple_values:
         raise ValueError("yajl backend doesn't support multiple_values")
-    callbacks, _keepalive, pending = _yajl2_ctypes_common.make_callbaks(target.send, use_float, 1)
+    if number_lexeme and use_float:
+        raise ValueError("number_lexeme cannot be combined with use_float in the yajl backend")
+    callbacks, _keepalive, pending = _yajl2_ctypes_common.make_callbaks(target.send, use_float, 1, number_lexeme)
     config = Config(allow_comments, True)
     handle = yajl.yajl_alloc(byref(callbacks), byref(config), None, None)
     try:

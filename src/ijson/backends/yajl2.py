@@ -17,7 +17,7 @@ YAJL_MULTIPLE_VALUES = 8
 
 @utils.coroutine
 def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
-                         use_float=False):
+                         use_float=False, number_lexeme=False):
     '''
     Iterator yielding unprefixed events.
 
@@ -28,7 +28,9 @@ def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
     - buf_size: a size of an input buffer
     - multiple_values: allows the parser to parse multiple JSON objects
     '''
-    callbacks, _keepalive, pending = _yajl2_ctypes_common.make_callbaks(target.send, use_float, 2)
+    if number_lexeme and use_float:
+        raise ValueError("number_lexeme cannot be combined with use_float in the yajl2 backend")
+    callbacks, _keepalive, pending = _yajl2_ctypes_common.make_callbaks(target.send, use_float, 2, number_lexeme)
     handle = yajl.yajl_alloc(byref(callbacks), None, None)
     if allow_comments:
         yajl.yajl_config(handle, YAJL_ALLOW_COMMENTS, 1)

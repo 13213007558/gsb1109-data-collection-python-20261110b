@@ -62,9 +62,16 @@ class PendingException:
         if exception is not None:
             raise exception
 
-def _make_callback(send, use_float, pending, field, event, func_type, func):
+def _make_callback(send, use_float, pending, field, event, func_type, func,
+                   number_lexeme=False):
     if use_float and field == 'number':
         return func_type()
+    if number_lexeme and field == 'number':
+        # The yajl "number" callback receives the original lexeme;
+        # report it alongside the parsed value
+        def func(v, l):
+            lexeme = string_at(v, l).decode('utf-8')
+            return common.NumberLexeme(common.integer_or_decimal(lexeme), lexeme)
     def c_callback(_context, *args):
         try:
             send((event, func(*args)))
@@ -74,12 +81,12 @@ def _make_callback(send, use_float, pending, field, event, func_type, func):
         return 1
     return func_type(c_callback)
 
-def make_callbaks(send, use_float, yajl_version):
+def make_callbaks(send, use_float, yajl_version, number_lexeme=False):
     callback_data = _get_callback_data(yajl_version)
     class Callbacks(Structure):
         _fields_ = [(name, type) for name, _, type, _ in callback_data]
     pending = PendingException()
-    callbacks = Callbacks(*[_make_callback(send, use_float, pending, *data) for data in callback_data])
+    callbacks = Callbacks(*[_make_callback(send, use_float, pending, *data, number_lexeme=number_lexeme) for data in callback_data])
     return callbacks, _all_cfunct_types, pending
 
 def yajl_get_error(yajl, handle, buffer):

@@ -119,6 +119,13 @@ def number(val, length):
     return common.integer_or_decimal(ffi.string(val, maxlen=length).decode("utf-8"))
 
 
+@ffi.callback('int(void *ctx, const char *numberVal, size_t numberLen)')
+@append_event_to_ctx('number')
+def number_with_lexeme(val, length):
+    lexeme = ffi.string(val, maxlen=length).decode("utf-8")
+    return common.NumberLexeme(common.integer_or_decimal(lexeme), lexeme)
+
+
 @ffi.callback('int(void *ctx, const unsigned char *stringVal, size_t stringLen)')
 @append_event_to_ctx('string')
 def string(val, length):
@@ -161,18 +168,28 @@ _decimal_callback_data = (
     start_map, map_key, end_map, start_array, end_array
 )
 
+_decimal_lexeme_callback_data = (
+    null, boolean, ffi.NULL, ffi.NULL, number_with_lexeme, string,
+    start_map, map_key, end_map, start_array, end_array
+)
+
 _float_callback_data = (
     null, boolean, integer, double, ffi.NULL, string,
     start_map, map_key, end_map, start_array, end_array
 )
 
 
-def yajl_init(scope, send, allow_comments=False, multiple_values=False, use_float=False):
+def yajl_init(scope, send, allow_comments=False, multiple_values=False, use_float=False,
+              number_lexeme=False):
     scope.send = send
     scope.exception = None
     scope.ctx = ffi.new_handle(scope)
     if use_float:
+        if number_lexeme:
+            raise ValueError("number_lexeme cannot be combined with use_float in the yajl2_cffi backend")
         scope.callbacks = ffi.new('yajl_callbacks*', _float_callback_data)
+    elif number_lexeme:
+        scope.callbacks = ffi.new('yajl_callbacks*', _decimal_lexeme_callback_data)
     else:
         scope.callbacks = ffi.new('yajl_callbacks*', _decimal_callback_data)
     handle = yajl.yajl_alloc(scope.callbacks, ffi.NULL, scope.ctx)

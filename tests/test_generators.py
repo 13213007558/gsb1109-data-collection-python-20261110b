@@ -1,4 +1,5 @@
 import io
+from decimal import Decimal
 
 import pytest
 
@@ -52,6 +53,17 @@ def test_boundary_whitespace(backend):
     buf_size = JSON.index(b'   ') + 1
     events = list(backend.basic_parse_gen(io.BytesIO(JSON), buf_size=buf_size))
     assert events == JSON_EVENTS
+
+@pytest.mark.parametrize("buf_size", range(1, 8))
+def test_number_lexeme_split_exponent(backend, buf_size):
+    """A number lexeme split across reads, even mid-exponent, is reported whole"""
+    if not backend.capabilities.number_lexeme:
+        pytest.skip("backend doesn't support number_lexeme")
+    events = list(backend.basic_parse(
+        io.BytesIO(b'[123e-2]'), buf_size=buf_size, number_lexeme=True
+    ))
+    numbers = [value for event, value in events if event == 'number']
+    assert [common.NumberLexeme(Decimal('123e-2'), '123e-2')] == numbers
 
 def test_item_building_greediness(backend):
     _test_item_iteration_validity(backend, io.BytesIO)

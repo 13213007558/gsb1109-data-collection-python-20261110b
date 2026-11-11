@@ -4,6 +4,7 @@ Backend independent higher level interfaces, common exceptions.
 import decimal
 import inspect
 import io
+import typing
 import warnings
 
 from ijson import compat, utils, utils35
@@ -21,6 +22,18 @@ class IncompleteJSONError(JSONError):
     Raised when the parser can't read expected data from a stream.
     '''
     pass
+
+
+class NumberLexeme(typing.NamedTuple):
+    '''
+    Value of a ``number`` event when parsing with ``number_lexeme=True``.
+
+    Carries both the parsed numeric ``value`` (an int, Decimal or float,
+    depending on the parsing options) and the ``lexeme``, i.e. the exact
+    textual representation of the number as it appeared in the JSON input.
+    '''
+    value: typing.Any
+    lexeme: str
 
 
 @utils.coroutine
@@ -481,6 +494,7 @@ class BackendCapabilities:
         'invalid_leading_zeros_detection': 'Detection of leading zeros in numbers, marking them as invalid',
         'incomplete_json_tokens_detection': 'Documents with incomplete JSON tokens',
         'int64': '64 bit integers supported when running with ``use_float=True``',
+        'number_lexeme': 'Reporting of the original lexeme of numbers via ``number_lexeme=True``',
     }
 
     def __init__(self):
@@ -489,6 +503,7 @@ class BackendCapabilities:
         self.invalid_leading_zeros_detection = True
         self.incomplete_json_tokens_detection = True
         self.int64 = True
+        self.number_lexeme = True
 
 
 def enrich_backend(backend, **capabilities_overrides):
