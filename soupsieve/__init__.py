@@ -88,12 +88,20 @@ def closest(
     namespaces: dict[str, str] | None = None,
     flags: int = 0,
     *,
+    boundary: bs4.Tag | None = None,
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
     **kwargs: Any
 ) -> bs4.Tag | None:
-    """Match closest ancestor."""
+    """
+    Match closest ancestor.
+
+    When ``boundary`` is given, it is an inclusive ancestor that the search is not allowed to
+    cross: only the boundary itself and its descendants may match, and complex selectors may not
+    borrow ancestors outside of it. If ``tag`` is not within ``boundary``, nothing is returned
+    instead of searching the rest of the tree.
+    """
 
     return compile(
         select,
@@ -103,7 +111,7 @@ def closest(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).closest(tag)
+    ).closest(tag, boundary=boundary)
 
 
 def match(

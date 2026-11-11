@@ -375,6 +375,104 @@ class TestSoupSieve(util.TestCase):
         self.assertTrue(sv.closest('div #div-05', el) is None)
         self.assertTrue(sv.closest('a', el) is None)
 
+    def _get_boundary_soup(self):
+        """Build a document with a recommendation region nested inside the main product."""
+
+        markup = """
+        <article id="main-product" class="product">
+          <h1 id="main-title">Main product</h1>
+          <section id="recs" class="recommendations">
+            <div id="rec-card" class="product-card">
+              <b id="rec-b">b</b>
+              <a id="rec-title" class="title">Recommended item</a>
+              <div id="rec-inner"><span id="rec-span">s</span></div>
+            </div>
+          </section>
+          <div id="other-region">other</div>
+        </article>
+        """
+        return self.soup(markup, 'html.parser')
+
+    def test_closest_boundary_is_inclusive(self):
+        """The boundary element itself is allowed to match."""
+
+        soup = self._get_boundary_soup()
+        title = sv.select_one('#rec-title', soup)
+        boundary = sv.select_one('#recs', soup)
+        for flags in (0, sv.NOCACHE):
+            self.assertEqual(sv.closest('section', title, boundary=boundary, flags=flags), boundary)
+
+    def test_closest_boundary_allows_internal_matches(self):
+        """Simple and complex selectors satisfied inside the boundary still match."""
+
+        soup = self._get_boundary_soup()
+        title = sv.select_one('#rec-title', soup)
+        span = sv.select_one('#rec-span', soup)
+        boundary = sv.select_one('#recs', soup)
+        for flags in (0, sv.NOCACHE):
+            self.assertEqual(sv.closest('.product-card', title, boundary=boundary, flags=flags)['id'], 'rec-card')
+            self.assertEqual(sv.closest('div a', title, boundary=boundary, flags=flags)['id'], 'rec-title')
+            self.assertEqual(sv.closest('b + a', title, boundary=boundary, flags=flags)['id'], 'rec-title')
+            self.assertEqual(sv.closest('div span', span, boundary=boundary, flags=flags)['id'], 'rec-span')
+
+    def test_closest_boundary_blocks_outside_ancestor(self):
+        """Complex selectors cannot borrow an ancestor that is outside of the boundary."""
+
+        soup = self._get_boundary_soup()
+        title = sv.select_one('#rec-title', soup)
+        span = sv.select_one('#rec-span', soup)
+        boundary = sv.select_one('#recs', soup)
+        for flags in (0, sv.NOCACHE):
+            # The `.product` and `article` ancestors live outside the recommendation region.
+            self.assertIsNone(sv.closest('.product .title', title, boundary=boundary, flags=flags))
+            self.assertIsNone(sv.closest('article .title', title, boundary=boundary, flags=flags))
+            self.assertIsNone(sv.closest('article > section span', span, boundary=boundary, flags=flags))
+            self.assertIsNone(sv.closest(':is(article a)', title, boundary=boundary, flags=flags))
+            # `:not()` may not use the outside ancestor to negate a match either.
+            self.assertEqual(sv.closest('a:not(article a)', title, boundary=boundary, flags=flags)['id'], 'rec-title')
+
+    def test_closest_boundary_blocks_sibling_escape(self):
+        """Sibling and `:has()` combinators cannot reach outside of the boundary through its parent."""
+
+        soup = self._get_boundary_soup()
+        title = sv.select_one('#rec-title', soup)
+        boundary = sv.select_one('#recs', soup)
+        for flags in (0, sv.NOCACHE):
+            # The boundary has no sibling inside itself, so these can only match by escaping it.
+            self.assertIsNone(sv.closest('section:has(~ h1)', title, boundary=boundary, flags=flags))
+            self.assertIsNone(sv.closest('h1 ~ section', title, boundary=boundary, flags=flags))
+            # Descendants of the boundary remain reachable through `:has()`.
+            self.assertEqual(sv.closest('section:has(div)', title, boundary=boundary, flags=flags)['id'], 'recs')
+
+    def test_closest_boundary_input_outside(self):
+        """A node outside the boundary returns nothing instead of searching the whole tree."""
+
+        soup = self._get_boundary_soup()
+        boundary = sv.select_one('#recs', soup)
+        outside = sv.select_one('#other-region', soup)
+        main = sv.select_one('#main-product', soup)
+        for flags in (0, sv.NOCACHE):
+            self.assertIsNone(sv.closest('div', outside, boundary=boundary, flags=flags))
+            self.assertIsNone(sv.closest('.product', outside, boundary=boundary, flags=flags))
+            # An unrelated detached boundary never contains the input either.
+            self.assertIsNone(sv.closest('div', main, boundary=outside, flags=flags))
+
+    def test_closest_boundary_none_searches_tree(self):
+        """Omitting the boundary, or passing `None`, preserves the whole-tree ancestor search."""
+
+        soup = self._get_boundary_soup()
+        title = sv.select_one('#rec-title', soup)
+        self.assertEqual(sv.closest('.product .title', title)['id'], 'rec-title')
+        self.assertEqual(sv.closest('.product .title', title, boundary=None)['id'], 'rec-title')
+
+    def test_closest_boundary_invalid_type(self):
+        """A boundary that is not a tag raises a type error."""
+
+        soup = self._get_boundary_soup()
+        title = sv.select_one('#rec-title', soup)
+        with self.assertRaises(TypeError):
+            sv.closest('div', title, boundary='not-a-tag')
+
     def test_escape_hyphen(self):
         """Test escape hyphen cases."""
 

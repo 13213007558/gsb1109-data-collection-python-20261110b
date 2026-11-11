@@ -603,12 +603,17 @@ class CSSMatch(_DocumentNav):
         selectors: ct.SelectorList,
         scope: bs4.Tag | None,
         namespaces: ct.Namespaces | None,
-        flags: int
+        flags: int,
+        boundary: bs4.Tag | None = None
     ) -> None:
         """Initialize."""
 
         self.assert_valid_input(scope)
+        if boundary is not None:
+            self.assert_valid_input(boundary)
         self.tag = scope
+        # An optional inclusive ancestor that a `closest` search is not allowed to cross.
+        self.boundary = boundary
         self.cached_meta_lang: list[tuple[str, str]] = []
         self.cached_forms: dict[int, TreeForms] = {}
         self.cached_options: dict[int, dict[int, bool]] = {}
@@ -964,6 +969,10 @@ class CSSMatch(_DocumentNav):
         parent = self.get_parent(el, no_doc=False, no_template=False)
         if parent is None:
             return found
+        # Siblings share a parent, so they only leave the boundary when the element itself is the
+        # inclusive boundary, whose parent is above it.
+        if self.boundary is not None and el is self.boundary:
+            return found
         pkey = id(parent)
 
         # Check the cache to see if we already know where the first sibling is,
@@ -1024,6 +1033,10 @@ class CSSMatch(_DocumentNav):
         found = False
         visited: list[tuple[int, int]] = []
         parent: bs4.Tag | None = el
+        bounded = self.boundary is not None
+        # An element at the boundary has no ancestor that is allowed to match.
+        if bounded and el is self.boundary:
+            return found
         while not found and parent and (parent := self.get_parent(parent)):
             key = (id(parent), id(relation))
             if key in self.anc_cache:
@@ -1031,6 +1044,9 @@ class CSSMatch(_DocumentNav):
                 break
             visited.append(key)
             found = yield parent, relation
+            # The boundary is inclusive, but nothing above it may take part in the match.
+            if bounded and parent is self.boundary:
+                break
 
         for key in visited:
             self.anc_cache[key] = found
@@ -1049,12 +1065,17 @@ class CSSMatch(_DocumentNav):
             if self.enable_cache:
                 found = yield from self.match_ancestor(el, relation)
             else:
-                parent: bs4.Tag | None = el
-                while not found and parent and (parent := self.get_parent(parent)):
-                    found = parent is not None and (yield parent, relation)
+                # An element at the boundary has no ancestor that is allowed to match.
+                if self.boundary is None or el is not self.boundary:
+                    parent: bs4.Tag | None = el
+                    while not found and parent and (parent := self.get_parent(parent)):
+                        found = parent is not None and (yield parent, relation)
+                        if self.boundary is not None and parent is self.boundary:
+                            break
         elif relation[0].rel_type == REL_CLOSE_PARENT:
             parent = self.get_parent(el)
-            if parent is None:
+            # A boundary element's parent sits above the inclusive boundary.
+            if parent is None or (self.boundary is not None and el is self.boundary):
                 pass
             elif self.enable_cache:
                 # Siblings share the parent, so cache whether it matches to avoid evaluating it again for every child.
@@ -1071,12 +1092,16 @@ class CSSMatch(_DocumentNav):
             if self.enable_cache:
                 found = yield from self.match_general_sibling(el, relation)
             else:
-                sibling: bs4.Tag | None = el
-                while not found and sibling and (sibling := self.get_previous_tag(sibling)):
-                    found = sibling is not None and (yield sibling, relation)
+                # A boundary element has no sibling that is still inside the boundary.
+                if not (self.boundary is not None and el is self.boundary):
+                    sibling: bs4.Tag | None = el
+                    while not found and sibling and (sibling := self.get_previous_tag(sibling)):
+                        found = sibling is not None and (yield sibling, relation)
         elif relation[0].rel_type == REL_CLOSE_SIBLING:
             sibling = self.get_previous_tag(el)
-            found = sibling is not None and (yield sibling, relation)
+            # A boundary element has no sibling that is still inside the boundary.
+            if sibling is not None and not (self.boundary is not None and el is self.boundary):
+                found = sibling is not None and (yield sibling, relation)
         return found
 
     def match_future_child(
@@ -1157,13 +1182,15 @@ class CSSMatch(_DocumentNav):
         elif relation[0].rel_type == REL_HAS_SIBLING:
             if self.enable_cache:
                 found = yield from self.match_general_sibling(el, relation)
-            else:
+            elif not (self.boundary is not None and el is self.boundary):
                 sibling: bs4.Tag | None = el
                 while not found and sibling and (sibling := self.get_next_tag(sibling)):
                     found = yield sibling, relation
         elif relation[0].rel_type == REL_HAS_CLOSE_SIBLING:
             sibling = self.get_next_tag(el)
-            found = sibling is not None and (yield sibling, relation)
+            # A boundary element has no sibling that is still inside the boundary.
+            if sibling is not None and not (self.boundary is not None and el is self.boundary):
+                found = sibling is not None and (yield sibling, relation)
         return found
 
     def match_relations(self, el: bs4.Tag, relation: ct.SelectorList) -> MatchGenerator:
@@ -1225,6 +1252,24 @@ class CSSMatch(_DocumentNav):
         """Match element as scope."""
 
         return self.scope is el
+
+    def within_boundary(self, el: bs4.Tag | None) -> bool:
+        """
+        Check whether an element may take part in a bounded `closest` search.
+
+        The boundary is inclusive, so the boundary element itself is allowed, along with every
+        descendant of it. Complex selectors may only be satisfied by ancestors that are also within
+        the boundary, so an element outside of it cannot make a selector match.
+        """
+
+        if self.boundary is None:
+            return True
+        current = el
+        while current is not None:
+            if current is self.boundary:
+                return True
+            current = self.get_parent(current, no_doc=False, no_template=False)
+        return False
 
     def match_nth_tag_type(self, el: bs4.Tag, child: bs4.Tag) -> bool:
         """Match tag type for `nth` matches."""
@@ -2071,13 +2116,19 @@ class CSSMatch(_DocumentNav):
     def closest(self) -> bs4.Tag | None:
         """Match closest ancestor."""
 
+        # A boundary only applies when the input tag is actually inside it; otherwise the search
+        # is empty instead of falling back to searching the whole tree.
+        if not self.within_boundary(self.tag):
+            return None
+
         current: bs4.Tag | None = self.tag
         closest = None
         while closest is None and current is not None:
             if self.match(current):
                 closest = current
             else:
-                current = self.get_parent(current)
+                # The boundary is inclusive and may itself match, but the walk never crosses it.
+                current = None if current is self.boundary else self.get_parent(current)
         return closest
 
     def filter(self) -> list[bs4.Tag]:  # noqa A001
@@ -2128,10 +2179,10 @@ class SoupSieve(ct.Immutable):
 
         return CSSMatch(self.selectors, tag, self.namespaces, self.flags).match(tag)
 
-    def closest(self, tag: bs4.Tag) -> bs4.Tag | None:
-        """Match closest ancestor."""
+    def closest(self, tag: bs4.Tag, *, boundary: bs4.Tag | None = None) -> bs4.Tag | None:
+        """Match closest ancestor, optionally limiting the search to an inclusive boundary."""
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).closest()
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, boundary).closest()
 
     def filter(self, iterable: Iterable[bs4.Tag]) -> list[bs4.Tag]:  # noqa A001
         """

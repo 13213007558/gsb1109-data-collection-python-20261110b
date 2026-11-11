@@ -154,7 +154,7 @@ def iselect(select, node, namespaces=None, limit=0, flags=0, **kwargs):
 ## `soupsieve.closest()`
 
 ```py
-def closest(select, tag, namespaces=None, flags=0, **kwargs):
+def closest(select, tag, namespaces=None, flags=0, *, boundary=None, **kwargs):
     """Match closest ancestor to the provided tag."""
 ```
 
@@ -163,6 +163,24 @@ ancestor of the tag or the tag itself.
 
 `closest` accepts a CSS selector string, a `Tag`/`BeautifulSoup` object, an optional [namespace](#namespaces)
 dictionary, and `flags`.
+
+### Search Boundary
+
+Passing a `boundary` tag limits the search to an inclusive region of the tree. The boundary itself and every
+descendant of it are allowed to match, but the search never crosses above the boundary. This is useful when, for
+example, a product detail page embeds recommendation cards and the cards must be attributed to the recommendation
+region rather than the outer product.
+
+```py
+sv.closest('.product .title', node)                       # may match through the outer product
+sv.closest('.product .title', node, boundary=recommend)   # None unless the relation exists inside `recommend`
+```
+
+The boundary is enforced for the whole selector, so a complex selector cannot borrow an ancestor outside of it to
+match: descendant, child, and sibling combinators, as well as `:is()`, `:not()`, and `:has()`, are all confined to the
+boundary. If the input `tag` is not a descendant of (or equal to) `boundary`, `closest` returns `None` instead of
+searching the rest of the tree. When `boundary` is `None` (the default), the entire ancestor chain is searched as
+usual.
 
 ## `soupsieve.match()`
 
@@ -237,8 +255,8 @@ class SoupSieve:
     def match(self, tag):
         """Match."""
 
-    def closest(self, tag):
-        """Match closest ancestor."""
+    def closest(self, tag, *, boundary=None):
+        """Match closest ancestor, optionally limited to an inclusive boundary."""
 
     def filter(self, iterable):
         """Filter."""

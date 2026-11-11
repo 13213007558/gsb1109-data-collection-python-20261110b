@@ -3,6 +3,13 @@ icon: lucide/scroll-text
 ---
 # Changelog
 
+## Unreleased
+
+-   **NEW**: `closest()` now accepts a keyword-only `boundary` argument that confines the search to an inclusive
+    ancestor. The boundary element and its descendants may match, but the search never crosses above it, complex
+    selectors cannot borrow ancestors outside of it, and an input node outside of the boundary returns `None` instead
+    of searching the rest of the tree.
+
 ## 4.1
 
 -   **NEW**: Soup Sieve is now thread safe, and this is now tested, including on free-threaded Python. This is assuming
