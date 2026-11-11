@@ -87,6 +87,8 @@ Usage with a folder containing multiple `xlsx` files:
 ```
 will output each file in the input directory converted to `.csv` in the output directory. If omitting the output directory, it will output the converted files in the input directory.
 
+When exporting all sheets (`-a`/`-s 0`) to a directory, the batch is published atomically per workbook: sheets are staged in a temporary directory and moved into place only after every selected sheet converted successfully, so watchers never see a half-written batch. If a sheet fails, the previously published directory is left untouched and a `<outdir>.failed` marker file records which sheet failed and why. Output to standard output (or a stream) has no such guarantee: sheets are written as they are converted and a failure midway leaves partial output.
+
 Usage from within Python:
 ```
   from xlsx2csv import Xlsx2csv

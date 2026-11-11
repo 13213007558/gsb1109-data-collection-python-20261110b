@@ -26,7 +26,7 @@ __author__ = "Dilshod Temirkhodjaev <tdilshod@gmail.com>"
 __license__ = "MIT"
 __version__ = "0.8.6"
 
-import csv, datetime, zipfile, sys, os, re, signal, io
+import csv, datetime, zipfile, sys, os, re, signal, io, shutil, tempfile
 import xml.parsers.expat
 from decimal import Decimal, localcontext, ROUND_HALF_UP
 from xml.dom import minidom
@@ -292,65 +292,126 @@ class Xlsx2csv:
 
     def convert(self, outfile, sheetid=1, sheetname=None):
         # type: (Union[str, TextIO], int, Optional[str]) -> None
-        """outfile - path to file or filehandle"""
+        """outfile - path to file or filehandle
+
+        When converting all sheets (sheetid 0) the behavior depends on the
+        output target:
+          - directory path (string): the batch is published atomically per
+            workbook. Sheets are staged in a temporary directory and moved
+            into place only after every selected sheet converted
+            successfully. On failure a previously published directory is
+            left untouched and a '<outfile>.failed' marker file records
+            which sheet failed.
+          - stream (e.g. sys.stdout or an open file): sheets are written
+            as they are converted, separated by the sheet delimiter. No
+            atomicity is promised; a failure midway leaves partial output.
+        """
         if sheetname:
             sheetid = self.getSheetIdByName(sheetname)
             if not sheetid:
                 raise XlsxException("Sheet '%s' not found" % sheetname)
         if sheetid > 0:
             self._convert(sheetid, outfile)
-        else:
-            if isinstance(outfile, str):
-                if not os.path.exists(outfile):
-                    os.makedirs(outfile)
-                elif os.path.isfile(outfile):
-                    raise OutFileAlreadyExistsException("File " + str(outfile) + " already exists!")
-            elif hasattr(outfile, "open"):
-                if outfile.exists():
-                    raise OutFileAlreadyExistsException("File " + str(outfile) + " already exists!")
-                outfile = outfile.open("w+", encoding=self.options['outputencoding'], newline="")
+            return
+        if isinstance(outfile, str):
+            self._convert_all_to_directory(outfile)
+            return
+        if hasattr(outfile, "open"):
+            if outfile.exists():
+                raise OutFileAlreadyExistsException("File " + str(outfile) + " already exists!")
+            outfile = outfile.open("w+", encoding=self.options['outputencoding'], newline="")
 
-            for s in self.workbook.sheets:
-                sheetname = s['name']
-                sheetstate = s['state']
+        for s in self._selected_sheets():
+            sheetname = s['name']
+            if not self.py3:
+                sheetname = sheetname.encode('utf-8')
+            if self.options['sheetdelimiter'] and len(self.options['sheetdelimiter']):
+                outfile.write(self.options['sheetdelimiter'] + " " + str(s['index']) + " - " + sheetname + self.options['lineterminator'])
+            self._convert(s['index'], outfile)
 
-                # filter hidden sheets
-                if sheetstate in ('hidden', 'veryHidden') and self.options['exclude_hidden_sheets']:
-                    continue
+    def _selected_sheets(self):
+        # type: () -> List[Dict[str, Any]]
+        """Workbook sheets after hidden/include/exclude filtering."""
+        sheets = []
+        for s in self.workbook.sheets:
+            sheetname = s['name']
+            sheetstate = s['state']
 
-                # filter sheets by include pattern
-                include_sheet_pattern = self.options['include_sheet_pattern']
-                if type(include_sheet_pattern) == type(""):  # optparser lib fix
-                    include_sheet_pattern = [include_sheet_pattern]
-                if len(include_sheet_pattern) > 0:
-                    include = False
-                    for pattern in include_sheet_pattern:
-                        include = pattern and len(pattern) > 0 and re.match(pattern, sheetname)
-                        if include:
-                            break
-                    if not include:
-                        continue
+            # filter hidden sheets
+            if sheetstate in ('hidden', 'veryHidden') and self.options['exclude_hidden_sheets']:
+                continue
 
-                # filter sheets by exclude pattern
-                exclude_sheet_pattern = self.options['exclude_sheet_pattern']
-                if type(exclude_sheet_pattern) == type(""):  # optparser lib fix
-                    exclude_sheet_pattern = [exclude_sheet_pattern]
-                exclude = False
-                for pattern in exclude_sheet_pattern:
-                    exclude = pattern and len(pattern) > 0 and re.match(pattern, sheetname)
-                    if exclude:
+            # filter sheets by include pattern
+            include_sheet_pattern = self.options['include_sheet_pattern']
+            if type(include_sheet_pattern) == type(""):  # optparser lib fix
+                include_sheet_pattern = [include_sheet_pattern]
+            if len(include_sheet_pattern) > 0:
+                include = False
+                for pattern in include_sheet_pattern:
+                    include = pattern and len(pattern) > 0 and re.match(pattern, sheetname)
+                    if include:
                         break
-                if exclude:
+                if not include:
                     continue
 
+            # filter sheets by exclude pattern
+            exclude_sheet_pattern = self.options['exclude_sheet_pattern']
+            if type(exclude_sheet_pattern) == type(""):  # optparser lib fix
+                exclude_sheet_pattern = [exclude_sheet_pattern]
+            exclude = False
+            for pattern in exclude_sheet_pattern:
+                exclude = pattern and len(pattern) > 0 and re.match(pattern, sheetname)
+                if exclude:
+                    break
+            if exclude:
+                continue
+
+            sheets.append(s)
+        return sheets
+
+    def _convert_all_to_directory(self, outdir):
+        # type: (str) -> None
+        """Convert all selected sheets into outdir, publishing the batch
+        atomically: consumers only see the directory once every sheet
+        converted successfully."""
+        if os.path.isfile(outdir):
+            raise OutFileAlreadyExistsException("File " + str(outdir) + " already exists!")
+        marker = outdir + ".failed"
+        outdir_abs = os.path.abspath(outdir)
+        parent = os.path.dirname(outdir_abs)
+        if not os.path.isdir(parent):
+            os.makedirs(parent)
+        staging = tempfile.mkdtemp(prefix=os.path.basename(outdir_abs) + ".", suffix=".tmp", dir=parent)
+        try:
+            for s in self._selected_sheets():
+                sheetname = s['name']
                 if not self.py3:
                     sheetname = sheetname.encode('utf-8')
-                of = outfile
-                if isinstance(outfile, str):
-                    of = os.path.join(outfile, sheetname + '.csv')
-                elif self.options['sheetdelimiter'] and len(self.options['sheetdelimiter']):
-                    of.write(self.options['sheetdelimiter'] + " " + str(s['index']) + " - " + sheetname + self.options['lineterminator'])
-                self._convert(s['index'], of)
+                try:
+                    self._convert(s['index'], os.path.join(staging, sheetname + '.csv'))
+                except Exception as e:
+                    raise XlsxException(
+                        "Failed to convert sheet '%s' (index %i): %s" % (s['name'], s['index'], str(e)))
+        except Exception as e:
+            shutil.rmtree(staging, ignore_errors=True)
+            with io.open(marker, 'w', encoding='utf-8') as marker_file:
+                marker_file.write(str(e) + "\n")
+            raise
+
+        backup = None
+        if os.path.isdir(outdir):
+            backup = staging + ".old"
+            os.rename(outdir, backup)
+        try:
+            os.rename(staging, outdir)
+        except Exception:
+            if backup is not None and not os.path.exists(outdir):
+                os.rename(backup, outdir)
+            raise
+        if backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
+        if os.path.exists(marker):
+            os.remove(marker)
 
     def _convert(self, sheet_index, outfile):
         closefile = False

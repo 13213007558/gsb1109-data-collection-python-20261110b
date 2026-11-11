@@ -117,3 +117,81 @@ def test_dir_sheetname():
     print("OK: dir_sheetname")
 
 test_dir_sheetname()
+
+
+def make_broken_xlsx(dest):
+    # sheets_order.xlsx with a corrupted middle sheet ('e' -> worksheets/sheet3.xml)
+    import zipfile
+    src = zipfile.ZipFile("test/sheets_order.xlsx", "r")
+    dst = zipfile.ZipFile(dest, "w")
+    for name in src.namelist():
+        data = src.read(name)
+        if name == "xl/worksheets/sheet3.xml":
+            data = b"<worksheet><sheetData><row><c><v>unclosed"
+        dst.writestr(name, data)
+    dst.close()
+    src.close()
+
+
+def test_dir_atomic_publish():
+    # directory output must be published per workbook: all sheets or nothing
+    import shutil, tempfile
+    tmp = tempfile.mkdtemp()
+    try:
+        outdir = os.path.join(tmp, "out")
+        broken = os.path.join(tmp, "broken.xlsx")
+        make_broken_xlsx(broken)
+
+        # seed a previously published ("old") version that must survive failures
+        os.makedirs(outdir)
+        old_csv = os.path.join(outdir, "old.csv")
+        f = open(old_csv, "w")
+        f.write("old,data\n")
+        f.close()
+
+        proc = subprocess.run([sys.executable, "./xlsx2csv.py", "-a", broken, outdir],
+                              capture_output=True)
+        if proc.returncode == 0:
+            print("FAILED: dir_atomic_publish expected non-zero exit")
+            sys.exit(1)
+        # old version still readable, no partial batch published
+        f = open(old_csv, "r")
+        if f.read() != "old,data\n":
+            f.close()
+            print("FAILED: dir_atomic_publish old version clobbered")
+            sys.exit(1)
+        f.close()
+        if sorted(os.listdir(outdir)) != ["old.csv"]:
+            print("FAILED: dir_atomic_publish partial sheets visible: %s" % os.listdir(outdir))
+            sys.exit(1)
+        # failure marker tells which sheet failed
+        marker = outdir + ".failed"
+        if not os.path.exists(marker):
+            print("FAILED: dir_atomic_publish no .failed marker")
+            sys.exit(1)
+        f = open(marker, "r")
+        marker_text = f.read()
+        f.close()
+        if "'e'" not in marker_text:
+            print("FAILED: dir_atomic_publish marker does not name failed sheet: %s" % marker_text)
+            sys.exit(1)
+        # no staging directories left behind
+        leftovers = [n for n in os.listdir(tmp) if n.endswith(".tmp") or n.endswith(".old")]
+        if leftovers:
+            print("FAILED: dir_atomic_publish staging leftovers: %s" % leftovers)
+            sys.exit(1)
+
+        # a good workbook publishes the whole batch and clears the marker
+        subprocess.check_call([sys.executable, "./xlsx2csv.py", "-a", "test/sheets_order.xlsx", outdir])
+        published = sorted(os.listdir(outdir))
+        if published != ["a.csv", "b.csv", "d.csv", "e.csv"]:
+            print("FAILED: dir_atomic_publish unexpected batch: %s" % published)
+            sys.exit(1)
+        if os.path.exists(marker):
+            print("FAILED: dir_atomic_publish stale .failed marker")
+            sys.exit(1)
+    finally:
+        shutil.rmtree(tmp)
+    print("OK: dir_atomic_publish")
+
+test_dir_atomic_publish()

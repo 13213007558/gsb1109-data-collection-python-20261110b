@@ -88,7 +88,14 @@ Convert recursively.
 
 =item B<-s SHEETID, --sheet=SHEETID>
 
-Sheet to convert (0 for all sheets).
+Sheet to convert (0 for all sheets). When converting all sheets to a
+directory, the batch is published atomically per workbook: sheets are
+staged in a temporary directory and moved into place only after every
+selected sheet converted successfully. On failure the previously
+published directory is left untouched and a "<outdir>.failed" marker
+file records which sheet failed. Output to standard output has no such
+guarantee; sheets are written as they are converted and a failure
+midway leaves partial output.
 
 =item B<-h, --help>
 
