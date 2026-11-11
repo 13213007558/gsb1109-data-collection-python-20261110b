@@ -163,6 +163,8 @@ API
 
 .. autofunction:: jsonlines.open
 
+.. autofunction:: jsonlines.open_append
+
 .. autoclass:: jsonlines.Reader
    :members:
    :inherited-members:
@@ -175,6 +177,9 @@ API
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.IncompleteLastLineError
    :members:
 
 

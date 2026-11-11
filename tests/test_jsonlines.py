@@ -306,6 +306,114 @@ def test_open_invalid_mode() -> None:
     assert "mode" in str(excinfo.value)
 
 
+def test_open_append_to_complete_file() -> None:
+    with tempfile.NamedTemporaryFile("w+b") as fp:
+        fp.write(b'{"a": 1}\n')
+        fp.flush()
+        with jsonlines.open_append(fp.name) as writer:
+            writer.write({"b": 2})
+        fp.seek(0)
+        assert fp.read() == b'{"a": 1}\n{"b": 2}\n'
+
+
+def test_open_append_to_empty_file() -> None:
+    with tempfile.NamedTemporaryFile("w+b") as fp:
+        with jsonlines.open_append(fp.name) as writer:
+            writer.write({"a": 1})
+        fp.seek(0)
+        assert fp.read() == b'{"a": 1}\n'
+
+
+def test_open_append_to_nonexistent_file() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = f"{tmpdir}/new.jsonl"
+        with jsonlines.open_append(path) as writer:
+            writer.write({"a": 1})
+        with jsonlines.open(path) as reader:
+            assert list(reader) == [{"a": 1}]
+
+
+def test_open_append_to_crlf_file() -> None:
+    """
+    Files using CRLF line endings end with a newline and are complete.
+    """
+    with tempfile.NamedTemporaryFile("w+b") as fp:
+        fp.write(b'{"a": 1}\r\n{"b": 2}\r\n')
+        fp.flush()
+        with jsonlines.open_append(fp.name) as writer:
+            writer.write({"c": 3})
+        fp.seek(0)
+        assert fp.read() == b'{"a": 1}\r\n{"b": 2}\r\n{"c": 3}\n'
+
+
+def test_open_append_to_crlf_only_file() -> None:
+    """
+    A file containing only a CRLF sequence has a complete (empty) last
+    line, so appending starts right after it.
+    """
+    with tempfile.NamedTemporaryFile("w+b") as fp:
+        fp.write(b"\r\n")
+        fp.flush()
+        with jsonlines.open_append(fp.name) as writer:
+            writer.write({"a": 1})
+        fp.seek(0)
+        assert fp.read() == b'\r\n{"a": 1}\n'
+
+
+def test_open_append_incomplete_last_line_raises() -> None:
+    with tempfile.NamedTemporaryFile("w+b") as fp:
+        fp.write(b'{"a": 1}\n{"b": 2')
+        fp.flush()
+        with pytest.raises(jsonlines.IncompleteLastLineError) as excinfo:
+            jsonlines.open_append(fp.name)
+        exc = excinfo.value
+        assert exc.offset == len(b'{"a": 1}\n')
+        assert exc.tail == b'{"b": 2'
+        assert str(exc.offset) in str(exc)
+        # the file is left unmodified
+        fp.seek(0)
+        assert fp.read() == b'{"a": 1}\n{"b": 2'
+
+
+def test_open_append_incomplete_last_line_without_newline_at_all() -> None:
+    with tempfile.NamedTemporaryFile("w+b") as fp:
+        fp.write(b'{"a": 1')
+        fp.flush()
+        with pytest.raises(jsonlines.IncompleteLastLineError) as excinfo:
+            jsonlines.open_append(fp.name)
+        assert excinfo.value.offset == 0
+        assert excinfo.value.tail == b'{"a": 1'
+
+
+def test_open_append_trailing_cr_only_is_incomplete() -> None:
+    """
+    A trailing CR without LF does not count as a line terminator.
+    """
+    with tempfile.NamedTemporaryFile("w+b") as fp:
+        fp.write(b'{"a": 1}\r')
+        fp.flush()
+        with pytest.raises(jsonlines.IncompleteLastLineError) as excinfo:
+            jsonlines.open_append(fp.name)
+        assert excinfo.value.offset == 0
+        assert excinfo.value.tail == b'{"a": 1}\r'
+
+
+def test_open_append_truncate_incomplete_last_line() -> None:
+    with tempfile.NamedTemporaryFile("w+b") as fp:
+        fp.write(b'{"a": 1}\n{"b": 2')
+        fp.flush()
+        with jsonlines.open_append(fp.name, on_incomplete="truncate") as writer:
+            writer.write({"c": 3})
+        fp.seek(0)
+        assert fp.read() == b'{"a": 1}\n{"c": 3}\n'
+
+
+def test_open_append_invalid_on_incomplete() -> None:
+    with pytest.raises(ValueError) as excinfo:
+        jsonlines.open_append("foo", on_incomplete="bogus")
+    assert "on_incomplete" in str(excinfo.value)
+
+
 def test_single_char_stripping() -> None:
     """ "
     Sanity check that a helper constant actually contains single-char strings.

@@ -138,6 +138,40 @@ class InvalidLineError(Error, ValueError):
         super().__init__(f"{message} (line {lineno})")
 
 
+@attr.s(auto_exc=True, auto_attribs=True, init=False)
+class IncompleteLastLineError(Error, ValueError):
+    """
+    Error raised when safely appending to a file with an incomplete
+    last line.
+
+    This happens when the file does not end with a newline character,
+    which means the last line may contain a partially written record.
+    The file is left unmodified when this error is raised.
+
+    The byte offset at which the incomplete final line starts is stored
+    on the exception instance as the ``.offset`` attribute, and the
+    incomplete data itself (the raw bytes from that offset to the end
+    of the file) as the ``.tail`` attribute.
+
+    This class subclasses both ``jsonlines.Error`` and the built-in
+    ``ValueError``.
+    """
+
+    #: Byte offset at which the incomplete final line starts
+    offset: int
+
+    #: The incomplete final line (raw bytes)
+    tail: bytes
+
+    def __init__(self, offset: int, tail: bytes) -> None:
+        self.offset = offset
+        self.tail = tail
+        super().__init__(
+            f"last line is incomplete (no trailing newline); "
+            f"incomplete data starts at byte offset {offset}"
+        )
+
+
 @attr.s(auto_attribs=True, repr=False)
 class ReaderWriterBase:
     """
@@ -652,6 +686,99 @@ def open(
     instance: Union[Reader, Writer] = cls(fp, **kwargs)
     instance._should_close_fp = True
     return instance
+
+
+def _find_final_line_start(fp: typing.BinaryIO, size: int) -> int:
+    """
+    Return the byte offset at which the final line of a file starts,
+    i.e. the position just after the last newline byte, or 0 if the
+    file does not contain any newline.
+    """
+    chunk_size = 8192
+    pos = size
+    while pos > 0:
+        read_size = min(chunk_size, pos)
+        pos -= read_size
+        fp.seek(pos)
+        chunk = fp.read(read_size)
+        index = chunk.rfind(b"\n")
+        if index != -1:
+            return pos + index + 1
+    return 0
+
+
+def open_append(
+    file: Openable,
+    *,
+    on_incomplete: str = "raise",
+    dumps: Optional[DumpsCallable] = None,
+    compact: Optional[bool] = None,
+    sort_keys: Optional[bool] = None,
+    flush: Optional[bool] = None,
+) -> Writer:
+    """
+    Open a jsonlines file for safely appending new records.
+
+    Unlike :py:func:`open` with ``mode="a"``, this function first
+    inspects the end of the file (without modifying it) to make sure
+    new records will not be glued to a partially written last line:
+
+    * If the file does not exist or is empty, appending starts at the
+      beginning of the file.
+    * If the file ends with a newline (``\\n``), the last line is
+      complete, and new records are appended after it. Files using
+      CRLF (``\\r\\n``) line endings also end with ``\\n`` and are
+      therefore considered complete; a trailing ``\\r`` alone does not
+      count as a line terminator.
+    * Otherwise the last line is incomplete. By default an
+      :py:exc:`IncompleteLastLineError` is raised, reporting the
+      byte offset at which the incomplete data starts, and the file is
+      left unmodified. When ``on_incomplete="truncate"`` is specified,
+      the incomplete final line is discarded instead, and appending
+      resumes right after the last complete line.
+
+    The result must be closed after use, like :py:func:`open`.
+
+    :param file: name or ‘path-like object’ of the file to open
+    :param on_incomplete: what to do when the last line is incomplete,
+        either ``raise`` (the default) or ``truncate``
+    :param dumps: custom encoder callable
+    :param compact: whether to use a compact output format
+    :param sort_keys: whether to sort object keys
+    :param flush: whether to flush the file after writing each line
+    """
+    if on_incomplete not in {"raise", "truncate"}:
+        raise ValueError("'on_incomplete' must be either 'raise' or 'truncate'")
+
+    try:
+        inspect_fp = builtins.open(file, mode="r+b")
+    except FileNotFoundError:
+        pass  # appending will create the file
+    else:
+        with inspect_fp:
+            inspect_fp.seek(0, os.SEEK_END)
+            size = inspect_fp.tell()
+            if size > 0:
+                inspect_fp.seek(size - 1)
+                if inspect_fp.read(1) != b"\n":
+                    offset = _find_final_line_start(inspect_fp, size)
+                    if on_incomplete == "truncate":
+                        inspect_fp.truncate(offset)
+                    else:
+                        inspect_fp.seek(offset)
+                        raise IncompleteLastLineError(offset, inspect_fp.read())
+
+    return cast(
+        Writer,
+        open(
+            file,
+            mode="a",
+            dumps=dumps,
+            compact=compact,
+            sort_keys=sort_keys,
+            flush=flush,
+        ),
+    )
 
 
 def repr_for_fp(fp: typing.IO[Any]) -> str:
