@@ -127,6 +127,55 @@ $ gunzip enwiki.dicts.gz | script2.py
 ...
 ```
 
+### Inheriting attributes from enclosing elements
+
+When a stream holds several records side by side, shared values (language, base
+URL, crawl batch, ...) are often declared once on an outer element instead of
+repeated on every record. Pass `inherited_attrs` with the attribute names to
+propagate, *without* the `attr_prefix`, and each streamed item receives the
+effective value under its prefixed key, wrapped in an
+`InheritedAttribute(value, declared_at)` object:
+
+```python
+>>> xml = """
+... <catalog>
+...   <site lang="en" base="https://a.example/" batch="B1">
+...     <group><record id="1">alpha</record></group>
+...     <group lang="fr"><record id="2">beta</record></group>
+...   </site>
+...   <site lang="es" base="https://b.example/" batch="B2">
+...     <group><record id="3">gamma</record></group>
+...   </site>
+... </catalog>
+... """
+>>> def handle(path, item):
+...     lang = item["@lang"]
+...     print(item["@id"], lang.value, lang.declared_at[0], item["@batch"].value)
+...     return True
+...
+>>> xmltodict.parse(xml, item_depth=4, item_callback=handle,
+...                 inherited_attrs=("lang", "base", "batch"))
+1 en site B1
+2 fr group B1
+3 es site B2
+```
+
+The scoping rules are:
+
+- `value` is the value in force at the item; `declared_at` is the
+  `(name, attrs)` path entry of the element that declared it, so local
+  declarations and inherited ones are distinguishable.
+- An attribute declared on the item itself stays a plain value and wins over
+  any inherited one.
+- A declaration on a middle element shadows outer values only inside that
+  element's subtree; leaving the element restores the outer value and its
+  declaration site.
+- Each item gets its own frozen snapshot. A record retained by the callback for
+  later insertion never picks up attributes from a following sibling subtree
+  (for example the next `<site>`).
+- Inherited values are attached only to the streamed item at `item_depth`, not
+  to its nested children, and the option has no effect on non-streaming parses.
+
 ## Roundtripping
 
 You can also convert in the other direction, using the `unparse()` method:
@@ -219,6 +268,7 @@ Parse XML input into a Python dictionary.
 - `force_list=None`: Force list values for specific elements. Can be a boolean (True/False), a tuple of element names to force lists for, or a callable function that receives (path, key, value) and returns True/False. Useful for elements that may appear once or multiple times to ensure consistent list output.
 - `item_depth=0`: Depth at which to call `item_callback`.
 - `item_callback=lambda *args: True`: Function called on items at `item_depth`.
+- `inherited_attrs=None`: Streaming-only sequence of attribute names (without `attr_prefix`) to inherit from enclosing elements. Each streamed item gets the effective value wrapped in an `InheritedAttribute(value, declared_at)`, where `declared_at` is the path entry of the declaring element. Local declarations take precedence, middle-element overrides are restored on exit, and each item keeps its own snapshot. Has no effect when `item_depth=0`.
 - `comment_key='#comment'`: Key used for XML comments when `process_comments=True`. Only used when `process_comments=True`. Comments can be preserved but multiple top-level comments may not retain order.
 
 ### xmltodict.unparse()

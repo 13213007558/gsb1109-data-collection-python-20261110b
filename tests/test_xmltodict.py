@@ -1,4 +1,9 @@
-from xmltodict import parse, ParsingInterrupted
+from xmltodict import (
+    parse,
+    ParsingInterrupted,
+    InheritedAttribute,
+    _DictSAXHandler,
+)
 import collections
 import pytest
 from io import BytesIO
@@ -720,3 +725,185 @@ def test_force_list_true_applies_to_all_keys():
     xml = "<a><b>1</b><b>2</b><c>x</c></a>"
     expected = {"a": [{"b": ["1", "2"], "c": ["x"]}]}
     assert parse(xml, force_list=True) == expected
+
+
+# ---------------------------------------------------------------------------
+# inherited_attrs: scoped attribute inheritance for streaming mode
+# ---------------------------------------------------------------------------
+
+_SITE_XML = """
+<catalog>
+  <site lang="en" base="https://a.example/" batch="B1">
+    <section>
+      <record id="1"><title>alpha</title></record>
+    </section>
+    <section lang="fr">
+      <record id="2"><title>beta</title></record>
+    </section>
+    <section>
+      <record id="3" lang="de"><title>gamma</title></record>
+      <record id="4">plain</record>
+    </section>
+  </site>
+  <site lang="es" base="https://b.example/" batch="B2">
+    <section>
+      <record id="5"><title>delta</title></record>
+    </section>
+  </site>
+</catalog>
+"""
+
+
+def _stream_inherited(xml, depth=4, **kwargs):
+    items = []
+    paths = []
+
+    def cb(path, item):
+        paths.append(list(path))
+        items.append(item)
+        return True
+
+    parse(xml, item_depth=depth, item_callback=cb,
+          inherited_attrs=("lang", "base", "batch"), **kwargs)
+    return paths, items
+
+
+def test_inherited_attrs_basic_value_and_location():
+    paths, items = _stream_inherited(_SITE_XML)
+    first = items[0]
+    site_entry = paths[0][1]
+    assert site_entry[0] == "site"
+    assert isinstance(first["@lang"], InheritedAttribute)
+    assert first["@lang"].value == "en"
+    # declared_at is the exact path entry of the declaring element
+    assert first["@lang"].declared_at == site_entry
+    assert first["@base"].value == "https://a.example/"
+    assert first["@base"].declared_at[0] == "site"
+    assert first["@batch"].value == "B1"
+    # own attributes and children are still present and untouched
+    assert first["@id"] == "1"
+    assert first["title"] == "alpha"
+
+
+def test_inherited_attrs_override_and_restore():
+    _, items = _stream_inherited(_SITE_XML)
+    # section lang="fr" shadows the site value within that layer
+    assert items[1]["@lang"].value == "fr"
+    assert items[1]["@lang"].declared_at[0] == "section"
+    assert items[1]["@base"].declared_at[0] == "site"
+    # leaving the section restores the site value (and its declaration site)
+    assert items[2]["@base"].declared_at[0] == "site"
+    third_lang = items[2]["@lang"]
+    # record 3 declares lang itself, so it is a plain local value, not inherited
+    assert third_lang == "de"
+    assert not isinstance(third_lang, InheritedAttribute)
+
+
+def test_inherited_attrs_site_isolation_and_retained_records():
+    _, items = _stream_inherited(_SITE_XML)
+    # records retained from the first site must never see the second site
+    first_site_records = items[:4]
+    for record in first_site_records:
+        assert record["@batch"].value == "B1"
+        assert record["@base"].value == "https://a.example/"
+    last = items[-1]
+    assert last["@lang"].value == "es"
+    assert last["@base"].value == "https://b.example/"
+    assert last["@batch"].value == "B2"
+    assert last["@lang"].declared_at[1]["lang"] == "es"
+    # immutable snapshot keeps the earlier value after parsing has moved on
+    assert items[0]["@lang"].value == "en"
+    assert items[1]["@lang"].value == "fr"
+
+
+def test_inherited_attrs_attached_to_attributeless_and_text_items():
+    xml = '<site lang="en"><item>hello</item></site>'
+    items = []
+    parse(xml, item_depth=2,
+          item_callback=lambda path, item: items.append(item) or True,
+          inherited_attrs=("lang",))
+    assert items == [{"@lang": InheritedAttribute("en", ("site", {"lang": "en"})),
+                      "#text": "hello"}]
+
+
+def test_inherited_attrs_do_not_pollute_nested_children():
+    xml = '<site lang="en"><item><meta><k>v</k></meta>tail</item></site>'
+    items = []
+    parse(xml, item_depth=2,
+          item_callback=lambda path, item: items.append(item) or True,
+          inherited_attrs=("lang",))
+    item = items[0]
+    # the streamed item itself carries the inherited value ...
+    assert isinstance(item["@lang"], InheritedAttribute)
+    # ... but its nested dict child and scalar child are left untouched
+    assert item["meta"] == {"k": "v"}
+    assert item["#text"] == "tail"
+    assert "@lang" not in item["meta"]
+
+
+def test_inherited_attrs_only_propagates_listed_names():
+    xml = '<site lang="en" other="x"><item/></site>'
+    items = []
+    parse(xml, item_depth=2,
+          item_callback=lambda path, item: items.append(item) or True,
+          inherited_attrs=("lang",))
+    assert "@lang" in items[0]
+    assert "@other" not in items[0]
+
+
+def test_inherited_attrs_custom_prefix():
+    items = []
+    parse('<site lang="en"><item>x</item></site>', item_depth=2,
+          item_callback=lambda path, item: items.append(item) or True,
+          attr_prefix="!", inherited_attrs=("lang",))
+    assert items[0]["!lang"].value == "en"
+
+
+def test_inherited_attrs_generator_input():
+    gen = (chunk for chunk in _SITE_XML)
+    _, items = _stream_inherited(gen)
+    assert len(items) == 5
+    assert items[-1]["@base"].value == "https://b.example/"
+
+
+def test_inherited_attrs_disabled_by_default():
+    items = []
+    parse(_SITE_XML, item_depth=4,
+          item_callback=lambda path, item: items.append(item) or True)
+    for record in items:
+        assert "@base" not in record
+        assert "@batch" not in record
+        assert not any(isinstance(v, InheritedAttribute) for v in record.values())
+
+
+def test_inherited_attrs_non_streaming_unchanged():
+    result = parse(_SITE_XML, inherited_attrs=("lang", "base", "batch"))
+    # full-document parse never injects InheritedAttribute objects
+    def walk(node):
+        if isinstance(node, dict):
+            for value in node.values():
+                assert not isinstance(value, InheritedAttribute)
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(result)
+
+
+def test_inherited_attrs_interrupt_still_raises():
+    def cb(path, item):
+        return False
+    with pytest.raises(ParsingInterrupted):
+        parse(_SITE_XML, item_depth=4, item_callback=cb,
+              inherited_attrs=("lang",))
+
+
+def test_inherited_attrs_scope_balanced_after_parse():
+    handler = _DictSAXHandler(item_depth=3, inherited_attrs=("lang",))
+    parser = expat.ParserCreate()
+    parser.StartElementHandler = handler.startElement
+    parser.EndElementHandler = handler.endElement
+    parser.CharacterDataHandler = handler.characters
+    parser.Parse('<a lang="x"><b><c>1</c><c>2</c></b></a>'.encode(), True)
+    assert handler._inherit_stack == []
+    assert handler._inherit == {}

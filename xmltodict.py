@@ -4,12 +4,29 @@
 from xml.parsers import expat
 from xml.sax.saxutils import XMLGenerator, escape
 from xml.sax.xmlreader import AttributesImpl
+from dataclasses import dataclass
 from io import StringIO
 from inspect import isgenerator
 import codecs
 
 class ParsingInterrupted(Exception):
     pass
+
+
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class InheritedAttribute:
+    """An attribute value inherited from an enclosing element.
+
+    ``value`` is the effective value for the attribute at the current element
+    and ``declared_at`` is the ``path`` entry ``(name, attrs)`` of the element
+    that declared it, so callers can tell a local declaration from an inherited
+    one without walking the path themselves.
+    """
+    value: object
+    declared_at: tuple
 
 
 class _DictSAXHandler:
@@ -29,6 +46,7 @@ class _DictSAXHandler:
         namespaces=None,
         force_list=None,
         comment_key="#comment",
+        inherited_attrs=None,
     ):
         self.path = []
         self.stack = []
@@ -49,6 +67,14 @@ class _DictSAXHandler:
         self.namespace_declarations = dict_constructor()
         self.force_list = force_list
         self.comment_key = comment_key
+        # Attributes to propagate down the tree in streaming mode. Names are
+        # given without ``attr_prefix`` (e.g. "lang", not "@lang").
+        self.inherited_attrs = (tuple(inherited_attrs)
+                                if inherited_attrs is not None else None)
+        # Each entry records the inherited attribute names shadowed by an
+        # element, so the outer values can be restored when that element ends.
+        self._inherit_stack = []
+        self._inherit = {}
 
     def _build_name(self, full_name):
         if self.namespaces is None:
@@ -74,6 +100,44 @@ class _DictSAXHandler:
     def startNamespaceDecl(self, prefix, uri):
         self.namespace_declarations[prefix or ''] = uri
 
+    def _inherited_key(self, name):
+        return self.attr_prefix + self._build_name(name)
+
+    def _push_inherited(self, name, attrs):
+        # Shadow any outer values declared on this element so they are in force
+        # for everything below it; remember what to restore on the way back up.
+        entry = self.dict_constructor()
+        if attrs:
+            for attr_name in self.inherited_attrs:
+                if attr_name in attrs:
+                    entry[attr_name] = self._inherit.get(attr_name, _UNSET)
+                    self._inherit[attr_name] = InheritedAttribute(
+                        value=attrs[attr_name],
+                        declared_at=(name, attrs or None),
+                    )
+        self._inherit_stack.append(entry)
+
+    def _pop_inherited(self):
+        entry = self._inherit_stack.pop()
+        for attr_name, previous in entry.items():
+            if previous is _UNSET:
+                del self._inherit[attr_name]
+            else:
+                self._inherit[attr_name] = previous
+
+    def _apply_inherited(self, item):
+        # Attach the currently effective inherited values to a streamed item.
+        # Locally declared attributes (already on ``item``) always win.
+        if not self._inherit:
+            return item
+        if item is None:
+            item = self.dict_constructor()
+        for attr_name, inherited in self._inherit.items():
+            key = self._inherited_key(attr_name)
+            if key not in item:
+                item[key] = inherited
+        return item
+
     def startElement(self, full_name, attrs):
         name = self._build_name(full_name)
         attrs = self._attrs_to_dict(attrs)
@@ -83,6 +147,8 @@ class _DictSAXHandler:
             attrs['xmlns'] = self.namespace_declarations
             self.namespace_declarations = self.dict_constructor()
         self.path.append((name, attrs or None))
+        if self.inherited_attrs is not None:
+            self._push_inherited(name, attrs)
         if len(self.path) >= self.item_depth:
             self.stack.append((self.item, self.data))
             if self.xml_attribs:
@@ -100,6 +166,11 @@ class _DictSAXHandler:
                 attrs = None
             self.item = attrs or None
             self.data = []
+            # Only the streamed record itself carries the effective inherited
+            # values; nested elements inside the record keep their own shape.
+            if (self.inherited_attrs is not None
+                    and len(self.path) == self.item_depth):
+                self.item = self._apply_inherited(self.item)
 
     def endElement(self, full_name):
         name = self._build_name(full_name)
@@ -119,6 +190,8 @@ class _DictSAXHandler:
                     self.push_data(item, self.cdata_key, data)
             else:
                 item = data
+            if self.inherited_attrs is not None:
+                item = self._apply_inherited(item)
 
             should_continue = self.item_callback(self.path, item)
             if not should_continue:
@@ -130,6 +203,8 @@ class _DictSAXHandler:
             else:
                 self.item = None
                 self.data = []
+            if self.inherited_attrs is not None:
+                self._pop_inherited()
             self.path.pop()
             return
         if self.stack:
@@ -150,6 +225,8 @@ class _DictSAXHandler:
         else:
             self.item = None
             self.data = []
+        if self.inherited_attrs is not None:
+            self._pop_inherited()
         self.path.pop()
 
     def characters(self, data):
@@ -342,6 +419,37 @@ def parse(xml_input, encoding=None, expat=expat, process_namespaces=False,
         at the default `True`, comments will have leading and trailing
         whitespace removed. Disable `strip_whitespace` to keep comment
         indentation or padding intact.
+
+    In streaming mode, `inherited_attrs` lets you declare element attributes
+    that should be propagated down to every streamed item rather than guessed
+    from the path afterwards. Pass a sequence of attribute names *without* the
+    `attr_prefix` (for example ``("lang", "base")``). Each streamed item then
+    carries the currently effective value under the prefixed key, wrapped in an
+    :class:`InheritedAttribute` whose ``value`` is the effective value and
+    whose ``declared_at`` is the ``(name, attrs)`` path entry of the element
+    that declared it. An attribute declared on the item itself stays a plain
+    value and takes precedence; a declaration on a middle element shadows outer
+    values only for that element's subtree and is restored to the outer value
+    once the element ends. Because each item receives its own frozen snapshot,
+    a callback that retains an item for later storage never sees attributes
+    from a following sibling subtree. Example::
+
+        >>> xml = '''
+        ... <catalog>
+        ...   <site lang="en" base="https://a.example/">
+        ...     <group><record id="1">alpha</record></group>
+        ...     <group lang="fr"><record id="2">beta</record></group>
+        ...   </site>
+        ... </catalog>
+        ... '''
+        >>> def handle(path, item):
+        ...     print(item['@lang'].value, item['@lang'].declared_at[0])
+        ...     return True
+        ...
+        >>> xmltodict.parse(xml, item_depth=4, item_callback=handle,
+        ...                 inherited_attrs=("lang", "base"))
+        en site
+        fr group
     """
     handler = _DictSAXHandler(namespace_separator=namespace_separator,
                               **kwargs)
