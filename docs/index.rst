@@ -51,6 +51,7 @@ is a group of two selectors.
 .. _group of selectors: http://www.w3.org/TR/selectors/#grouping
 
 .. autofunction:: parse
+.. autofunction:: resolve_nested_selectors
 .. autoclass:: Selector()
     :members:
 
@@ -122,6 +123,12 @@ be implemented):
 * The ``:not()`` pseudo-class with a *complex selector* argument, e.g.
   ``:not(a.important[rel] > b)``. Limitation: it takes a single argument, so a
   selector list is unsupported (e.g. ``:not(a, b)``).
+* The nesting selector ``&`` of CSS Nesting. The parser accepts it inside a
+  selector, and :func:`resolve_nested_selectors` expands a nested rule's
+  selectors against a parent selector list into ordinary selectors,
+  replacing every ``&`` with an ``:is()`` holding the whole parent list so
+  that a low-specificity parent branch cannot downgrade the nested rule.
+  Stylesheets and their declarations are not parsed.
 
 These are non-standard extensions:
 

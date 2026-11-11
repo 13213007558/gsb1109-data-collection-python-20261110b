@@ -63,6 +63,7 @@ Tree: TypeAlias = Union[
     "Matching",
     "SpecificityAdjustment",
     "CombinedSelector",
+    "Nesting",
 ]
 PseudoElement: TypeAlias = Union["FunctionalPseudoElement", str]
 
@@ -533,6 +534,41 @@ class CombinedSelector:
         return a1 + a2, b1 + b2, c1 + c2
 
 
+class Nesting:
+    """Represents the nesting selector ``&``.
+
+    A nesting selector stands for the parent rule's selector list. It only
+    appears in the parsed tree of a selector that contains ``&``;
+    :func:`resolve_nested_selectors` replaces each occurrence with a
+    :class:`Matching` (``:is()``) holding the whole parent list.
+
+    The optional *selector* holds the compound selector written before an
+    ``&`` that is not at the start of its compound, e.g. the ``a`` in
+    ``a&``. It is ``None`` for a nesting selector on its own.
+
+    """
+
+    def __init__(self, selector: Tree | None = None) -> None:
+        self.selector = selector
+
+    def __repr__(self) -> str:
+        if self.selector is None:
+            return "Nesting[&]"
+        return f"Nesting[{self.selector!r}&]"
+
+    def canonical(self) -> str:
+        if self.selector is None:
+            return "&"
+        return f"{self.selector.canonical()}&"
+
+    def specificity(self) -> tuple[int, int, int]:
+        # The parent's contribution is carried by the Matching node that
+        # replaces the nesting selector during resolution.
+        if self.selector is None:
+            return 0, 0, 0
+        return self.selector.specificity()
+
+
 #### Parser
 
 # foo
@@ -598,6 +634,218 @@ def parse_selector_group(stream: TokenStream) -> Iterator[Selector]:
             stream.skip_whitespace()
         else:
             break
+
+
+def resolve_nested_selectors(
+    parent_selectors: str | Iterable[Selector | str],
+    nested_css: str,
+) -> list[Selector]:
+    """Resolve the nesting selector ``&`` of a nested CSS rule.
+
+    Implements the `nesting selector resolution`_ of CSS Nesting: every
+    nesting selector in *nested_css* stands for the whole parent selector
+    list, so each ``&`` is replaced by an ``:is()`` carrying every parent
+    selector. The nested group is therefore expanded into one ordinary
+    selector per nested selector. The whole stylesheet and the style
+    declarations are not parsed; only the two selector strings are.
+
+    .. _nesting selector resolution:
+        https://www.w3.org/TR/css-nesting-1/#nest-selector
+
+    :param parent_selectors:
+        The parent rule's selector list, as a comma-separated CSS string or
+        an iterable of :class:`Selector` objects and/or selector strings.
+    :param nested_css:
+        The nested rule's group of selectors, which must contain at least one
+        nesting selector ``&``. A single nested selector may contain any
+        number of them, including two within one compound selector, e.g.
+        ``& + &``.
+    :raises:
+        :class:`SelectorSyntaxError` if either argument cannot be parsed, the
+        parent selector list is empty, or *nested_css* contains no ``&``.
+    :returns:
+        One resolved :class:`Selector` per selector of the nested group, in
+        order. Each nesting selector becomes an :class:`Matching` (``:is()``)
+        holding the full parent list, so the parent's contribution to the
+        specificity is the most specific parent selector, whatever parent
+        branch actually matches: a low-specificity parent branch never
+        downgrades the nested rule. This also holds when a nested selector
+        references the parent more than once, where flattening into a
+        cross-product of parent selectors would compute the wrong
+        specificity.
+
+    Note that a parent selector containing a combinator (e.g. ``a b``) ends
+    up inside an ``:is()`` argument, which the parser and the XPath
+    translator only accept as compound selectors; the resolved
+    :class:`Selector` and its specificity are still correct in that case.
+
+    """
+    if isinstance(parent_selectors, str):
+        parents = parse(parent_selectors)
+    else:
+        parents = [
+            selector if isinstance(selector, Selector) else parse(selector)[0]
+            for selector in parent_selectors
+        ]
+    if not parents:
+        raise SelectorSyntaxError("The parent selector list is empty")
+
+    stream = TokenStream(tokenize(nested_css))
+    stream.source = nested_css
+    nested = list(parse_selector_group(stream))
+    if not any(_contains_nesting(selector.parsed_tree) for selector in nested):
+        raise SelectorSyntaxError(
+            f"Nested selector {nested_css!r} does not contain a nesting selector '&'"
+        )
+
+    parent_trees = [_clone_tree(parent.parsed_tree) for parent in parents]
+    return [
+        Selector(
+            _replace_nesting(selector.parsed_tree, parent_trees),
+            selector.pseudo_element,
+        )
+        for selector in nested
+    ]
+
+
+def _contains_nesting(tree: Tree) -> bool:
+    if isinstance(tree, Nesting):
+        return True
+    if isinstance(tree, Element):
+        return False
+    if isinstance(tree, CombinedSelector):
+        return _contains_nesting(tree.selector) or _contains_nesting(
+            tree.subselector
+        )
+    if isinstance(tree, Negation):
+        return _contains_nesting(tree.selector) or _contains_nesting(
+            tree.subselector
+        )
+    if isinstance(tree, Relation):
+        return _contains_nesting(tree.selector) or any(
+            _contains_nesting(argument.parsed_tree)
+            for _, argument in tree.arguments
+        )
+    if isinstance(tree, (Matching, SpecificityAdjustment)):
+        return _contains_nesting(tree.selector) or any(
+            _contains_nesting(argument) for argument in tree.selector_list
+        )
+    return _contains_nesting(tree.selector)
+
+
+def _clone_tree(tree: Tree) -> Tree:
+    """Return a structural copy of a parsed selector tree.
+
+    Token objects are immutable and are shared rather than copied.
+    """
+    if isinstance(tree, Element):
+        return Element(tree.namespace, tree.element)
+    if isinstance(tree, Hash):
+        return Hash(_clone_tree(tree.selector), tree.id)
+    if isinstance(tree, Class):
+        return Class(_clone_tree(tree.selector), tree.class_name)
+    if isinstance(tree, Function):
+        return Function(
+            _clone_tree(tree.selector), tree.name, list(tree.arguments)
+        )
+    if isinstance(tree, Pseudo):
+        return Pseudo(_clone_tree(tree.selector), tree.ident)
+    if isinstance(tree, Attrib):
+        selector = _clone_tree(tree.selector)
+        if tree.operator == "exists":
+            return Attrib(
+                selector, tree.namespace, tree.attrib, "exists", None
+            )
+        assert tree.value is not None
+        return Attrib(
+            selector,
+            tree.namespace,
+            tree.attrib,
+            tree.operator,
+            tree.value,
+            tree.flag,
+        )
+    if isinstance(tree, Negation):
+        return Negation(
+            _clone_tree(tree.selector), _clone_tree(tree.subselector)
+        )
+    if isinstance(tree, Relation):
+        return Relation(
+            _clone_tree(tree.selector),
+            [
+                (
+                    combinator,
+                    Selector(
+                        _clone_tree(argument.parsed_tree),
+                        argument.pseudo_element,
+                    ),
+                )
+                for combinator, argument in tree.arguments
+            ],
+        )
+    if isinstance(tree, Matching):
+        return Matching(
+            _clone_tree(tree.selector),
+            [_clone_tree(argument) for argument in tree.selector_list],
+        )
+    if isinstance(tree, SpecificityAdjustment):
+        return SpecificityAdjustment(
+            _clone_tree(tree.selector),
+            [_clone_tree(argument) for argument in tree.selector_list],
+        )
+    if isinstance(tree, CombinedSelector):
+        return CombinedSelector(
+            _clone_tree(tree.selector),
+            tree.combinator,
+            _clone_tree(tree.subselector),
+        )
+    if isinstance(tree, Nesting):
+        return Nesting(
+            None if tree.selector is None else _clone_tree(tree.selector)
+        )
+    raise TypeError(f"Cannot clone {type(tree).__name__}")
+
+
+def _replace_nesting(tree: Tree, parent_trees: Sequence[Tree]) -> Tree:
+    def visit(node: Tree) -> Tree:
+        if isinstance(node, Nesting):
+            base = (
+                Element()
+                if node.selector is None
+                else visit(node.selector)
+            )
+            return Matching(
+                base, [_clone_tree(parent) for parent in parent_trees]
+            )
+        if isinstance(node, Element):
+            return node
+        if isinstance(node, CombinedSelector):
+            node.selector = visit(node.selector)
+            node.subselector = visit(node.subselector)
+        elif isinstance(node, Negation):
+            node.selector = visit(node.selector)
+            node.subselector = visit(node.subselector)
+        elif isinstance(node, Relation):
+            node.selector = visit(node.selector)
+            node.arguments = [
+                (
+                    combinator,
+                    Selector(
+                        visit(argument.parsed_tree), argument.pseudo_element
+                    ),
+                )
+                for combinator, argument in node.arguments
+            ]
+        elif isinstance(node, (Matching, SpecificityAdjustment)):
+            node.selector = visit(node.selector)
+            node.selector_list = [
+                visit(argument) for argument in node.selector_list
+            ]
+        else:
+            node.selector = visit(node.selector)
+        return node
+
+    return visit(_clone_tree(tree))
 
 
 def parse_selector(stream: TokenStream) -> tuple[Tree, PseudoElement | None]:
@@ -671,6 +919,16 @@ def parse_simple_selector(
             )
         if peek.type == "HASH":
             result = Hash(result, cast("str", stream.next().value))
+        elif peek == ("DELIM", "&"):
+            stream.next()
+            if (
+                isinstance(result, Element)
+                and result.element is None
+                and result.namespace is None
+            ):
+                result = Nesting()
+            else:
+                result = Nesting(result)
         elif peek == ("DELIM", "."):
             stream.next()
             result = Class(result, stream.next_ident())

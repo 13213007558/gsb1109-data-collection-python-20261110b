@@ -51,7 +51,7 @@ ATTRIB_OPERATORS: dict[str, Callable[[str, str], bool]] = {
 }
 
 CSS_FRAGMENTS = [
-    *"abc*>+~,.#[]=^$|!()'\":- \\019nN",
+    *"abc*>+~,.#[]=^$|!()'\":-& \\019nN",
     ":not(",
     ":has(",
     ":is(",

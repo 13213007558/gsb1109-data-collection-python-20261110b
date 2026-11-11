@@ -1,6 +1,21 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+*   Added :func:`resolve_nested_selectors`, which expands the selectors of a
+    nested CSS rule into ordinary selectors. It takes the parent rule's
+    selector list (a string, or an iterable of :class:`Selector` objects
+    and/or strings) and the nested rule's selectors containing the nesting
+    selector ``&``, and returns one resolved :class:`Selector` per nested
+    selector. Each ``&`` is replaced by an ``:is()`` holding the whole parent
+    list, so the parent's contribution to the specificity is that of the most
+    specific parent selector: a low-specificity parent branch cannot
+    downgrade the nested rule, including when one nested selector references
+    the parent more than once. The stylesheet and its declarations are not
+    parsed.
+
 Version 1.6.0
 -------------
 

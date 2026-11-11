@@ -29,8 +29,10 @@ from cssselect import (
     ExpressionError,
     GenericTranslator,
     HTMLTranslator,
+    Selector,
     SelectorSyntaxError,
     parse,
+    resolve_nested_selectors,
 )
 from cssselect.parser import (
     Function,
@@ -408,6 +410,143 @@ class TestCssselect(unittest.TestCase):
             1,
             3,
         )
+
+    def test_nesting_parsing(self) -> None:
+        def repr_parse(css: str) -> list[str]:
+            return [repr(selector.parsed_tree) for selector in parse(css)]
+
+        assert repr_parse("&") == ["Nesting[&]"]
+        assert repr_parse("&.foo") == ["Class[Nesting[&].foo]"]
+        assert repr_parse("a&") == ["Nesting[Element[a]&]"]
+        assert repr_parse("a&.foo") == ["Class[Nesting[Element[a]&].foo]"]
+        assert repr_parse("& .b") == [
+            "CombinedSelector[Nesting[&] <followed> Class[Element[*].b]]"
+        ]
+        assert repr_parse("& + &") == [
+            "CombinedSelector[Nesting[&] + Nesting[&]]"
+        ]
+        assert repr_parse(":not(&)") == ["Negation[Element[*]:not(Nesting[&])]"]
+        assert repr_parse(":has(> &)") == [
+            "Relation[Element[*]:has(> Selector[Nesting[&]])]"
+        ]
+
+        selectors = parse("&, a& .b")
+        assert [selector.canonical() for selector in selectors] == ["&", "a& .b"]
+        # An unresolved nesting selector does not borrow the parent's
+        # specificity; it is only meaningful after resolution.
+        assert selectors[0].specificity() == (0, 0, 0)
+
+    def test_resolve_nested_selectors(self) -> None:
+        def resolve(
+            parents: str | Sequence[Selector | str], nested: str
+        ) -> list[tuple[str, tuple[int, int, int]]]:
+            return [
+                (selector.canonical(), selector.specificity())
+                for selector in resolve_nested_selectors(parents, nested)
+            ]
+
+        assert resolve(".a", "& .b") == [(":is(.a) .b", (0, 2, 0))]
+        assert resolve(".a, #b", "& .c") == [
+            (":is(.a, #b) .c", (1, 1, 0))
+        ]
+        # One resolved selector per nested selector, in group order.
+        assert resolve(".a", "& .b, & > .c") == [
+            (":is(.a) .b", (0, 2, 0)),
+            (":is(.a) > .c", (0, 2, 0)),
+        ]
+        # A type selector written before the nesting selector is kept.
+        assert resolve(".p", "a&:hover") == [("a:is(.p):hover", (0, 2, 1))]
+
+        # The parent list may be parsed Selector objects and/or strings.
+        assert resolve(parse(".x") + ["#y"], "& p") == [
+            (":is(.x, #y) p", (1, 0, 1))
+        ]
+
+        # A low-specificity parent branch must not downgrade the nested rule:
+        # the parent contributes the specificity of the most specific branch.
+        assert resolve("div, #main", "& .foo") == [
+            (":is(div, #main) .foo", (1, 1, 0))
+        ]
+        assert resolve("div, #main", "& + &") == [
+            (":is(div, #main) + :is(div, #main)", (2, 0, 0))
+        ]
+        assert resolve("div, #main", "& > & .bar") == [
+            (":is(div, #main) > :is(div, #main) .bar", (2, 1, 0))
+        ]
+        # Two references to the parent in one compound selector.
+        assert resolve(".a, #b", "&&") == [
+            (":is(.a, #b):is(.a, #b)", (2, 0, 0))
+        ]
+        # A universal parent contributes no specificity.
+        assert resolve("*", "& .x") == [(":is(*) .x", (0, 1, 0))]
+        # :where() in the parent keeps its zero adjustment.
+        assert resolve(":where(.a, #b)", "& .x") == [
+            (":is(:where(.a, #b)) .x", (0, 1, 0))
+        ]
+        # Nesting works inside functional pseudo-classes.
+        assert resolve(".a, #b", ":not(:has(> &))") == [
+            (":not(:has(> :is(.a, #b)))", (1, 0, 0))
+        ]
+
+        # Pseudo-elements are preserved on the resolved selector.
+        resolved = resolve_nested_selectors(".a", "&::before")
+        assert len(resolved) == 1
+        assert resolved[0].canonical() == ":is(.a)::before"
+        assert resolved[0].pseudo_element == "before"
+        assert resolved[0].specificity() == (0, 1, 1)
+
+        # Every resolved selector stays a parseable canonical selector with
+        # the same specificity.
+        for selector in resolve_nested_selectors(
+            "div, #main", "& .foo, & + &, :not(&)"
+        ):
+            reparsed = parse(selector.canonical())
+            assert len(reparsed) == 1
+            assert reparsed[0].canonical() == selector.canonical()
+            assert reparsed[0].specificity() == selector.specificity()
+
+        # Resolved selectors translate to XPath like ordinary selectors,
+        # while an unresolved nesting selector does not.
+        translator = GenericTranslator()
+        for selector in resolve_nested_selectors(".a, #b", "& > p"):
+            etree.XPath(translator.selector_to_xpath(selector))
+        with pytest.raises(ExpressionError):
+            translator.css_to_xpath("& > p")
+
+    def test_resolve_nested_selectors_errors(self) -> None:
+        def get_error(
+            parents: str | Sequence[Selector | str], nested: str
+        ) -> str:
+            with pytest.raises(SelectorSyntaxError) as exc_info:
+                resolve_nested_selectors(parents, nested)
+            return str(exc_info.value)
+
+        assert "empty" in get_error([], "& a")
+        # An empty parent string fails to parse first.
+        with pytest.raises(SelectorSyntaxError):
+            resolve_nested_selectors("", "& a")
+        assert "nesting selector" in get_error(".a", ".b")
+        # Invalid CSS in either argument raises the parser's error.
+        with pytest.raises(SelectorSyntaxError):
+            resolve_nested_selectors("!!", "& a")
+        with pytest.raises(SelectorSyntaxError):
+            resolve_nested_selectors(".a", "& !!")
+
+    def test_resolve_nested_selectors_does_not_mutate_inputs(self) -> None:
+        parents = parse(".a, #b")
+        nested = parse("& .b, :not(&)")
+        parent_repr = [repr(selector) for selector in parents]
+        nested_repr = [repr(selector) for selector in nested]
+
+        first = resolve_nested_selectors(parents, "& .b, :not(&)")
+        second = resolve_nested_selectors(parents, "& .b, :not(&)")
+        assert [repr(selector) for selector in first] == [
+            repr(selector) for selector in second
+        ]
+        assert [repr(selector) for selector in parents] == parent_repr
+        assert [repr(selector) for selector in nested] == nested_repr
+        # The two outputs do not share mutable selector trees.
+        assert first[0].parsed_tree is not second[0].parsed_tree
 
     def test_css_export(self) -> None:
         def css2css(css: str, res: str | None = None) -> None:
