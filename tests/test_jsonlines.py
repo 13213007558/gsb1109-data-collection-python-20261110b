@@ -7,6 +7,7 @@ import collections
 import io
 import json
 import tempfile
+from typing import List
 
 import jsonlines
 import pytest
@@ -144,6 +145,167 @@ def test_skip_invalid() -> None:
     it = reader.iter(skip_invalid=True)
     assert next(it) == 12
     assert next(it) == 34
+
+
+def test_on_invalid_invalid_json() -> None:
+    fp = io.StringIO("12\ninvalid\n34\n")
+    rejections: List[jsonlines.Rejection] = []
+    with jsonlines.Reader(fp) as reader:
+        values = list(
+            reader.iter(skip_invalid=True, on_invalid=rejections.append)
+        )
+    assert values == [12, 34]
+    assert len(rejections) == 1
+    rejection = rejections[0]
+    assert rejection.lineno == 2
+    assert rejection.line == "invalid\n"
+    assert rejection.reason is jsonlines.RejectionReason.INVALID_JSON
+
+
+def test_on_invalid_invalid_utf8() -> None:
+    fp = io.BytesIO(b"12\n\xff\xff\n34\n")
+    rejections: List[jsonlines.Rejection] = []
+    with jsonlines.Reader(fp) as reader:
+        values = list(
+            reader.iter(skip_invalid=True, on_invalid=rejections.append)
+        )
+    assert values == [12, 34]
+    assert len(rejections) == 1
+    rejection = rejections[0]
+    assert rejection.lineno == 2
+    assert rejection.line == b"\xff\xff\n"
+    assert rejection.reason is jsonlines.RejectionReason.INVALID_UTF8
+
+
+def test_on_invalid_type_mismatch() -> None:
+    fp = io.StringIO("12\ntrue\n34\n")
+    rejections: List[jsonlines.Rejection] = []
+    with jsonlines.Reader(fp) as reader:
+        values = list(
+            reader.iter(
+                type=int,
+                skip_invalid=True,
+                on_invalid=rejections.append,
+            )
+        )
+    assert values == [12, 34]
+    assert len(rejections) == 1
+    rejection = rejections[0]
+    assert rejection.lineno == 2
+    assert rejection.line == "true\n"
+    assert rejection.reason is jsonlines.RejectionReason.TYPE_MISMATCH
+
+
+def test_on_invalid_receives_unmodified_line() -> None:
+    """
+    The rejected line is passed verbatim, including a BOM prefix that is
+    otherwise stripped and trailing whitespace that is otherwise removed.
+    """
+    original_line = codecs.BOM_UTF8.decode() + "invalid  "
+    rejections: List[jsonlines.Rejection] = []
+    with jsonlines.Reader([original_line]) as reader:
+        list(reader.iter(skip_invalid=True, on_invalid=rejections.append))
+    assert len(rejections) == 1
+    assert rejections[0].lineno == 1
+    assert rejections[0].line == original_line
+
+
+def test_on_invalid_empty_lines_follow_skip_empty() -> None:
+    data = "12\n\n  \n34\n"
+
+    # With skip_empty=True, empty and whitespace-only lines are skipped
+    # without triggering the rejection callback.
+    rejections: List[jsonlines.Rejection] = []
+    with jsonlines.Reader(io.StringIO(data)) as reader:
+        values = list(
+            reader.iter(
+                skip_empty=True,
+                skip_invalid=True,
+                on_invalid=rejections.append,
+            )
+        )
+    assert values == [12, 34]
+    assert rejections == []
+
+    # With skip_empty=False, those same lines are invalid lines and get
+    # reported for quarantine.
+    quarantined: List[jsonlines.Rejection] = []
+    with jsonlines.Reader(io.StringIO(data)) as reader:
+        values = list(
+            reader.iter(skip_invalid=True, on_invalid=quarantined.append)
+        )
+    assert values == [12, 34]
+    assert [rejection.lineno for rejection in quarantined] == [2, 3]
+    assert [rejection.line for rejection in quarantined] == ["\n", "  \n"]
+    assert all(
+        rejection.reason is jsonlines.RejectionReason.INVALID_JSON
+        for rejection in quarantined
+    )
+
+
+def test_on_invalid_without_skip_invalid_is_ignored() -> None:
+    rejections: List[jsonlines.Rejection] = []
+    with jsonlines.Reader(io.StringIO("invalid\n")) as reader:
+        iterator = reader.iter(on_invalid=rejections.append)
+        with pytest.raises(jsonlines.InvalidLineError):
+            next(iterator)
+    assert rejections == []
+
+
+def test_on_invalid_callback_error_stops_iteration() -> None:
+    lines = iter(["12", "invalid", "34"])
+    reader = jsonlines.Reader(lines)
+
+    def fail(rejection: jsonlines.Rejection) -> None:
+        raise OSError("quarantine storage unavailable")
+
+    iterator = reader.iter(skip_invalid=True, on_invalid=fail)
+    assert next(iterator) == 12
+    with pytest.raises(OSError, match="quarantine"):
+        next(iterator)
+
+    # The generator must not silently continue, and the following line
+    # must not have been consumed from the underlying iterable.
+    assert next(lines) == "34"
+    with pytest.raises(StopIteration):
+        next(iterator)
+
+
+def test_on_invalid_callback_eoferror_is_not_swallowed() -> None:
+    def fail(rejection: jsonlines.Rejection) -> None:
+        raise EOFError("quarantine stream ended")
+
+    reader = jsonlines.Reader(io.StringIO("12\ninvalid\n34\n"))
+    iterator = reader.iter(skip_invalid=True, on_invalid=fail)
+    assert next(iterator) == 12
+    with pytest.raises(EOFError, match="quarantine"):
+        next(iterator)
+
+
+def test_invalid_line_error_reason_and_raw_line() -> None:
+    reader = jsonlines.Reader(io.StringIO("true"))
+    with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+        reader.read(type=int)
+    exc = excinfo.value
+    assert exc.reason is jsonlines.RejectionReason.TYPE_MISMATCH
+    assert exc.raw_line == "true"
+    assert exc.line == "true"
+
+    original_line = codecs.BOM_UTF8.decode() + "invalid  "
+    with jsonlines.Reader([original_line]) as failing_reader:
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            failing_reader.read()
+    exc = excinfo.value
+    assert exc.reason is jsonlines.RejectionReason.INVALID_JSON
+    assert exc.raw_line == original_line
+    assert exc.line == original_line.rstrip()
+
+    with jsonlines.Reader([b"\xff\xff"]) as failing_reader:
+        with pytest.raises(jsonlines.InvalidLineError) as excinfo:
+            failing_reader.read()
+    exc = excinfo.value
+    assert exc.reason is jsonlines.RejectionReason.INVALID_UTF8
+    assert exc.raw_line == b"\xff\xff"
 
 
 def test_empty_strings_in_iterable() -> None:

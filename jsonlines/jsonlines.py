@@ -51,6 +51,56 @@ VALID_TYPES = {
     str,
 }
 
+
+class RejectionReason(enum.Enum):
+    """
+    Reason why a line was rejected by the :py:class:`Reader`.
+
+    .. py:attribute:: INVALID_UTF8
+
+        the line is binary data that cannot be decoded as UTF-8
+
+    .. py:attribute:: INVALID_JSON
+
+        the line is valid text but does not contain valid JSON
+
+    .. py:attribute:: TYPE_MISMATCH
+
+        the line contains valid JSON, but not the requested data type
+    """
+
+    INVALID_UTF8 = enum.auto()
+    INVALID_JSON = enum.auto()
+    TYPE_MISMATCH = enum.auto()
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class Rejection:
+    """
+    A rejected input line.
+
+    Instances of this class are passed to the ``on_invalid`` callback of
+    :py:meth:`Reader.iter()` when ``skip_invalid=True`` is used.
+
+    .. py:attribute:: lineno
+
+        the line number of the rejected line, counted from 1
+
+    .. py:attribute:: line
+
+        the original line, without any modifications; this is a
+        ``str`` for text input and ``bytes`` for binary input
+
+    .. py:attribute:: reason
+
+        the reason the line was rejected, as a :py:class:`RejectionReason`
+    """
+
+    lineno: int
+    line: Union[str, bytes]
+    reason: RejectionReason
+
+
 # Characters to skip at the beginning of a line. Note: at most one such
 # character is skipped per line.
 SKIPPABLE_SINGLE_INITIAL_CHARS = (
@@ -70,6 +120,7 @@ Openable = Union[str, bytes, int, os.PathLike]
 
 LoadsCallable = Callable[[Union[str, bytes]], Any]
 DumpsCallable = Callable[[Any], Union[str, bytes]]
+InvalidLineCallback = Callable[[Rejection], None]
 
 # Currently, JSON structures cannot be typed properly:
 # - https://github.com/python/typing/issues/182
@@ -120,21 +171,41 @@ class InvalidLineError(Error, ValueError):
     different data type.
 
     The original line itself is stored on the exception instance as the
-    ``.line`` attribute, and the line number as ``.lineno``.
+    ``.line`` attribute, the line number as ``.lineno``, and the reason
+    the line was rejected as ``.reason`` (a :py:class:`RejectionReason`).
+
+    The unmodified line, including any trailing whitespace and without
+    decoding or other rewriting, is available as the ``.raw_line``
+    attribute. This is the same data handed to the ``on_invalid``
+    callback of :py:meth:`Reader.iter()`.
 
     This class subclasses both ``jsonlines.Error`` and the built-in
     ``ValueError``.
     """
 
-    #: The invalid line
+    #: The invalid line, with trailing whitespace stripped
     line: Union[str, bytes]
 
     #: The line number
     lineno: int
 
-    def __init__(self, message: str, line: Union[str, bytes], lineno: int) -> None:
+    #: The reason the line was rejected
+    reason: RejectionReason
+
+    #: The invalid line without any modifications
+    raw_line: Union[str, bytes]
+
+    def __init__(
+        self,
+        message: str,
+        line: Union[str, bytes],
+        lineno: int,
+        reason: RejectionReason,
+    ) -> None:
+        self.raw_line = line
         self.line = line.rstrip()
         self.lineno = lineno
+        self.reason = reason
         super().__init__(f"{message} (line {lineno})")
 
 
@@ -310,12 +381,19 @@ class Reader(ReaderWriterBase):
         except StopIteration:
             raise EOFError from None
 
+        # Keep the original line around before it is decoded or rewritten,
+        # so that rejected lines can be quarantined unchanged.
+        raw_line = line
+
         if isinstance(line, bytes):
             try:
                 line = line.decode("utf-8")
             except UnicodeDecodeError as orig_exc:
                 exc = InvalidLineError(
-                    f"line is not valid utf-8: {orig_exc}", line, lineno
+                    f"line is not valid utf-8: {orig_exc}",
+                    raw_line,
+                    lineno,
+                    RejectionReason.INVALID_UTF8,
                 )
                 raise exc from orig_exc
 
@@ -326,14 +404,22 @@ class Reader(ReaderWriterBase):
             value: JSONValue = self._loads(line)
         except ValueError as orig_exc:
             exc = InvalidLineError(
-                f"line contains invalid json: {orig_exc}", line, lineno
+                f"line contains invalid json: {orig_exc}",
+                raw_line,
+                lineno,
+                RejectionReason.INVALID_JSON,
             )
             raise exc from orig_exc
 
         if value is None:
             if allow_none:
                 return None
-            raise InvalidLineError("line contains null value", line, lineno)
+            raise InvalidLineError(
+                "line contains null value",
+                raw_line,
+                lineno,
+                RejectionReason.TYPE_MISMATCH,
+            )
 
         if type is not None:
             valid = isinstance(value, type)
@@ -342,7 +428,10 @@ class Reader(ReaderWriterBase):
                 valid = False
             if not valid:
                 raise InvalidLineError(
-                    "line does not match requested type", line, lineno
+                    "line does not match requested type",
+                    raw_line,
+                    lineno,
+                    RejectionReason.TYPE_MISMATCH,
                 )
 
         return value
@@ -356,6 +445,7 @@ class Reader(ReaderWriterBase):
         allow_none: Literal[False] = ...,
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_invalid: Optional[InvalidLineCallback] = ...,
     ) -> Iterator[JSONValue]:
         ...  # pragma: no cover
 
@@ -368,6 +458,7 @@ class Reader(ReaderWriterBase):
         allow_none: Literal[True],
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_invalid: Optional[InvalidLineCallback] = ...,
     ) -> Iterator[JSONValue]:
         ...  # pragma: no cover
 
@@ -380,6 +471,7 @@ class Reader(ReaderWriterBase):
         allow_none: Literal[False] = ...,
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_invalid: Optional[InvalidLineCallback] = ...,
     ) -> Iterator[TJSONValue]:
         ...  # pragma: no cover
 
@@ -392,6 +484,7 @@ class Reader(ReaderWriterBase):
         allow_none: Literal[True],
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_invalid: Optional[InvalidLineCallback] = ...,
     ) -> Iterator[Optional[TJSONValue]]:
         ...  # pragma: no cover
 
@@ -404,6 +497,7 @@ class Reader(ReaderWriterBase):
         allow_none: bool = ...,
         skip_empty: bool = ...,
         skip_invalid: bool = ...,
+        on_invalid: Optional[InvalidLineCallback] = ...,
     ) -> Iterator[Optional[TJSONValue]]:
         ...  # pragma: no cover
 
@@ -413,6 +507,7 @@ class Reader(ReaderWriterBase):
         allow_none: bool = False,
         skip_empty: bool = False,
         skip_invalid: bool = False,
+        on_invalid: Optional[InvalidLineCallback] = None,
     ) -> Iterator[Optional[JSONValue]]:
         """
         Iterate over all lines.
@@ -425,20 +520,45 @@ class Reader(ReaderWriterBase):
         When `skip_invalid` is set to ``True``, invalid lines will be
         silently ignored.
 
+        The optional `on_invalid` argument is only used together with
+        ``skip_invalid=True``. It must be a callable that is invoked for
+        every skipped line with a single :py:class:`Rejection` argument,
+        which contains the line number, the unmodified original line, and
+        the :py:class:`RejectionReason` why the line was rejected. This
+        can be used to quarantine rejected lines. Any exception raised by
+        the callable is propagated to the caller instead of being swallowed,
+        so that a failed quarantine never looks like a successful skip.
+
+        Empty lines are handled according to `skip_empty`, independently
+        of `skip_invalid` and `on_invalid`.
+
         See :py:meth:`~Reader.read()` for a description of the other
         arguments.
         """
-        try:
-            while True:
-                try:
-                    yield self.read(
-                        type=type, allow_none=allow_none, skip_empty=skip_empty
+        while True:
+            try:
+                value = self.read(
+                    type=type,
+                    allow_none=allow_none,
+                    skip_empty=skip_empty,
+                )
+            except EOFError:
+                return
+            except InvalidLineError as orig_exc:
+                if not skip_invalid:
+                    raise
+                if on_invalid is not None:
+                    # Deliberately outside of any try/except: a failed
+                    # quarantine must propagate instead of being skipped.
+                    on_invalid(
+                        Rejection(
+                            lineno=orig_exc.lineno,
+                            line=orig_exc.raw_line,
+                            reason=orig_exc.reason,
+                        )
                     )
-                except InvalidLineError:
-                    if not skip_invalid:
-                        raise
-        except EOFError:
-            pass
+            else:
+                yield value
 
     def __iter__(self) -> Iterator[Any]:
         """

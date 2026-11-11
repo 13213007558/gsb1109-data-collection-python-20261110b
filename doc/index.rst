@@ -49,6 +49,8 @@ Features
     :py:meth:`~jsonlines.Reader.iter()` method
   * can validate data types, including `None` checks
   * can skip invalid lines during iteration
+  * can report skipped lines to a callback, including their position,
+    unmodified contents, and a distinguishable rejection reason
   * provides decent error messages
   * can be used as a context manager
   * allows complete control over decoding using a custom ``loads``
@@ -123,6 +125,33 @@ calling :py:meth:`Reader.iter()` instead::
   for obj in reader.iter(type=dict, skip_invalid=True):
       ...
 
+Invalid lines that are skipped can be quarantined by passing an
+``on_invalid`` callable. It receives a :py:class:`Rejection` with the
+line number, the unmodified original line, and a
+:py:class:`RejectionReason` that distinguishes between lines that are
+not valid UTF-8, not valid JSON, or valid JSON that does not match the
+requested type::
+
+  quarantine = open("rejected.jsonl", "w")
+
+  def reject(rejection):
+      quarantine.write(rejection.line)
+      if not rejection.line.endswith("\n"):
+          quarantine.write("\n")
+
+  with quarantine:
+      for obj in reader.iter(
+          type=dict,
+          skip_invalid=True,
+          on_invalid=reject,
+      ):
+          ...
+
+If the callable raises an exception, iteration aborts and the exception
+propagates to the caller, so that a failed quarantine is never mistaken
+for a successfully skipped line. Empty lines are handled by
+``skip_empty`` independently; they are never reported as rejections.
+
 A :py:class:`Writer` wraps a file-like object, and can write a single
 object, or multiple objects at once::
 
@@ -177,6 +206,12 @@ API
 .. autoclass:: jsonlines.InvalidLineError
    :members:
 
+.. autoclass:: jsonlines.Rejection
+   :members:
+
+.. autoclass:: jsonlines.RejectionReason
+   :members:
+
 
 Contributing
 ============
@@ -188,6 +223,18 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* unreleased
+
+  * add an optional ``on_invalid`` callback to
+    :py:meth:`Reader.iter()` that receives a :py:class:`Rejection`
+    with the line number, unmodified original line, and a
+    :py:class:`RejectionReason` for every line skipped via
+    ``skip_invalid=True``; exceptions raised by the callback are
+    propagated instead of being swallowed
+
+  * add :py:attr:`InvalidLineError.reason` and
+    :py:attr:`InvalidLineError.raw_line`
 
 * 4.0.0, released at 2023-09-01
 
