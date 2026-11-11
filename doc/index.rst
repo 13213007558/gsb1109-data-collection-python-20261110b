@@ -54,6 +54,16 @@ Features
   * allows complete control over decoding using a custom ``loads``
     callable
 
+* Random access with :py:class:`~jsonlines.IndexedReader`
+
+  * builds an index of valid records for addressable (regular) files
+  * maps each valid record number to its physical line number and
+    byte offset, so blank or malformed lines no longer cause confusion
+  * fetches records in arbitrary order without rescanning the file
+  * binds the index to the read options and the file contents; the
+    index raises :py:class:`~jsonlines.StaleIndexError` when the file
+    was replaced or truncated
+
 * Flexible :py:class:`~jsonlines.Writer`
 
   * wraps a file-like object
@@ -154,6 +164,41 @@ calling code. That means no ``.close()`` is needed there::
   with jsonlines.open('input.jsonl') as reader:
       ...
 
+Random access by record number
+-------------------------------
+
+A plain :py:class:`Reader` counts *physical* lines while streaming,
+which makes it hard to locate a record by its number when the file also
+contains blank or malformed lines: the 840th valid record generally does
+not live on physical line 840. :py:class:`IndexedReader` solves this for
+regular, addressable files by scanning the file once and remembering the
+physical line number and byte offset of every valid record::
+
+  with jsonlines.index('input.jsonl') as indexed:
+      record = indexed.get(839)   # 840th valid record, zero-based
+      print(record.value)         # decoded JSON value
+      print(record.lineno)        # physical line number in the file
+      print(record.offset)        # byte offset where the line starts
+
+The returned :py:class:`IndexedRecord` makes the record directly
+locatable, e.g. by seeking a binary file to ``record.offset``. Records
+can be fetched in any order, so this also supports random access without
+rereading the whole file.
+
+The index is bound to the file and the read options (such as a custom
+``loads`` callable or ``skip_empty``) that were active when it was
+built. Before each access the file's size, inode and modification time
+are compared against the values recorded while indexing; if the file
+was replaced, truncated, or otherwise changed in the meantime,
+:py:class:`~jsonlines.StaleIndexError` is raised. Rescan the file to get
+a fresh index::
+
+  indexed.rebuild()
+
+Because an index requires seeking, it only works with regular files
+opened by path; non-seekable streams such as pipes keep working with the
+ordinary sequential :py:class:`Reader`.
+
 This should be enough to get started. See the API docs below for
 more details.
 
@@ -163,9 +208,18 @@ API
 
 .. autofunction:: jsonlines.open
 
+.. autofunction:: jsonlines.index
+
 .. autoclass:: jsonlines.Reader
    :members:
    :inherited-members:
+
+.. autoclass:: jsonlines.IndexedReader
+   :members:
+   :inherited-members:
+
+.. autoclass:: jsonlines.IndexedRecord
+   :members:
 
 .. autoclass:: jsonlines.Writer
    :members:
@@ -175,6 +229,9 @@ API
    :members:
 
 .. autoclass:: jsonlines.InvalidLineError
+   :members:
+
+.. autoclass:: jsonlines.StaleIndexError
    :members:
 
 
@@ -188,6 +245,14 @@ The source code and issue tracker for this package can be found on GitHub:
 
 Version history
 ===============
+
+* development version
+
+  * add :py:class:`~jsonlines.IndexedReader` and the
+    :py:func:`~jsonlines.index()` helper to index valid records in
+    addressable files, returning physical line numbers and byte offsets
+    for random access; stale indexes raise
+    :py:class:`~jsonlines.StaleIndexError`
 
 * 4.0.0, released at 2023-09-01
 

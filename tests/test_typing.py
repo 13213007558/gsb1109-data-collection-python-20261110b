@@ -66,6 +66,31 @@ def something_with_writer() -> None:
     locals()  # Silence flake8 F841
 
 
+def something_with_indexed_reader() -> None:
+    name = "/nonexistent"
+
+    indexed: jsonlines.IndexedReader
+    indexed = jsonlines.index(name)
+    indexed = jsonlines.index(name, loads=json.loads, skip_empty=True)
+    indexed = jsonlines.IndexedReader(name)
+    indexed = jsonlines.IndexedReader(name, loads=json.loads)
+
+    count: int = len(indexed)
+    record: jsonlines.IndexedRecord = indexed.get(0)
+    record = indexed.read_at(0, type=dict, allow_none=True)
+    record_index: int = record.record
+    record_lineno: int = record.lineno
+    record_offset: int = record.offset
+    record_value: object = record.value
+
+    for each in indexed.iter_all():
+        each_lineno: int = each.lineno
+        locals()  # Silence flake8 F841
+
+    indexed.rebuild()
+    locals()  # Silence flake8 F841
+
+
 def something_with_open() -> None:
     name = "/nonexistent"
 

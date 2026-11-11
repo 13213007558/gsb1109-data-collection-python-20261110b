@@ -18,6 +18,7 @@ from typing import (
     Iterator,
     List,
     Literal,
+    NamedTuple,
     Optional,
     Tuple,
     Type,
@@ -57,6 +58,25 @@ SKIPPABLE_SINGLE_INITIAL_CHARS = (
     "\x1e",  # RFC7464 text sequence
     codecs.BOM_UTF8.decode(),
 )
+
+# Byte-level equivalent of SKIPPABLE_SINGLE_INITIAL_CHARS.
+SKIPPABLE_SINGLE_INITIAL_BYTES = (
+    b"\x1e",  # RFC7464 text sequence
+    codecs.BOM_UTF8,
+)
+
+
+def strip_skippable_initial_bytes(line: bytes) -> bytes:
+    """
+    Strip a single leading record separator or UTF-8 BOM from a byte line.
+
+    This is the byte-level equivalent of the character stripping in
+    :py:class:`Reader`; the UTF-8 BOM is three bytes long.
+    """
+    for prefix in SKIPPABLE_SINGLE_INITIAL_BYTES:
+        if line.startswith(prefix):
+            return line[len(prefix) :]
+    return line
 
 
 class DumpsResultConversion(enum.Enum):
@@ -136,6 +156,17 @@ class InvalidLineError(Error, ValueError):
         self.line = line.rstrip()
         self.lineno = lineno
         super().__init__(f"{message} (line {lineno})")
+
+
+@attr.s(auto_exc=True, auto_attribs=True)
+class StaleIndexError(Error):
+    """
+    Error raised when a record index no longer matches its file.
+
+    This happens when the indexed file was replaced or truncated after
+    the index was built. Rebuild the index with
+    :py:meth:`IndexedReader.rebuild` to recover.
+    """
 
 
 @attr.s(auto_attribs=True, repr=False)
@@ -453,6 +484,228 @@ class Reader(ReaderWriterBase):
         return f"<{class_name} at 0x{id(self._file_or_iterable):x}>"
 
 
+class IndexedRecord(NamedTuple):
+    """
+    A single valid record together with its position in the source file.
+
+    Instances are returned by :py:class:`IndexedReader`.
+
+    :param record: zero-based record number, counting only valid records
+    :param value: decoded JSON value
+    :param lineno: one-based physical line number in the file
+    :param offset: byte offset of the start of the line in the file
+    """
+
+    record: int
+    value: JSONValue
+    lineno: int
+    offset: int
+
+
+@attr.s(auto_attribs=True, repr=False)
+class IndexedReader(ReaderWriterBase):
+    """
+    Random-access reader that builds a record index for a seekable file.
+
+    Unlike :py:class:`Reader`, which sequentially reads any iterable
+    (including pipes), this reader requires a regular file that can be
+    opened by path. It scans the file once to build an index mapping
+    valid record numbers to their physical line number and byte offset,
+    after which individual records can be fetched in arbitrary order.
+
+    Only lines that successfully decode into a JSON value are indexed.
+    Empty lines and malformed lines do not get a record number, but they
+    do make the physical line number diverge from the record number.
+
+    The index is bound to both the file and the read options used to
+    build it. Before each access the file's size, inode and modification
+    time are compared against the values recorded while indexing; if the
+    file was replaced, truncated, or otherwise changed,
+    :py:exc:`StaleIndexError` is raised. Call :py:meth:`rebuild` to
+    rescan the file and obtain a fresh index.
+
+    Instances can be used as a context manager.
+
+    :param file: name or ‘path-like object’ of the file to index
+    :param loads: custom json decoder callable
+    :param skip_empty: whether empty or whitespace-only lines are skipped
+    """
+
+    _file: Openable
+    _loads: LoadsCallable = attr.ib(default=default_loads, kw_only=True)
+    _skip_empty: bool = attr.ib(default=False, kw_only=True)
+    _entries: List[Tuple[int, int]] = attr.ib(factory=list, init=False)
+    _identity: Tuple[int, int, int, int] = attr.ib(
+        default=(0, 0, 0, 0), init=False
+    )
+    _built: bool = attr.ib(default=False, init=False)
+
+    def __attrs_post_init__(self) -> None:
+        self.rebuild()
+
+    def _open_fp(self) -> typing.IO[bytes]:
+        return builtins.open(self._file, mode="rb")
+
+    def _check_valid(self) -> None:
+        if self._closed:
+            raise RuntimeError("reader is closed")
+        if not self._built:
+            raise StaleIndexError("record index has not been built")
+        try:
+            stat = os.stat(self._file)
+        except OSError as orig_exc:
+            raise StaleIndexError(
+                f"indexed file is no longer available: {orig_exc}"
+            ) from orig_exc
+        identity = (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+        if identity != self._identity:
+            raise StaleIndexError(
+                "indexed file changed since the index was built; "
+                "call rebuild()"
+            )
+
+    def rebuild(self) -> None:
+        """
+        (Re)scan the file and rebuild the record index from scratch.
+        """
+        entries: List[Tuple[int, int]] = []
+        with self._open_fp() as fp:
+            offset = 0
+            for lineno, raw_line in enumerate(fp, 1):
+                line_offset = offset
+                offset += len(raw_line)
+
+                if self._skip_empty and not raw_line.strip():
+                    continue
+
+                raw = strip_skippable_initial_bytes(raw_line)
+                try:
+                    line = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+
+                try:
+                    self._loads(line)
+                except ValueError:
+                    continue
+
+                entries.append((lineno, line_offset))
+
+        stat = os.stat(self._file)
+        self._entries = entries
+        self._identity = (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+        self._built = True
+        self._closed = False
+
+    def __len__(self) -> int:
+        """
+        Number of indexed valid records.
+        """
+        self._check_valid()
+        return len(self._entries)
+
+    def _read_entry_at(
+        self, fp: typing.IO[bytes], index: int
+    ) -> IndexedRecord:
+        lineno, offset = self._entries[index]
+        fp.seek(offset)
+        raw_line = fp.readline()
+
+        line = raw_line.rstrip(b"\r\n")
+        line = strip_skippable_initial_bytes(line)
+        value: JSONValue = self._loads(line.decode("utf-8"))
+        return IndexedRecord(
+            record=index, value=value, lineno=lineno, offset=offset
+        )
+
+    def _read_entry(self, index: int) -> IndexedRecord:
+        with self._open_fp() as fp:
+            return self._read_entry_at(fp, index)
+
+    def get(self, record: int) -> IndexedRecord:
+        """
+        Fetch a single valid record by its zero-based record number.
+
+        :param record: zero-based valid record number
+        :raises StaleIndexError: if the indexed file changed
+        :raises IndexError: if the record number is out of range
+        """
+        self._check_valid()
+        count = len(self._entries)
+        index = record + count if record < 0 else record
+        if not 0 <= index < count:
+            raise IndexError(
+                f"record number out of range: {record} "
+                f"(index contains {count} records)"
+            )
+        return self._read_entry(index)
+
+    def read_at(
+        self,
+        record: int,
+        *,
+        type: Optional[Type[Any]] = None,
+        allow_none: bool = False,
+    ) -> IndexedRecord:
+        """
+        Fetch a record, optionally validating its decoded value.
+
+        See :py:meth:`Reader.read` for the meaning of the `type` and
+        `allow_none` arguments.
+
+        :param record: zero-based valid record number
+        :raises StaleIndexError: if the indexed file changed
+        :raises IndexError: if the record number is out of range
+        :raises InvalidLineError: if the value does not satisfy the
+            requested type or null handling
+        """
+        if type is not None and type not in VALID_TYPES:
+            raise ValueError("invalid type specified")
+
+        indexed_record = self.get(record)
+        value = indexed_record.value
+        if value is None:
+            if not allow_none:
+                raise InvalidLineError(
+                    "line contains null value",
+                    repr(value),
+                    indexed_record.lineno,
+                )
+        elif type is not None:
+            valid = isinstance(value, type)
+            if type is int and isinstance(value, bool):
+                valid = False
+            if not valid:
+                raise InvalidLineError(
+                    "line does not match requested type",
+                    repr(value),
+                    indexed_record.lineno,
+                )
+        return indexed_record
+
+    def iter_all(self) -> Iterator[IndexedRecord]:
+        """
+        Yield every indexed record in record-number order.
+        """
+        self._check_valid()
+        with self._open_fp() as fp:
+            for index in range(len(self._entries)):
+                yield self._read_entry_at(fp, index)
+
+    def _repr_for_wrapped(self) -> str:
+        return repr_for_fp_path(self._file)
+
+
 @attr.s(auto_attribs=True, repr=False)
 class Writer(ReaderWriterBase):
     """
@@ -654,6 +907,33 @@ def open(
     return instance
 
 
+def index(
+    file: Openable,
+    *,
+    loads: Optional[LoadsCallable] = None,
+    skip_empty: bool = False,
+) -> IndexedReader:
+    """
+    Open a jsonlines file and build a record index for random access.
+
+    This is a convenience wrapper around :py:class:`IndexedReader`. The
+    resulting reader must be closed after use by the caller; using a
+    ``with`` block is recommended.
+
+    :param file: name or ‘path-like object’ of the file to index
+    :param loads: custom json decoder callable
+    :param skip_empty: whether empty or whitespace-only lines are skipped
+    """
+    if isinstance(file, int):
+        raise ValueError("an indexed reader requires a file path, not a fd")
+    kwargs: Dict[str, Any] = {}
+    if loads is not None:
+        kwargs["loads"] = loads
+    if skip_empty:
+        kwargs["skip_empty"] = skip_empty
+    return IndexedReader(file, **kwargs)
+
+
 def repr_for_fp(fp: typing.IO[Any]) -> str:
     """
     Helper to make a useful repr() for a file-like object.
@@ -663,3 +943,12 @@ def repr_for_fp(fp: typing.IO[Any]) -> str:
         return repr(name)
     else:
         return repr(fp)
+
+
+def repr_for_fp_path(file: Openable) -> str:
+    """
+    Helper to make a useful repr() for a file path.
+    """
+    if isinstance(file, int):
+        return repr(file)
+    return repr(os.fspath(file))
