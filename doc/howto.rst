@@ -839,3 +839,37 @@ All ``expect_request``, ``expect_oneshot_request``, and
 ``expect_ordered_request`` methods are available on the baked object. Other
 attributes such as ``url_for()`` and ``check_assertions()`` are delegated to
 the underlying server transparently.
+
+
+Publishing expectations atomically
+-----------------------------------
+
+When a long list of expectations is generated (for example from a file),
+registering them one by one means the first rules are already live while later
+rules are still being added. If one of those rules is invalid (such as a
+matcher that raises when evaluated), the server ends up in a half-configured
+state.
+
+The ``expectation_group()`` method returns an
+:py:class:`~pytest_httpserver.ExpectationGroup` that collects expectations
+without making them visible. Calling ``publish()`` first validates every rule:
+each matcher is evaluated once and every handler must define a response. If any
+rule is invalid, a :py:class:`~pytest_httpserver.HandlerRegistrationError`
+reports the position of the failing rule and none of the group's rules become
+visible. On success the whole group appears in a single step.
+
+.. literalinclude :: ../tests/examples/test_howto_expectation_group.py
+   :language: python
+
+The group can also be used as a context manager, which publishes on a clean
+exit and skips publishing if the block raises. The group accepts permanent,
+oneshot, and ordered expectations through the same ``expect_request``,
+``expect_oneshot_request``, and ``expect_ordered_request`` methods.
+
+To swap one complete set of rules for another, create the group with
+``replace=True`` (or call ``publish(replace=True)``). The old rules are removed
+and the new ones installed under a single lock, so a request being matched
+while the set is replaced never sees a mixture of the two generations. A
+failed validation leaves the currently visible rules untouched. The
+per-item ``expect_request()`` API keeps working and can be mixed freely with
+groups.

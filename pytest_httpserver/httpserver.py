@@ -15,6 +15,7 @@ from collections.abc import Generator
 from collections.abc import Iterable
 from collections.abc import Mapping
 from collections.abc import MutableMapping
+from collections.abc import Sequence
 from contextlib import contextmanager
 from contextlib import suppress
 from copy import copy
@@ -78,6 +79,18 @@ class NoHandlerError(Error):
 class HTTPServerError(Error):
     """
     Raised when there's a problem with HTTP server.
+    """
+
+
+class HandlerRegistrationError(Error):
+    """
+    Raised when an :py:class:`ExpectationGroup` cannot be published.
+
+    Publishing validates every rule of the group first. A rule is invalid when
+    its matcher raises while evaluated (for example a broken regular expression)
+    or when it has no response defined. The error identifies the position of the
+    invalid rule within the group, and no rule from the group becomes visible on
+    the server.
     """
 
 
@@ -315,6 +328,18 @@ def _create_query_matcher(query_string: QueryMatcher | str | bytes | Mapping[str
         return MappingQueryMatcher(query_string)
 
     raise TypeError("Unable to cast this type to QueryMatcher: {!r}".format(type(query_string)))
+
+
+def _validate_matcher(matcher: RequestMatcher) -> None:
+    """
+    Exercise a matcher once so invalid rules (eg. a broken regular expression)
+    fail before any handler of a batch becomes visible.
+
+    Matching runs lazily, only when a request arrives, so merely constructing the
+    matcher does not reveal such errors.
+    """
+    probe_request = Request.from_values(path="/")
+    matcher.match(probe_request)
 
 
 class URIPattern(abc.ABC):
@@ -688,6 +713,134 @@ class HandlerType(Enum):
     PERMANENT = "permanent"
     ONESHOT = "oneshot"
     ORDERED = "ordered"
+
+
+class ExpectationGroup:
+    """
+    A batch of request expectations published atomically.
+
+    Handlers are collected first and stay invisible until :py:meth:`publish` is
+    called. Publishing validates every rule of the group (each matcher must not
+    raise when evaluated and each handler must define a response); when any rule
+    is invalid, a :py:class:`HandlerRegistrationError` identifies the offending
+    item and no rule of the group becomes visible. On success, the whole group
+    becomes visible in a single step, so a request being matched while another
+    set of expectations is published never sees a mix of old and new rules.
+
+    Use :py:meth:`HTTPServer.expectation_group` to create an instance bound to a
+    server. The group supports the context manager protocol, publishing on a
+    clean exit.
+
+    :param server: the server the group will be published to.
+    :param replace: default value for the ``replace`` argument of :py:meth:`publish`.
+    """
+
+    def __init__(self, server: HTTPServer, *, replace: bool = False) -> None:
+        self._server = server
+        self._handlers: list[tuple[HandlerType, RequestHandler]] = []
+        self._replace = replace
+        self._published = False
+
+    def _register(
+        self,
+        handler_type: HandlerType,
+        uri: str | URIPattern | Pattern[str],
+        **kwargs: Unpack[RequestMatcherKwargs],
+    ) -> RequestHandler:
+        if self._published:
+            raise HandlerRegistrationError("Cannot add expectations to a published group")
+        matcher = self._server.create_matcher(uri, **kwargs)
+        request_handler = RequestHandler(matcher)
+        self._handlers.append((handler_type, request_handler))
+        return request_handler
+
+    def expect_request(
+        self,
+        uri: str | URIPattern | Pattern[str],
+        **kwargs: Unpack[RequestMatcherKwargs],
+    ) -> RequestHandler:
+        """Add a permanent expectation to the group.
+
+        Accepts the same parameters as :py:meth:`HTTPServer.expect_request`,
+        apart from ``handler_type`` which is selected by the method called.
+        """
+        return self._register(HandlerType.PERMANENT, uri, **kwargs)
+
+    def expect_oneshot_request(
+        self,
+        uri: str | URIPattern | Pattern[str],
+        **kwargs: Unpack[RequestMatcherKwargs],
+    ) -> RequestHandler:
+        """Add a oneshot expectation to the group.
+
+        Accepts the same parameters as :py:meth:`HTTPServer.expect_oneshot_request`.
+        """
+        return self._register(HandlerType.ONESHOT, uri, **kwargs)
+
+    def expect_ordered_request(
+        self,
+        uri: str | URIPattern | Pattern[str],
+        **kwargs: Unpack[RequestMatcherKwargs],
+    ) -> RequestHandler:
+        """Add an ordered expectation to the group.
+
+        Accepts the same parameters as :py:meth:`HTTPServer.expect_ordered_request`.
+        """
+        return self._register(HandlerType.ORDERED, uri, **kwargs)
+
+    def add_handler(self, handler: RequestHandler, handler_type: HandlerType) -> None:
+        """Add an already created :py:class:`RequestHandler` to the group."""
+        if self._published:
+            raise HandlerRegistrationError("Cannot add expectations to a published group")
+        self._handlers.append((handler_type, handler))
+
+    @property
+    def handlers(self) -> Sequence[RequestHandler]:
+        """The handlers collected in the group, in registration order."""
+        return tuple(handler for _handler_type, handler in self._handlers)
+
+    def _validate(self) -> None:
+        for index, (_handler_type, handler) in enumerate(self._handlers, start=1):
+            try:
+                _validate_matcher(handler.matcher)
+            except Exception as exc:
+                raise HandlerRegistrationError(
+                    "Invalid matcher in rule #{} ({}): {}".format(index, handler.matcher, exc)
+                ) from exc
+            if handler.request_handler is None:
+                raise HandlerRegistrationError(
+                    "No response defined for rule #{} ({}): call one of the respond_* methods before publishing".format(
+                        index, handler.matcher
+                    )
+                )
+
+    def publish(self, *, replace: bool | None = None) -> None:
+        """Validate the group and make all its rules visible atomically.
+
+        :param replace: when true, all previously registered handlers are
+            removed and replaced by this group in a single step. When false
+            (the default, or the value given to the constructor), the group is
+            added to the existing handlers. Validation runs first, so a failed
+            publish never changes the currently visible rules, even in replace
+            mode.
+        """
+        if replace is None:
+            replace = self._replace
+        self._validate()
+        self._server._publish_handlers(self._handlers, replace=replace)  # noqa: SLF001
+        self._published = True
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        if exc_type is None:
+            self.publish()
 
 
 class HTTPServerBase(abc.ABC):  # pylint: disable=too-many-instance-attributes
@@ -1067,6 +1220,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         self.oneshot_handlers = RequestHandlerList()
         self.handlers = RequestHandlerList()
         self.permanently_failed = False
+        self._handlers_lock = threading.RLock()
         if default_waiting_settings is not None:
             self.default_waiting_settings = default_waiting_settings
         else:
@@ -1116,9 +1270,47 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         Clears all types of the handlers (ordered, oneshot, permanent)
         """
 
-        self.ordered_handlers = []
-        self.oneshot_handlers = RequestHandlerList()
-        self.handlers = RequestHandlerList()
+        with self._handlers_lock:
+            self.ordered_handlers = []
+            self.oneshot_handlers = RequestHandlerList()
+            self.handlers = RequestHandlerList()
+
+    def _add_handler(self, request_handler: RequestHandler, handler_type: HandlerType) -> None:
+        with self._handlers_lock:
+            if handler_type == HandlerType.PERMANENT:
+                self.handlers.append(request_handler)
+            elif handler_type == HandlerType.ONESHOT:
+                self.oneshot_handlers.append(request_handler)
+            elif handler_type == HandlerType.ORDERED:
+                self.ordered_handlers.append(request_handler)
+
+    def expectation_group(self, *, replace: bool = False) -> ExpectationGroup:
+        """
+        Create an :py:class:`ExpectationGroup` for publishing expectations atomically.
+
+        Collect expectations on the returned object (the group keeps them
+        invisible), then call its ``publish()`` method (or use it as a context
+        manager) to validate and publish the whole batch at once.
+
+        :param replace: default for the group's ``publish(replace=...)``. When
+            true, publishing replaces every currently visible handler instead of
+            adding to them.
+        """
+        return ExpectationGroup(self, replace=replace)
+
+    def _publish_handlers(
+        self,
+        handlers: Sequence[tuple[HandlerType, RequestHandler]],
+        *,
+        replace: bool,
+    ) -> None:
+        with self._handlers_lock:
+            if replace:
+                self.ordered_handlers = []
+                self.oneshot_handlers = RequestHandlerList()
+                self.handlers = RequestHandlerList()
+            for handler_type, request_handler in handlers:
+                self._add_handler(request_handler, handler_type)
 
     def expect(self, matcher: RequestMatcher, handler_type: HandlerType = HandlerType.PERMANENT) -> RequestHandler:
         """
@@ -1128,12 +1320,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
         :param handler_type: type of handler
         """
         request_handler = RequestHandler(matcher)
-        if handler_type == HandlerType.PERMANENT:
-            self.handlers.append(request_handler)
-        elif handler_type == HandlerType.ONESHOT:
-            self.oneshot_handlers.append(request_handler)
-        elif handler_type == HandlerType.ORDERED:
-            self.ordered_handlers.append(request_handler)
+        self._add_handler(request_handler, handler_type)
         return request_handler
 
     def expect_request(
@@ -1216,12 +1403,7 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             **({"data_form": data_form} if data_form is not None else {}),
         )
         request_handler = RequestHandler(matcher)
-        if handler_type == HandlerType.PERMANENT:
-            self.handlers.append(request_handler)
-        elif handler_type == HandlerType.ONESHOT:
-            self.oneshot_handlers.append(request_handler)
-        elif handler_type == HandlerType.ORDERED:
-            self.ordered_handlers.append(request_handler)
+        self._add_handler(request_handler, handler_type)
         return request_handler
 
     def expect_oneshot_request(
@@ -1360,15 +1542,16 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
             else:
                 return ["    none"]
 
-        lines: list[str] = []
-        lines.append("Ordered matchers:")
-        lines.extend(format_handlers(self.ordered_handlers))
-        lines.append("")
-        lines.append("Oneshot matchers:")
-        lines.extend(format_handlers(self.oneshot_handlers))
-        lines.append("")
-        lines.append("Persistent matchers:")
-        lines.extend(format_handlers(self.handlers))
+        with self._handlers_lock:
+            lines: list[str] = []
+            lines.append("Ordered matchers:")
+            lines.extend(format_handlers(self.ordered_handlers))
+            lines.append("")
+            lines.append("Oneshot matchers:")
+            lines.extend(format_handlers(self.oneshot_handlers))
+            lines.append("")
+            lines.append("Persistent matchers:")
+            lines.extend(format_handlers(self.handlers))
 
         return "\n".join(lines)
 
@@ -1419,30 +1602,31 @@ class HTTPServer(HTTPServerBase):  # pylint: disable=too-many-instance-attribute
 
             return Response(HTTPStatus.OK.phrase, status=HTTPStatus.OK.value)
 
-        if self.permanently_failed:
-            return self.respond_permanent_failure()
+        with self._handlers_lock:
+            if self.permanently_failed:
+                return self.respond_permanent_failure()
 
-        handler = None
-        if self.ordered_handlers:
-            handler = self.ordered_handlers[0]
-            if not handler.matcher.match(request):
-                self.permanently_failed = True
-                response = self.respond_nohandler(request)
-                return response
+            handler = None
+            if self.ordered_handlers:
+                handler = self.ordered_handlers[0]
+                if not handler.matcher.match(request):
+                    self.permanently_failed = True
+                    response = self.respond_nohandler(request)
+                    return response
 
-            self.ordered_handlers.pop(0)
-            self._update_waiting_result()
-
-        if not handler:
-            handler = self.oneshot_handlers.match(request)
-            if handler:
-                self.oneshot_handlers.remove(handler)
+                self.ordered_handlers.pop(0)
                 self._update_waiting_result()
-            else:
-                handler = self.handlers.match(request)
 
             if not handler:
-                return self.respond_nohandler(request)
+                handler = self.oneshot_handlers.match(request)
+                if handler:
+                    self.oneshot_handlers.remove(handler)
+                    self._update_waiting_result()
+                else:
+                    handler = self.handlers.match(request)
+
+                if not handler:
+                    return self.respond_nohandler(request)
 
         try:
             response = handler.respond(request)

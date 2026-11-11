@@ -43,6 +43,12 @@ BakedHTTPServer
     .. autoclass:: BakedHTTPServer
         :members:
 
+ExpectationGroup
+~~~~~~~~~~~~~~~~
+
+    .. autoclass:: ExpectationGroup
+        :members:
+
 BlockingHTTPServer
 ~~~~~~~~~~~~~~~~~~
 
@@ -85,6 +91,12 @@ HTTPServerError
 ~~~~~~~~~~~~~~~
 
     .. autoclass:: HTTPServerError
+        :members:
+
+HandlerRegistrationError
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+    .. autoclass:: HandlerRegistrationError
         :members:
 
 NoHandlerError

@@ -11,8 +11,10 @@ __all__ = [
     "BlockingRequestHandler",
     "CaseInsensitiveHeaderValueMatcher",
     "Error",
+    "ExpectationGroup",
     "HTTPServer",
     "HTTPServerError",
+    "HandlerRegistrationError",
     "HeaderValueMatcher",
     "NoHandlerError",
     "RequestHandler",
@@ -29,6 +31,8 @@ from .httpserver import METHOD_ALL
 from .httpserver import URI_DEFAULT
 from .httpserver import CaseInsensitiveHeaderValueMatcher
 from .httpserver import Error
+from .httpserver import ExpectationGroup
+from .httpserver import HandlerRegistrationError
 from .httpserver import HeaderValueMatcher
 from .httpserver import HTTPServer
 from .httpserver import HTTPServerError

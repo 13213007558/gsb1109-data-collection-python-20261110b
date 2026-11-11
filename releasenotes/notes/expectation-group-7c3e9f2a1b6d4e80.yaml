@@ -1,0 +1,14 @@
+---
+features:
+  - |
+    Add the ``expectation_group()`` method to ``HTTPServer`` and an
+    ``ExpectationGroup`` class for publishing a batch of request expectations
+    atomically. Expectations collected on the group stay invisible until
+    ``publish()`` is called. Publishing validates every rule first: each
+    matcher is evaluated once and every handler must define a response. When a
+    rule is invalid, ``HandlerRegistrationError`` identifies its position in
+    the group and no rule from the group becomes visible. Publishing with
+    ``replace=True`` swaps the complete set of handlers under a single lock, so
+    a request matched while the set is replaced never sees a mixture of old
+    and new rules. The existing per-item ``expect_request()`` API is unchanged
+    and can be mixed freely with groups.
