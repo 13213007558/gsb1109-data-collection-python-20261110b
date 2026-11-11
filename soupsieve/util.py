@@ -31,6 +31,10 @@ def lower(string: str) -> str:
     return ascii_lower(string)
 
 
+class SelectorWorkError(Exception):
+    """The declared work budget was exhausted before the match operation could complete."""
+
+
 class SelectorSyntaxError(Exception):
     """Syntax error in a CSS selector."""
 

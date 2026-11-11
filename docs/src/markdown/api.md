@@ -109,7 +109,7 @@ sv.select('div:has(> p:has(+ .b + .c))', soup, flags=sv.NOSTRICT)
 ## `soupsieve.select_one()`
 
 ```py
-def select_one(select, tag, namespaces=None, flags=0, **kwargs):
+def select_one(select, tag, namespaces=None, flags=0, *, max_work=None, **kwargs):
     """Select the specified tags."""
 ```
 
@@ -127,7 +127,7 @@ sv.select_one('p:is(.a, .b, .c)', soup)
 ## `soupsieve.select()`
 
 ```py
-def select(select, tag, namespaces=None, limit=0, flags=0, **kwargs):
+def select(select, tag, namespaces=None, limit=0, flags=0, *, max_work=None, **kwargs):
     """Select the specified tags."""
 ```
 
@@ -145,7 +145,7 @@ sv.select('p:is(.a, .b, .c)', soup)
 ## `soupsieve.iselect()`
 
 ```py
-def iselect(select, node, namespaces=None, limit=0, flags=0, **kwargs):
+def iselect(select, node, namespaces=None, limit=0, flags=0, *, max_work=None, **kwargs):
     """Select the specified tags."""
 ```
 
@@ -154,7 +154,7 @@ def iselect(select, node, namespaces=None, limit=0, flags=0, **kwargs):
 ## `soupsieve.closest()`
 
 ```py
-def closest(select, tag, namespaces=None, flags=0, **kwargs):
+def closest(select, tag, namespaces=None, flags=0, *, max_work=None, **kwargs):
     """Match closest ancestor to the provided tag."""
 ```
 
@@ -167,7 +167,7 @@ dictionary, and `flags`.
 ## `soupsieve.match()`
 
 ```py
-def match(select, tag, namespaces=None, flags=0, **kwargs):
+def match(select, tag, namespaces=None, flags=0, *, max_work=None, **kwargs):
     """Match node."""
 ```
 
@@ -185,7 +185,7 @@ sv.match('p:not(.b)', nodes[1])
 ## `soupsieve.filter()`
 
 ```py
-def filter(select, nodes, namespaces=None, flags=0, **kwargs):
+def filter(select, nodes, namespaces=None, flags=0, *, max_work=None, **kwargs):
     """Filter list of nodes."""
 ```
 
@@ -234,22 +234,22 @@ selector functions available via the module without the need to specify the sele
 class SoupSieve:
     """Match tags in Beautiful Soup with CSS selectors."""
 
-    def match(self, tag):
+    def match(self, tag, max_work=None):
         """Match."""
 
-    def closest(self, tag):
+    def closest(self, tag, max_work=None):
         """Match closest ancestor."""
 
-    def filter(self, iterable):
+    def filter(self, iterable, max_work=None):
         """Filter."""
 
-    def select_one(self, tag):
+    def select_one(self, tag, max_work=None):
         """Select a single tag."""
 
-    def select(self, tag, limit=0):
+    def select(self, tag, limit=0, max_work=None):
         """Select the specified tags."""
 
-    def iselect(self, tag, limit=0):
+    def iselect(self, tag, limit=0, max_work=None):
         """Iterate the specified tags."""
 ```
 
@@ -381,6 +381,25 @@ try:
     sv.compile('.a, .b, .c', max_selectors=2)
 except ValueError:
     print('Too many selectors')
+```
+
+## Work Budget
+
+`select`, `iselect`, `select_one`, `closest`, `match`, and `filter` all accept an optional, keyword only `max_work`
+parameter that declares a work budget for a single match operation. The budget counts element evaluations, not wall
+clock time: every time an element is evaluated against the selectors, one unit is spent, even if the same element is
+evaluated again while checking ancestors, siblings, or descendants (as can happen often with `:has()`).
+
+If the budget is exhausted before the operation completes, `soupsieve.SelectorWorkError` is raised. This is an explicit
+incomplete state: a partially iterated selection is never reported as a finished one. Calls that do not declare a
+budget behave exactly as before.
+
+```py play exceptions
+import soupsieve as sv
+try:
+    sv.select('div:has(> p)', soup, max_work=1000)
+except sv.SelectorWorkError:
+    print('Selection incomplete: work budget exhausted')
 ```
 
 ## Thread Safety

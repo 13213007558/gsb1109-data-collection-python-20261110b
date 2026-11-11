@@ -105,6 +105,36 @@ class TreeForms(NamedTuple):
     checked: dict[tuple[int, str], bs4.Tag]
 
 
+class _WorkBudget:
+    """
+    Track the work spent against an optional limit for a single match operation.
+
+    Every element evaluated against the selectors spends one unit, even if the same
+    element is evaluated again while checking ancestors, siblings, or descendants.
+    """
+
+    __slots__ = ('max_work', 'spent')
+
+    def __init__(self, max_work: int | None) -> None:
+        """Initialize."""
+
+        if max_work is not None and max_work < 0:
+            raise ValueError("'max_work' must be a non-negative integer or None")
+        self.max_work = max_work
+        self.spent = 0
+
+    def spend(self) -> None:
+        """Account for one element evaluation, raising when the budget is exhausted."""
+
+        if self.max_work is not None:
+            self.spent += 1
+            if self.spent > self.max_work:
+                raise util.SelectorWorkError(
+                    f"Work budget of {self.max_work} element evaluation(s) exceeded; "
+                    "the match operation is incomplete"
+                )
+
+
 class _DocumentNav:
     """Navigate a Beautiful Soup document."""
 
@@ -603,12 +633,14 @@ class CSSMatch(_DocumentNav):
         selectors: ct.SelectorList,
         scope: bs4.Tag | None,
         namespaces: ct.Namespaces | None,
-        flags: int
+        flags: int,
+        budget: _WorkBudget | None = None
     ) -> None:
         """Initialize."""
 
         self.assert_valid_input(scope)
         self.tag = scope
+        self.budget = budget
         self.cached_meta_lang: list[tuple[str, str]] = []
         self.cached_forms: dict[int, TreeForms] = {}
         self.cached_options: dict[int, dict[int, bool]] = {}
@@ -1928,6 +1960,18 @@ class CSSMatch(_DocumentNav):
                 self.edit_cache[key] = editable
         return editable
 
+    def _match_frame(self, el: bs4.Tag, selectors: ct.SelectorList) -> Generator[MatchRequest | bool, bool, None]:
+        """
+        Create a generator that matches an element against the selectors.
+
+        Each element evaluated is actual work, so one unit of the caller's work budget
+        is spent every time, even if the same element has been evaluated before.
+        """
+
+        if self.budget is not None:
+            self.budget.spend()
+        return self._match_selectors(el, selectors)
+
     def match_selectors(self, el: bs4.Tag, selectors: ct.SelectorList) -> bool:
         """
         Check if element matches one of the selectors.
@@ -1941,13 +1985,13 @@ class CSSMatch(_DocumentNav):
 
         # Most matches never need a nested match, so avoid setting up the stack unless needed.
         # `frame` yields a `bool` when it is done.
-        frame = self._match_selectors(el, selectors)
+        frame = self._match_frame(el, selectors)
         item = next(frame)
         if item.__class__ is bool:
             return item
 
         # We need to setup a stack as a selector has sent back a match request.
-        stack = [frame, self._match_selectors(*cast('MatchRequest', item))]
+        stack = [frame, self._match_frame(*cast('MatchRequest', item))]
         result: bool | None = None
         while True:
             item = stack[-1].send(result)  # type: ignore[arg-type]
@@ -1957,7 +2001,7 @@ class CSSMatch(_DocumentNav):
                     return item
                 result = item
             else:
-                stack.append(self._match_selectors(*cast('MatchRequest', item)))
+                stack.append(self._match_frame(*cast('MatchRequest', item)))
                 result = None
 
     def _match_selectors(self, el: bs4.Tag, selectors: ct.SelectorList) -> Generator[MatchRequest | bool, bool, None]:
@@ -2123,17 +2167,19 @@ class SoupSieve(ct.Immutable):
             flags=flags
         )
 
-    def match(self, tag: bs4.Tag) -> bool:
+    def match(self, tag: bs4.Tag, max_work: int | None = None) -> bool:
         """Match."""
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).match(tag)
+        budget = _WorkBudget(max_work) if max_work is not None else None
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, budget).match(tag)
 
-    def closest(self, tag: bs4.Tag) -> bs4.Tag | None:
+    def closest(self, tag: bs4.Tag, max_work: int | None = None) -> bs4.Tag | None:
         """Match closest ancestor."""
 
-        return CSSMatch(self.selectors, tag, self.namespaces, self.flags).closest()
+        budget = _WorkBudget(max_work) if max_work is not None else None
+        return CSSMatch(self.selectors, tag, self.namespaces, self.flags, budget).closest()
 
-    def filter(self, iterable: Iterable[bs4.Tag]) -> list[bs4.Tag]:  # noqa A001
+    def filter(self, iterable: Iterable[bs4.Tag], max_work: int | None = None) -> list[bs4.Tag]:  # noqa A001
         """
         Filter.
 
@@ -2145,27 +2191,34 @@ class SoupSieve(ct.Immutable):
         so for those, we use a new `CSSMatch` for each item in the iterable.
         """
 
+        budget = _WorkBudget(max_work) if max_work is not None else None
         if isinstance(iterable, bs4.Tag):
-            return CSSMatch(self.selectors, iterable, self.namespaces, self.flags).filter()
+            return CSSMatch(self.selectors, iterable, self.namespaces, self.flags, budget).filter()
         else:
             # There is no guarantee that elements are from the same document, evaluate them separately.
-            return [node for node in iterable if not CSSMatch.is_navigable_string(node) and self.match(node)]
+            # The budget is shared, as the whole filter is a single match operation.
+            return [
+                node for node in iterable
+                if not CSSMatch.is_navigable_string(node) and
+                CSSMatch(self.selectors, node, self.namespaces, self.flags, budget).match(node)
+            ]
 
-    def select_one(self, tag: bs4.Tag) -> bs4.Tag | None:
+    def select_one(self, tag: bs4.Tag, max_work: int | None = None) -> bs4.Tag | None:
         """Select a single tag."""
 
-        tags = self.select(tag, limit=1)
+        tags = self.select(tag, limit=1, max_work=max_work)
         return tags[0] if tags else None
 
-    def select(self, tag: bs4.Tag, limit: int = 0) -> list[bs4.Tag]:
+    def select(self, tag: bs4.Tag, limit: int = 0, max_work: int | None = None) -> list[bs4.Tag]:
         """Select the specified tags."""
 
-        return list(self.iselect(tag, limit))
+        return list(self.iselect(tag, limit, max_work=max_work))
 
-    def iselect(self, tag: bs4.Tag, limit: int = 0) -> Iterator[bs4.Tag]:
+    def iselect(self, tag: bs4.Tag, limit: int = 0, max_work: int | None = None) -> Iterator[bs4.Tag]:
         """Iterate the specified tags."""
 
-        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags).select(limit)
+        budget = _WorkBudget(max_work) if max_work is not None else None
+        yield from CSSMatch(self.selectors, tag, self.namespaces, self.flags, budget).select(limit)
 
     def __repr__(self) -> str:  # pragma: no cover
         """Representation."""

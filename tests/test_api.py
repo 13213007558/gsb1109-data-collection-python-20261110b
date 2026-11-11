@@ -830,3 +830,93 @@ class TestSyntaxErrorReporting(util.TestCase):
         self.assertEqual(e.line, None)
         self.assertEqual(e.col, None)
         self.assertEqual(str(e), 'Syntax Message')
+
+
+class TestWorkBudget(util.TestCase):
+    """Test the `max_work` budget."""
+
+    markup = """
+    <html>
+    <body>
+    <div id="1">
+        <p id="2"><span id="3">text</span></p>
+        <p id="4"><span id="5">text</span></p>
+        <p id="6"><span id="7">text</span></p>
+    </div>
+    </body>
+    </html>
+    """
+
+    def test_select_within_budget(self):
+        """A sufficient budget returns the complete selection."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        ids = [el.attrs['id'] for el in sv.select('span[id]', soup, max_work=1000)]
+        self.assertEqual(sorted(['3', '5', '7']), sorted(ids))
+
+    def test_select_budget_exceeded(self):
+        """An exhausted budget raises instead of returning a partial selection."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        with self.assertRaises(sv.SelectorWorkError):
+            sv.select('span[id]', soup, max_work=2)
+
+    def test_iselect_budget_exceeded(self):
+        """An exhausted budget interrupts iteration with an explicit error."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        results = []
+        iterator = sv.iselect('span[id]', soup, max_work=2)
+        with self.assertRaises(sv.SelectorWorkError):
+            while True:
+                results.append(next(iterator))
+        self.assertNotEqual(3, len(results))
+
+    def test_repeated_visits_count(self):
+        """Evaluating the same element again, via `:has()`, still spends the budget."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        # A single element match walks multiple descendants, each evaluation spends work.
+        self.assertTrue(sv.match('div:has(span)', soup.find('div'), max_work=1000))
+        with self.assertRaises(sv.SelectorWorkError):
+            sv.match('div:has(span)', soup.find('div'), max_work=1)
+
+    def test_closest_budget_exceeded(self):
+        """`closest` respects the budget."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        span = soup.find('span', id='3')
+        self.assertEqual('1', sv.closest('div[id]', span, max_work=1000).attrs['id'])
+        with self.assertRaises(sv.SelectorWorkError):
+            sv.closest('div[id]', span, max_work=0)
+
+    def test_filter_budget_exceeded(self):
+        """`filter` shares one budget across the whole iterable."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        spans = soup.find_all('span')
+        self.assertEqual(3, len(sv.filter('span[id]', spans, max_work=1000)))
+        with self.assertRaises(sv.SelectorWorkError):
+            sv.filter('span[id]', spans, max_work=2)
+
+    def test_select_one_budget_exceeded(self):
+        """`select_one` respects the budget."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        self.assertEqual('3', sv.select_one('span[id]', soup, max_work=1000).attrs['id'])
+        with self.assertRaises(sv.SelectorWorkError):
+            sv.select_one('span[id]', soup, max_work=0)
+
+    def test_no_budget_keeps_original_behavior(self):
+        """Calls without a budget are not limited."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        ids = [el.attrs['id'] for el in sv.select('span[id]', soup)]
+        self.assertEqual(sorted(['3', '5', '7']), sorted(ids))
+
+    def test_negative_budget(self):
+        """A negative budget is rejected."""
+
+        soup = self.soup(self.markup, 'html.parser')
+        with self.assertRaises(ValueError):
+            sv.select('span[id]', soup, max_work=-1)

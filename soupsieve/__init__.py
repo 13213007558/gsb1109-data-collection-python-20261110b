@@ -30,12 +30,12 @@ from .__meta__ import __version__, __version_info__  # noqa: F401
 from . import css_parser as cp
 from . import css_match as cm
 from . import css_types as ct
-from .util import DEBUG, NOCACHE, NOSTRICT, SelectorSyntaxError  # noqa: F401
+from .util import DEBUG, NOCACHE, NOSTRICT, SelectorSyntaxError, SelectorWorkError  # noqa: F401
 import bs4
 from typing import Any, Mapping, Iterator, Iterable, cast
 
 __all__ = (
-    'DEBUG', 'NOCACHE', 'NOSTRICT', 'SelectorSyntaxError', 'CustomSelectors', 'SoupSieve',
+    'DEBUG', 'NOCACHE', 'NOSTRICT', 'SelectorSyntaxError', 'SelectorWorkError', 'CustomSelectors', 'SoupSieve',
     'closest', 'compile', 'filter', 'iselect', 'match', 'select', 'select_one'
 )
 
@@ -91,6 +91,7 @@ def closest(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    max_work: int | None = None,
     **kwargs: Any
 ) -> bs4.Tag | None:
     """Match closest ancestor."""
@@ -103,7 +104,7 @@ def closest(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).closest(tag)
+    ).closest(tag, max_work=max_work)
 
 
 def match(
@@ -115,6 +116,7 @@ def match(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    max_work: int | None = None,
     **kwargs: Any
 ) -> bool:
     """Match node."""
@@ -127,7 +129,7 @@ def match(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).match(tag)
+    ).match(tag, max_work=max_work)
 
 
 def filter(  # noqa: A001
@@ -139,6 +141,7 @@ def filter(  # noqa: A001
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    max_work: int | None = None,
     **kwargs: Any
 ) -> list[bs4.Tag]:
     """Filter list of nodes."""
@@ -151,7 +154,7 @@ def filter(  # noqa: A001
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).filter(iterable)
+    ).filter(iterable, max_work=max_work)
 
 
 def select_one(
@@ -163,6 +166,7 @@ def select_one(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    max_work: int | None = None,
     **kwargs: Any
 ) -> bs4.Tag | None:
     """Select a single tag."""
@@ -175,7 +179,7 @@ def select_one(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).select_one(tag)
+    ).select_one(tag, max_work=max_work)
 
 
 def select(
@@ -188,6 +192,7 @@ def select(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    max_work: int | None = None,
     **kwargs: Any
 ) -> list[bs4.Tag]:
     """Select the specified tags."""
@@ -200,7 +205,7 @@ def select(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).select(tag, limit)
+    ).select(tag, limit, max_work=max_work)
 
 
 def iselect(
@@ -213,6 +218,7 @@ def iselect(
     custom: Mapping[str, str | ct.SelectorList] | None = None,
     ignore: Iterable[str] | None = None,
     max_selectors: int = cp.SELECTOR_LIMIT,
+    max_work: int | None = None,
     **kwargs: Any
 ) -> Iterator[bs4.Tag]:
     """Iterate the specified tags."""
@@ -225,7 +231,7 @@ def iselect(
         ignore=ignore,
         max_selectors=max_selectors,
         **kwargs
-    ).iselect(tag, limit)
+    ).iselect(tag, limit, max_work=max_work)
 
 
 def escape(ident: str) -> str:
