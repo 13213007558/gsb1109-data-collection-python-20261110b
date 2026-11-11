@@ -428,3 +428,93 @@ class JSONDecoder(object):
             elif ord0 == 0xef and s[idx:idx + 3] == '\xef\xbb\xbf':
                 idx += 3
         return self.scan_once(s, idx=_w(s, idx).end())
+
+    def iter_decode(self, s, idx=0):
+        """Decode consecutive JSON values from ``s`` (a ``str`` or
+        ``unicode`` instance holding one or more JSON values packed
+        together, with or without separating whitespace) and iterate
+        over their Python representations.
+
+        This is the streaming counterpart of :meth:`raw_decode`: each
+        iteration produces one complete top-level JSON value (string,
+        number, boolean, ``null``, array, or object) and scanning
+        resumes immediately after it. Values are never split on a
+        guess: every term is scanned greedily, so adjacent digits that
+        form one lexical number (e.g. ``'12345'`` or ``'1.5e3'``) are
+        always delivered as a single value rather than cut in two.
+
+        The returned iterator exposes the exact position of the first
+        character following the most recently produced value as its
+        :attr:`last_end` attribute (initially ``idx``). Breaking out of
+        iteration leaves :attr:`last_end` pointing at the unscanned
+        remainder, so another call (or :meth:`raw_decode`) can resume
+        from that index::
+
+            it = decoder.iter_decode('1 "two" [3] {"x": 4}')
+            for value in it:
+                ...
+                if done:
+                    break
+            remainder = s[it.last_end:]
+
+        If a value cannot be decoded, :exc:`JSONDecodeError` is raised
+        with ``pos`` set to the index where that value begins. Values
+        already produced before the failure are not affected.
+
+        """
+        return _IterDecode(self, s, idx)
+
+
+class _IterDecode(object):
+    """Iterator over the consecutive JSON values in a single string.
+
+    ``last_end`` tracks the index immediately after the value returned
+    by the most recent __next__ call (or the start index before the
+    first call), which is the precise position where scanning would
+    resume.
+    """
+
+    def __init__(self, decoder, s, idx=0, _w=WHITESPACE.match, _PY3=PY3):
+        if _PY3 and isinstance(s, bytes):
+            s = str(s, decoder.encoding)
+        elif _PY3 and not isinstance(s, str):
+            raise TypeError("Input string must be text, not bytes")
+        if idx < 0:
+            # Match raw_decode/scan_once behavior for negative indexes. #98
+            raise JSONDecodeError('Expecting value', s, idx)
+        # strip UTF-8 bom
+        if len(s) > idx:
+            ord0 = ord(s[idx])
+            if ord0 == 0xfeff:
+                idx += 1
+            elif ord0 == 0xef and s[idx:idx + 3] == '\xef\xbb\xbf':
+                idx += 3
+        self._scan_once = decoder.scan_once
+        self._w = _w
+        self._s = s
+        self.last_end = idx
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        s = self._s
+        idx = self._w(s, self.last_end).end()
+        if idx >= len(s):
+            raise StopIteration
+        try:
+            obj, end = self._scan_once(s, idx)
+        except JSONDecodeError as exc:
+            # Report the start of the value that could not be decoded
+            # rather than an inner position, so the boundary of the bad
+            # tail is unambiguous. The original error is retained as the
+            # exception cause (a plain attribute on Python 2); already
+            # produced values stay valid.
+            new_exc = JSONDecodeError(exc.msg, s, idx)
+            new_exc.__cause__ = exc
+            raise new_exc
+        self.last_end = end
+        return obj
+
+    # Python 2 compatibility
+    next = __next__

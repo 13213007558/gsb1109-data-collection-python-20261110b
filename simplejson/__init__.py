@@ -120,7 +120,7 @@ Serializing multiple objects to JSON lines (newline-delimited JSON)::
 from __future__ import absolute_import
 __version__ = '4.2.0'
 __all__ = [
-    'dump', 'dumps', 'load', 'loads',
+    'dump', 'dumps', 'load', 'loads', 'iter_decode',
     'JSONDecoder', 'JSONDecodeError', 'JSONEncoder',
     'OrderedDict', 'simple_first', 'RawJSON'
 ]
@@ -537,6 +537,62 @@ def loads(s, encoding=None, cls=None, object_hook=None, parse_float=None,
     if allow_nan:
         kw['allow_nan'] = True
     return cls(encoding=encoding, **kw).decode(s)
+
+
+def iter_decode(s, idx=0, encoding=None, cls=None, object_hook=None,
+        parse_float=None, parse_int=None, parse_constant=None,
+        object_pairs_hook=None, use_decimal=False, allow_nan=False,
+        array_hook=None, **kw):
+    """Iterate over the consecutive JSON values contained in ``s``.
+
+    Unlike :func:`loads`, which requires exactly one JSON document,
+    :func:`iter_decode` accepts any number of JSON values packed into
+    one string, with or without whitespace between them (e.g. chunks
+    of a streamed HTTP response that were concatenated mid-document
+    boundary). Every top-level value -- strings, numbers, booleans,
+    ``null``, arrays, and objects -- is supported.
+
+    It returns an iterator whose :attr:`last_end` attribute is the
+    index immediately following the most recently produced value; that
+    is the exact position at which scanning would resume. A malformed
+    tail raises :exc:`JSONDecodeError` whose ``pos`` points at the
+    start of the value that could not be decoded, while the values
+    already produced by the iterator remain valid::
+
+        >>> it = iter_decode('1 "x" [3]')
+        >>> list(it)
+        [1, 'x', [3]]
+        >>> it.last_end
+        9
+
+    Adjacent values are split only at lexical boundaries. A run of
+    digits with no separator is a single JSON number and is never cut
+    into several values on a guess.
+
+    The decoder keyword arguments are the same as for :func:`loads`.
+
+    """
+    if cls is None:
+        cls = JSONDecoder
+    if object_hook is not None:
+        kw['object_hook'] = object_hook
+    if object_pairs_hook is not None:
+        kw['object_pairs_hook'] = object_pairs_hook
+    if array_hook is not None:
+        kw['array_hook'] = array_hook
+    if parse_float is not None:
+        kw['parse_float'] = parse_float
+    if parse_int is not None:
+        kw['parse_int'] = parse_int
+    if parse_constant is not None:
+        kw['parse_constant'] = parse_constant
+    if use_decimal:
+        if parse_float is not None:
+            raise TypeError("use_decimal=True implies parse_float=Decimal")
+        kw['parse_float'] = Decimal
+    if allow_nan:
+        kw['allow_nan'] = True
+    return cls(encoding=encoding, **kw).iter_decode(s, idx)
 
 
 def _toggle_speedups(enabled):

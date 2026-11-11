@@ -1,3 +1,13 @@
+Unreleased
+
+* Add ``JSONDecoder.iter_decode`` and the module-level
+  ``simplejson.iter_decode``, which iterate over consecutive JSON
+  values packed into one string (with or without whitespace between
+  them). The returned iterator exposes a ``last_end`` attribute with
+  the exact position after the most recently decoded value; a
+  malformed value raises ``JSONDecodeError`` positioned at that
+  value's start without discarding previously decoded values
+
 Version 4.2.0 released 2026-10-02
 
 * Start building wheels for Python 3.15 and drop Python 3.8 support

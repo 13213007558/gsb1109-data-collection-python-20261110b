@@ -457,6 +457,37 @@ Basic Usage
     ``'Infinity'``, ``'NaN'``. It is not recommended to use this feature,
     as it is rare to parse non-compliant JSON containing these values.
 
+.. function:: iter_decode(s, idx=0, encoding='utf-8', cls=None, object_hook=None, \
+                          parse_float=None, parse_int=None, \
+                          parse_constant=None, object_pairs_hook=None, \
+                          use_decimal=None, allow_nan=False, array_hook=None, **kw)
+
+    Iterate over the consecutive JSON values contained in *s*. Where
+    :func:`loads` requires exactly one JSON document, :func:`iter_decode`
+    accepts any number of values packed into one string, with or without
+    whitespace (including newlines) between them. This is useful when
+    streamed responses have been concatenated and document boundaries
+    have been lost. Every top-level value is supported: strings,
+    numbers, booleans, ``null``, arrays, and objects.
+
+    The returned iterator yields one decoded value per iteration. It
+    also exposes a ``last_end`` attribute: the index immediately
+    following the most recently produced value, i.e. the exact position
+    where scanning would resume. Breaking out of iteration leaves
+    ``last_end`` pointing at the unscanned remainder, so iteration (or
+    :meth:`JSONDecoder.raw_decode`) can resume from that index. Before
+    the first value is produced, ``last_end`` equals *idx*.
+
+    Values are only split at lexical boundaries. A run of digits with
+    no separator is one JSON number and is never cut into several
+    values.
+
+    If a value cannot be decoded, :exc:`JSONDecodeError` is raised with
+    its ``pos`` set to the index where that value begins; values
+    already produced before the failure are not affected. The
+    underlying scanner error is retained as the exception cause.
+
+    The decoder keyword arguments are the same as for :func:`loads`.
 
 Encoders and decoders
 ---------------------
@@ -569,6 +600,20 @@ Encoders and decoders
 
       :exc:`JSONDecodeError` will be raised if the given JSON
       document is not valid.
+
+   .. method:: iter_decode(s[, idx=0])
+
+      Return an iterator over the consecutive JSON values in *s*, starting
+      at *idx*. Each iteration decodes one complete top-level value and
+      resumes immediately after it, so values packed together without
+      separating whitespace are handled. The iterator's ``last_end``
+      attribute gives the index right after the most recently produced
+      value; it equals *idx* before the first iteration.
+
+      A value that cannot be decoded raises :exc:`JSONDecodeError` with
+      ``pos`` at the start of that value, leaving the values already
+      produced untouched. Adjacent digits forming a single lexical number
+      are always returned as one value.
 
 .. class:: JSONEncoder(skipkeys=False, ensure_ascii=True, \
                        check_circular=True, allow_nan=False, sort_keys=False, \
