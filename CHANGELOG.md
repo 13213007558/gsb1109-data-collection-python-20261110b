@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+* Add support for reading and writing files with multi-character delimiters
+  (such as ``||``) when the dialect is explicitly specified. Reading is
+  handled by a new pure-Python parser (``clevercsv.pyparser``) that mirrors
+  the C parser, and writing by a pure-Python fallback in
+  ``clevercsv.writer``. Dialect detection is unchanged and only considers
+  single-character delimiters.
+
 ## Version 0.8.5
 
 * Fix reference counting bug in C extension 

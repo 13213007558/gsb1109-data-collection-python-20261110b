@@ -37,7 +37,12 @@ class SimpleDialect:
     Parameters
     ----------
     delimiter : str
-        The delimiter of the CSV file.
+        The delimiter of the CSV file. This may be a string of more than
+        one character, in which case reading and writing are handled by
+        the pure-Python parser and writer (see
+        :mod:`clevercsv.pyparser`). Note that dialects with a
+        multi-character delimiter cannot be converted to a dialect of
+        the Python ``csv`` module.
 
     quotechar : str
         The quotechar of the file.
@@ -63,10 +68,9 @@ class SimpleDialect:
         self.strict = strict
 
     def validate(self) -> None:
-        if self.delimiter is None or len(self.delimiter) > 1:
+        if self.delimiter is None:
             raise ValueError(
-                "Delimiter should be zero or one characters, got: %r"
-                % self.delimiter
+                "Delimiter should be a string, got: %r" % self.delimiter
             )
         if self.quotechar is None or len(self.quotechar) > 1:
             raise ValueError(
@@ -103,6 +107,12 @@ class SimpleDialect:
         return cls(delimiter, quotechar, escapechar, strict=d.strict)
 
     def to_csv_dialect(self) -> csv.Dialect:
+        if self.delimiter is not None and len(self.delimiter) > 1:
+            raise ValueError(
+                "Cannot convert dialect with multi-character delimiter "
+                "(%r) to a csv.Dialect object." % self.delimiter
+            )
+
         class dialect(csv.Dialect):
             assert self.delimiter is not None
             delimiter = self.delimiter

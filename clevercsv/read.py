@@ -15,6 +15,8 @@ from typing import Iterable
 from typing import Iterator
 from typing import List
 from typing import Optional
+from typing import Union
+from typing import cast
 
 from . import field_size_limit
 from ._types import _DialectLike
@@ -22,6 +24,7 @@ from .cparser import Error as ParserError
 from .cparser import Parser
 from .dialect import SimpleDialect
 from .exceptions import Error
+from .pyparser import PyParser
 
 
 class reader:
@@ -35,7 +38,7 @@ class reader:
         self.original_dialect = dialect
         self._dialect = self._make_simple_dialect(dialect, **fmtparams)
         self.line_num: int = 0
-        self.parser_gen: Optional[Parser] = None
+        self.parser_gen: Optional[Union[Parser, PyParser]] = None
 
     @property
     def dialect(self) -> csv.Dialect:
@@ -59,7 +62,15 @@ class reader:
         return sd
 
     def __iter__(self) -> Iterator[List[str]]:
-        self.parser_gen = Parser(
+        parser_class: Union[type[Parser], type[PyParser]] = Parser
+        if (
+            self._dialect.delimiter is not None
+            and len(self._dialect.delimiter) > 1
+        ):
+            # The C parser only supports single-character delimiters, use
+            # the pure-Python parser for multi-character delimiters.
+            parser_class = PyParser
+        self.parser_gen = parser_class(
             self.csvfile,
             delimiter=self._dialect.delimiter,
             quotechar=self._dialect.quotechar,
@@ -78,4 +89,4 @@ class reader:
         except ParserError as e:
             raise Error(str(e))
         self.line_num += 1
-        return row
+        return cast(List[str], row)

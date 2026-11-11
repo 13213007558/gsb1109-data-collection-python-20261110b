@@ -19,6 +19,7 @@ from .cparser import Error as ParserError
 from .cparser import Parser
 from .dialect import SimpleDialect
 from .exceptions import Error
+from .pyparser import PyParser
 
 _FIELD_SIZE_LIMIT: int = 128 * 1024
 
@@ -54,7 +55,12 @@ def _parse_data(
     strict: bool,
     return_quoted: bool = False,
 ) -> Iterator[Union[List[str], List[Tuple[str, bool]]]]:
-    parser = Parser(
+    parser_class: Union[type[Parser], type[PyParser]] = Parser
+    if delimiter is not None and len(delimiter) > 1:
+        # The C parser only supports single-character delimiters, use the
+        # pure-Python parser for multi-character delimiters.
+        parser_class = PyParser
+    parser = parser_class(
         data,
         delimiter=delimiter,
         quotechar=quotechar,
