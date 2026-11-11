@@ -1,6 +1,7 @@
 # History
 
 ## Unreleased
+* Add optional content-versioned dependency declarations to the SQLite backend, so a derived cached response is only reused while its input responses still match their declared versions; distinguish missing inputs, version mismatches, and dependency cycles
 * Fix `ValueError` when a response has an invalid `Expires` date (for example `Expires: garbage`); it is now treated as already expired
 * Fix JSON refresh comparisons for mixed-case `Content-Type` values
 * Keep caller-supplied MongoDB clients open when closing MongoDB or GridFS caches

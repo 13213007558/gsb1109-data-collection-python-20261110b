@@ -88,6 +88,65 @@ enabled with the `wal` option:
 >>> backend = SQLiteCache(wal=True)
 ```
 
+## Content-Versioned Dependencies
+Some cached responses are derived from other cached responses — for example, a merged or paginated
+response assembled from several input responses. When you read such a derived result, it should
+only be reused if every input it was built from still matches the version used to generate it. If
+an input is re-fetched with different content (even at the same URL / cache key), the derived
+result must be regenerated.
+
+The SQLite backend supports this with optional dependency declarations. Every cached item gets a
+content version derived from its response body. Re-saving an item with the **same body but a new
+expiration time keeps the same version**, so refreshing expiry does not invalidate dependent
+results. Items without any declared dependencies continue to behave exactly as before.
+
+Declare the inputs of a derived response with {py:meth}`.SQLiteCache.declare_dependencies`, passing
+either an iterable of input cache keys (their current versions are captured for you) or an explicit
+mapping of cache key to required version:
+```python
+>>> backend = SQLiteCache()
+>>> # 'merged' was assembled from the responses cached under 'page-1' and 'page-2'
+>>> backend.declare_dependencies('merged', ['page-1', 'page-2'])
+```
+
+Before reusing the result, check its dependencies. Use the non-raising form to inspect the outcome:
+```python
+>>> backend.check_dependencies('merged')
+<DependencyStatus.VALID: 'valid'>
+```
+
+The possible outcomes are enumerated in {py:class}`.DependencyStatus`:
+
+- `VALID`: every declared dependency is present at the declared version.
+- `NO_DEPENDENCIES`: the item declared no dependencies (always reusable, like a normal cache entry).
+- `NOT_CACHED`: the item itself is not in the cache.
+- `MISSING`: one of the declared input keys is no longer cached.
+- `VERSION_MISMATCH`: an input is present, but its content no longer matches the declared version.
+- `CYCLE`: the dependency declarations reachable from the item form a cycle.
+
+Alternatively, use {py:meth}`.SQLiteCache.raise_for_dependencies`, which raises a specific
+exception for each failure case, or {py:meth}`.SQLiteCache.get_dependency_aware_response`, which
+returns the cached response only when all dependencies are satisfied and otherwise a default:
+```python
+>>> from requests_cache.backends.sqlite import (
+...     MissingDependencyError,
+...     DependencyVersionMismatchError,
+...     DependencyCycleError,
+... )
+>>> try:
+...     backend.raise_for_dependencies('merged')
+... except (MissingDependencyError, DependencyVersionMismatchError, DependencyCycleError):
+...     pass  # regenerate the derived result instead
+>>> # Or, without handling exceptions:
+>>> response = backend.get_dependency_aware_response('merged')  # None if any check fails
+```
+
+Checks are transitive: if `merged` depends on `page-1`, which in turn depends on `raw`, then a
+missing or changed `raw` is detected when reading `merged`. A dependency declared with an explicit
+version of `None` only requires that key to be present, regardless of its content. Declarations are
+removed automatically when their owning item is deleted, and replacing the whole cache with
+{py:meth}`.SQLiteCache.clear` resets all dependency state.
+
 ## Hosting Services and Filesystem Compatibility
 There are some caveats to using SQLite with some hosting services, based on what kind of storage is
 available:

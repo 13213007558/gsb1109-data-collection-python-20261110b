@@ -11,7 +11,14 @@ import pytest
 from platformdirs import user_cache_dir
 
 from requests_cache.backends import BaseCache, SQLiteCache, SQLiteDict
-from requests_cache.backends.sqlite import MEMORY_URI
+from requests_cache.backends.sqlite import (
+    MEMORY_URI,
+    DependencyCycleError,
+    DependencyStatus,
+    DependencyVersionMismatchError,
+    MissingDependencyError,
+    get_content_version,
+)
 from requests_cache.models import CachedRequest, CachedResponse
 from requests_cache.policy import utcnow
 from tests.conftest import skip_pypy
@@ -107,7 +114,12 @@ class TestSQLiteDict(BaseStorageTest):
         with patch.object(cache, 'connection') as mock_connection:
             con = mock_connection().__enter__.return_value
             cache.bulk_delete(keys)
-            assert con.execute.call_count == 3
+            main_table_deletes = [
+                call
+                for call in con.execute.call_args_list
+                if f'DELETE FROM {cache.table_name} WHERE' in str(call)
+            ]
+            assert len(main_table_deletes) == 3
 
         # Second pass to actually delete keys and make sure it doesn't explode
         cache.bulk_delete(keys)
@@ -451,3 +463,259 @@ class TestSQLiteCache(BaseCacheTest):
             assert prev_item is None or prev_item.expires < item.expires
             assert item.cache_key
             assert not item.is_expired
+
+
+class TestSQLiteDependencies:
+    """Optional content-versioned dependency declarations for the SQLite backend"""
+
+    def init_cache(self, tmp_path, name='deps'):
+        return SQLiteCache(tmp_path / f'{name}.sqlite')
+
+    def make_response(self, body, expires=None):
+        response = CachedResponse(url='https://example.com')
+        response._content = body
+        if expires is not None:
+            response.expires = expires
+        return response
+
+    def test_no_dependencies_by_default(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['k'] = self.make_response(b'body')
+        assert cache.check_dependencies('k') == DependencyStatus.NO_DEPENDENCIES
+        assert cache.is_dependency_valid('k')
+        # Items without dependencies keep working exactly as before
+        assert cache.get_response('k').content == b'body'
+
+    def test_not_cached_status(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        assert cache.check_dependencies('missing') == DependencyStatus.NOT_CACHED
+        assert cache.get_dependency_aware_response('missing') is None
+        assert cache.get_dependency_aware_response('missing', 'default') == 'default'
+
+    def test_content_version_based_on_body(self):
+        r1 = self.make_response(b'abc')
+        r2 = self.make_response(b'abc')
+        r3 = self.make_response(b'xyz')
+        assert get_content_version(r1) == get_content_version(r2)
+        assert get_content_version(r1) != get_content_version(r3)
+
+    def test_version_unaffected_by_expiration_refresh(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        response = self.make_response(b'same-body')
+        cache.responses['input'] = response
+        version = cache.get_version('input')
+
+        cache.responses['input'] = self.make_response(
+            b'same-body', expires=utcnow() + timedelta(hours=2)
+        )
+        assert cache.get_version('input') == version
+
+    def test_declare_dependencies_captures_versions(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['in2'] = self.make_response(b'b')
+
+        declared = cache.declare_dependencies('derived', ['in1', 'in2'])
+        assert declared == {'in1': cache.get_version('in1'), 'in2': cache.get_version('in2')}
+        assert cache.get_dependencies('derived') == declared
+
+        # Mapping form allows explicit versions, including None (presence only)
+        cache.declare_dependencies('derived', {'in1': None})
+        assert cache.get_dependencies('derived') == {'in1': None}
+
+    def test_declare_dependencies_unknown_key(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        with pytest.raises(KeyError):
+            cache.declare_dependencies('derived', ['nope'])
+
+    def test_valid_dependencies_allow_reuse(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['in2'] = self.make_response(b'b')
+        cache.responses['derived'] = self.make_response(b'merged')
+        cache.declare_dependencies('derived', ['in1', 'in2'])
+
+        assert cache.check_dependencies('derived') == DependencyStatus.VALID
+        assert cache.is_dependency_valid('derived')
+        assert cache.get_dependency_aware_response('derived').content == b'merged'
+
+    def test_version_mismatch_when_input_content_changes(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['input'] = self.make_response(b'v1')
+        original_version = cache.get_version('input')
+        cache.responses['derived'] = self.make_response(b'merged')
+        cache.declare_dependencies('derived', ['input'])
+
+        # Same cache key (same URL), different body: the derived result must be regenerated
+        cache.responses['input'] = self.make_response(b'v2-different')
+        assert cache.get_version('input') != original_version
+        assert cache.check_dependencies('derived') == DependencyStatus.VERSION_MISMATCH
+        assert not cache.is_dependency_valid('derived')
+        assert cache.get_dependency_aware_response('derived') is None
+
+        with pytest.raises(DependencyVersionMismatchError) as exc_info:
+            cache.raise_for_dependencies('derived')
+        error = exc_info.value
+        assert error.dependency_key == 'input'
+        assert error.expected_version == original_version
+        assert error.actual_version == cache.get_version('input')
+
+    def test_missing_dependency(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['input'] = self.make_response(b'a')
+        cache.responses['derived'] = self.make_response(b'merged')
+        cache.declare_dependencies('derived', ['input'])
+        del cache.responses['input']
+
+        # The dangling reference is retained so the missing input can still be reported
+        assert 'input' in cache.get_dependencies('derived')
+        assert cache.check_dependencies('derived') == DependencyStatus.MISSING
+        with pytest.raises(MissingDependencyError) as exc_info:
+            cache.raise_for_dependencies('derived')
+        assert exc_info.value.missing_key == 'input'
+        assert exc_info.value.dependent_key == 'derived'
+
+    def test_cycle_detection(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        for key in ('a', 'b', 'c'):
+            cache.responses[key] = self.make_response(key.encode())
+        cache.declare_dependencies('a', ['b'])
+        cache.declare_dependencies('b', ['c'])
+        cache.declare_dependencies('c', ['a'])
+
+        assert cache.check_dependencies('a') == DependencyStatus.CYCLE
+        with pytest.raises(DependencyCycleError) as exc_info:
+            cache.raise_for_dependencies('a')
+        cycle = exc_info.value.cycle
+        assert cycle[0] == cycle[-1]
+        assert set(cycle) == {'a', 'b', 'c'}
+
+    def test_self_dependency_is_a_cycle(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['a'] = self.make_response(b'a')
+        cache.declare_dependencies('a', ['a'])
+        assert cache.check_dependencies('a') == DependencyStatus.CYCLE
+
+    def test_transitive_dependencies_are_checked(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        for key in ('d', 'e', 'f'):
+            cache.responses[key] = self.make_response(key.encode())
+        cache.declare_dependencies('e', ['f'])
+        cache.declare_dependencies('d', ['e'])
+        assert cache.check_dependencies('d') == DependencyStatus.VALID
+
+        f_version = cache.get_version('f')
+        cache.responses['f'] = self.make_response(b'f-changed')
+        with pytest.raises(DependencyVersionMismatchError) as exc_info:
+            cache.raise_for_dependencies('d')
+        assert exc_info.value.dependency_key == 'f'
+        assert exc_info.value.expected_version == f_version
+
+        cache.responses['f'] = self.make_response(b'f-changed')
+        del cache.responses['f']
+        assert cache.check_dependencies('d') == DependencyStatus.MISSING
+
+    def test_presence_only_dependency(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['derived'] = self.make_response(b'merged')
+        cache.declare_dependencies('derived', {'in1': None})
+
+        cache.responses['in1'] = self.make_response(b'totally-different')
+        assert cache.check_dependencies('derived') == DependencyStatus.VALID
+        del cache.responses['in1']
+        assert cache.check_dependencies('derived') == DependencyStatus.MISSING
+
+    def test_replace_and_merge_declarations(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        for key in ('a', 'b', 'c'):
+            cache.responses[key] = self.make_response(key.encode())
+
+        cache.declare_dependencies('derived', ['a'])
+        cache.declare_dependencies('derived', ['b'], replace=False)
+        assert set(cache.get_dependencies('derived')) == {'a', 'b'}
+
+        cache.declare_dependencies('derived', ['c'])
+        assert set(cache.get_dependencies('derived')) == {'c'}
+
+    def test_drop_dependencies(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['derived'] = self.make_response(b'merged')
+        cache.declare_dependencies('derived', ['in1'])
+        cache.drop_dependencies('derived')
+        assert cache.get_dependencies('derived') == {}
+        assert cache.check_dependencies('derived') == DependencyStatus.NO_DEPENDENCIES
+
+    def test_deleting_dependent_removes_its_declarations(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['derived'] = self.make_response(b'merged')
+        cache.declare_dependencies('derived', ['in1'])
+        del cache.responses['derived']
+        assert cache.get_dependencies('derived') == {}
+        assert cache.check_dependencies('in1') == DependencyStatus.NO_DEPENDENCIES
+
+    def test_persistence_across_reopen(self, tmp_path):
+        db_path = tmp_path / 'persist.sqlite'
+        cache = SQLiteCache(db_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['derived'] = self.make_response(b'merged')
+        version = cache.get_version('in1')
+        cache.declare_dependencies('derived', ['in1'])
+        cache.close()
+
+        reopened = SQLiteCache(db_path)
+        assert reopened.get_version('in1') == version
+        assert reopened.check_dependencies('derived') == DependencyStatus.VALID
+
+    def test_bulk_delete_removes_owned_declarations(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['derived'] = self.make_response(b'merged')
+        cache.declare_dependencies('derived', ['in1'])
+
+        cache.responses.bulk_delete(['derived'])
+        assert cache.get_dependencies('derived') == {}
+        assert 'in1' in cache.responses
+
+    def test_expired_delete_removes_owned_declarations(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['derived'] = self.make_response(
+            b'merged', expires=utcnow() - timedelta(1)
+        )
+        cache.declare_dependencies('derived', ['in1'])
+        cache.delete(expired=True)
+        assert cache.get_dependencies('derived') == {}
+        assert 'in1' in cache.responses
+
+    def test_clear_removes_dependency_state(self, tmp_path):
+        cache = self.init_cache(tmp_path)
+        cache.responses['in1'] = self.make_response(b'a')
+        cache.responses['derived'] = self.make_response(b'merged')
+        cache.declare_dependencies('derived', ['in1'])
+        cache.clear()
+
+        cache.responses['fresh'] = self.make_response(b'fresh')
+        assert cache.check_dependencies('fresh') == DependencyStatus.NO_DEPENDENCIES
+
+    def test_legacy_database_gets_version_column(self, tmp_path):
+        db_path = tmp_path / 'legacy.sqlite'
+        # Simulate a database created before dependency support (no version column)
+        connection = sqlite3.connect(db_path)
+        connection.execute(
+            'CREATE TABLE responses (key TEXT PRIMARY KEY, value BLOB, expires INTEGER)'
+        )
+        connection.execute(
+            "INSERT INTO responses (key, value, expires) VALUES ('old', x'00', NULL)"
+        )
+        connection.commit()
+        connection.close()
+
+        cache = SQLiteCache(db_path)
+        assert cache.get_version('old') is None
+        assert 'old' in cache.responses
+
+        cache.responses['new'] = self.make_response(b'new-body')
+        assert cache.get_version('new') == get_content_version(self.make_response(b'new-body'))

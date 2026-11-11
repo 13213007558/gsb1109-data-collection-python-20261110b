@@ -5,16 +5,18 @@
    :nosignatures:
 """
 
+import hashlib
 import sqlite3
 import threading
 from contextlib import contextmanager
+from enum import Enum
 from logging import getLogger
 from os import unlink
 from os.path import getsize, isfile
 from pathlib import Path
 from tempfile import gettempdir
 from time import sleep, time
-from typing import Collection, Iterator, List, Optional, Tuple, Type
+from typing import Collection, Dict, Iterator, List, Mapping, Optional, Tuple, Type
 
 from platformdirs import user_cache_dir
 
@@ -29,6 +31,54 @@ MEMORY_URI = 'file::memory:?cache=shared'
 SQLITE_MAX_VARIABLE_NUMBER = 999
 
 logger = getLogger(__name__)
+
+
+class DependencyError(Exception):
+    """Base class for errors raised while checking declared cache dependencies"""
+
+
+class MissingDependencyError(DependencyError):
+    """Raised when a declared dependency key is not present in the cache"""
+
+    def __init__(self, dependent_key: str, missing_key: str):
+        super().__init__(
+            f"Cached result '{dependent_key}' depends on missing cache key '{missing_key}'"
+        )
+        self.dependent_key = dependent_key
+        self.missing_key = missing_key
+
+
+class DependencyVersionMismatchError(DependencyError):
+    """Raised when a dependency is present but its content no longer matches the declared version"""
+
+    def __init__(self, dependent_key: str, dependency_key: str, expected: str, actual: str):
+        super().__init__(
+            f"Cached result '{dependent_key}' depends on version '{expected}' of "
+            f"'{dependency_key}', but current version is '{actual}'"
+        )
+        self.dependent_key = dependent_key
+        self.dependency_key = dependency_key
+        self.expected_version = expected
+        self.actual_version = actual
+
+
+class DependencyCycleError(DependencyError):
+    """Raised when dependency declarations form a cycle"""
+
+    def __init__(self, cycle: List[str]):
+        self.cycle = cycle
+        super().__init__(f"Dependency declarations form a cycle: {' -> '.join(cycle)}")
+
+
+class DependencyStatus(Enum):
+    """Possible outcomes of checking a cache item's declared dependencies"""
+
+    VALID = 'valid'
+    MISSING = 'missing'
+    VERSION_MISMATCH = 'version_mismatch'
+    CYCLE = 'cycle'
+    NO_DEPENDENCIES = 'no_dependencies'
+    NOT_CACHED = 'not_cached'
 
 
 class SQLiteCache(BaseCache):
@@ -126,10 +176,23 @@ class SQLiteCache(BaseCache):
     def _delete_expired(self):
         """A more efficient implementation of deleting expired responses in SQL"""
         with self.responses._lock, self.responses.connection(commit=True) as con:
-            con.execute(
-                f'DELETE FROM {self.responses.table_name} WHERE expires <= ?',
-                (round(time()),),
-            )
+            table = self.responses.table_name
+            deps = self.responses.dependencies_table
+            expired_keys = [
+                row[0]
+                for row in con.execute(
+                    f'SELECT key FROM {table} WHERE expires <= ?', (round(time()),)
+                ).fetchall()
+            ]
+            if not expired_keys:
+                return
+            for chunk in chunkify(expired_keys, max_size=SQLITE_MAX_VARIABLE_NUMBER):
+                marks, args = _format_sequence(chunk)
+                con.execute(f'DELETE FROM {table} WHERE key IN ({marks})', args)
+                con.execute(
+                    f'DELETE FROM {deps} WHERE dependent_key IN ({marks})',
+                    args,
+                )
 
     def _prune_redirects(self):
         """A more efficient implementation of removing invalid redirects in SQL"""
@@ -189,6 +252,71 @@ class SQLiteCache(BaseCache):
         """
         return self.responses.sorted(key, reversed, limit, expired)
 
+    # Optional dependency declarations
+    # -------------------------------
+
+    def declare_dependencies(
+        self,
+        dependent_key: str,
+        dependencies,
+        replace: bool = True,
+    ) -> Dict[str, Optional[str]]:
+        """Declare that a derived cached response depends on one or more other cached responses.
+
+        The derived response is only reusable while each dependency is still present with the same
+        content version. Re-saving an input with the same body but a new expiration time does not
+        invalidate the result.
+
+        Args:
+            dependent_key: Cache key of the derived response
+            dependencies: Mapping of dependency cache keys to required content versions, or an
+                iterable of dependency keys whose current versions are captured now
+            replace: Replace existing declarations for the dependent key; otherwise merge with them
+        """
+        return self.responses.declare_dependencies(dependent_key, dependencies, replace)
+
+    def get_dependencies(self, dependent_key: str) -> Dict[str, Optional[str]]:
+        """Return the declared dependencies of a cached response as ``{key: required_version}``"""
+        return self.responses.get_dependencies(dependent_key)
+
+    def drop_dependencies(self, dependent_key: str):
+        """Remove all dependency declarations made by a cached response"""
+        self.responses.drop_dependencies(dependent_key)
+
+    def get_version(self, key: str) -> Optional[str]:
+        """Get the current content version of a cached response, or ``None`` if not cached"""
+        return self.responses.get_version(key)
+
+    def check_dependencies(self, key: str) -> DependencyStatus:
+        """Check a response's dependencies without raising; see :class:`DependencyStatus`"""
+        return self.responses.check_dependencies(key)
+
+    def is_dependency_valid(self, key: str) -> bool:
+        """Return whether a response can be reused based on its declared dependencies"""
+        return self.responses.is_dependency_valid(key)
+
+    def raise_for_dependencies(self, key: str) -> DependencyStatus:
+        """Check a response's dependencies, raising a specific error if it cannot be reused
+
+        Raises:
+            MissingDependencyError: If a declared dependency is no longer in the cache
+            DependencyVersionMismatchError: If a dependency's content changed
+            DependencyCycleError: If the dependency declarations form a cycle
+        """
+        return self.responses.raise_for_dependencies(key)
+
+    def get_dependency_aware_response(
+        self, key: str, default=None
+    ) -> Optional[CachedResponse]:
+        """Retrieve a cached response only if it exists and all its declared dependencies are still
+        satisfied; otherwise return ``default``
+        """
+        try:
+            self.responses.raise_for_dependencies(key)
+        except DependencyError:
+            return default
+        return self.get_response(key, default)
+
 
 class SQLiteDict(BaseStorage):
     """A dictionary-like interface for SQLite"""
@@ -222,6 +350,7 @@ class SQLiteDict(BaseStorage):
         self.busy_timeout = busy_timeout
         self.fast_save = fast_save
         self.table_name = table_name
+        self.dependencies_table = f'{table_name}_dependencies'
         self.wal = wal
         self.init_db()
 
@@ -229,9 +358,14 @@ class SQLiteDict(BaseStorage):
         """Initialize the database, if it hasn't already been"""
         self.close()
         with self.connection(commit=True) as con:
-            # Add new column to tables created before 1.0
+            # Add new columns to tables created before 1.0
             try:
                 con.execute(f'ALTER TABLE {self.table_name} ADD COLUMN expires INTEGER')
+            except sqlite3.OperationalError:
+                pass
+            # Content version used by optional dependency declarations
+            try:
+                con.execute(f'ALTER TABLE {self.table_name} ADD COLUMN version TEXT')
             except sqlite3.OperationalError:
                 pass
 
@@ -239,10 +373,22 @@ class SQLiteDict(BaseStorage):
                 f'CREATE TABLE IF NOT EXISTS {self.table_name} ('
                 '    key TEXT PRIMARY KEY,'
                 '    value BLOB, '
-                '    expires INTEGER'
+                '    expires INTEGER,'
+                '    version TEXT'
                 ')'
             )
             con.execute(f'CREATE INDEX IF NOT EXISTS expires_idx ON {self.table_name}(expires)')
+
+            # Optional dependency declarations: a derived cache item (dependent) is only reusable
+            # while each of its input keys still has the declared content version
+            con.execute(
+                f'CREATE TABLE IF NOT EXISTS {self.dependencies_table} ('
+                '    dependent_key TEXT NOT NULL,'
+                '    dependency_key TEXT NOT NULL,'
+                '    version TEXT,'
+                '    PRIMARY KEY (dependent_key, dependency_key)'
+                ')'
+            )
 
     @contextmanager
     def connection(self, commit=False) -> Iterator[sqlite3.Connection]:
@@ -322,6 +468,12 @@ class SQLiteDict(BaseStorage):
     def __delitem__(self, key):
         with self.connection(commit=True) as con:
             cur = con.execute(f'DELETE FROM {self.table_name} WHERE key=?', (key,))
+            # Remove this item's own declarations. Edges pointing at a deleted dependency key are
+            # kept so dependency checks can still report a missing input.
+            con.execute(
+                f'DELETE FROM {self.dependencies_table} WHERE dependent_key=?',
+                (key,),
+            )
         if not cur.rowcount:
             raise KeyError
 
@@ -343,11 +495,13 @@ class SQLiteDict(BaseStorage):
     def _write(self, key, value):
         # If available, set expiration as a timestamp in unix format
         expires = getattr(value, 'expires_unix', None)
+        version = get_content_version(value)
         value = self.serialize(value)
         with self.connection(commit=True) as con:
             con.execute(
-                f'INSERT OR REPLACE INTO {self.table_name} (key,value,expires) VALUES (?,?,?)',
-                (key, value, expires),
+                f'INSERT OR REPLACE INTO {self.table_name} (key,value,expires,version) '
+                'VALUES (?,?,?,?)',
+                (key, value, expires, version),
             )
 
     def __iter__(self):
@@ -372,11 +526,22 @@ class SQLiteDict(BaseStorage):
                 marks, args = _format_sequence(chunk)
                 statement = f'DELETE FROM {self.table_name} WHERE {column} IN ({marks})'
                 con.execute(statement, args)
+            if keys:
+                for chunk in chunkify(keys, max_size=SQLITE_MAX_VARIABLE_NUMBER):
+                    marks, args = _format_sequence(chunk)
+                    # Only drop declarations owned by deleted items; dangling references to deleted
+                    # dependency keys are kept so checks can still report them as missing
+                    con.execute(
+                        f'DELETE FROM {self.dependencies_table} '
+                        f'WHERE dependent_key IN ({marks})',
+                        args,
+                    )
 
     def clear(self):
         with self._lock:
             with self.connection(commit=True) as con:
                 con.execute(f'DROP TABLE IF EXISTS {self.table_name}')
+                con.execute(f'DROP TABLE IF EXISTS {self.dependencies_table}')
             self.init_db()
             self.vacuum()
 
@@ -455,10 +620,196 @@ class SQLiteDict(BaseStorage):
                     self._active_transaction = False
                 self._connection.execute('VACUUM')
 
+    # Optional dependency declarations
+    # -------------------------------
+
+    def get_version(self, key: str) -> Optional[str]:
+        """Get the current content version stored for a key, or ``None`` if the key is not cached"""
+        row = self._get_version_row(key)
+        return row[0] if row else None
+
+    def _get_version_row(self, key: str) -> Optional[Tuple]:
+        with self.connection() as con:
+            # Using string interpolation for keys, matching the workaround in __getitem__
+            cur = con.execute(f"SELECT version FROM {self.table_name} WHERE key='{key}'")
+            row = cur.fetchone()
+            cur.close()
+        return row
+
+    def declare_dependencies(
+        self,
+        dependent_key: str,
+        dependencies,
+        replace: bool = True,
+    ) -> Dict[str, Optional[str]]:
+        """Declare that a cached item is derived from other cached items.
+
+        The dependent item may only be reused while every declared dependency is still present
+        and still has the declared content version. A dependency whose declared version is ``None``
+        is only required to be present.
+
+        Args:
+            dependent_key: Cache key of the derived result
+            dependencies: Either a mapping of dependency key to required content version, or an
+                iterable of dependency keys whose current versions are captured at declaration time
+            replace: Replace existing declarations for the dependent key; otherwise merge with them
+
+        Raises:
+            KeyError: If an iterable of dependency keys contains a key that is not cached
+        """
+        if not isinstance(dependencies, Mapping):
+            declared = {}
+            for dependency_key in dependencies:
+                row = self._get_version_row(dependency_key)
+                if row is None:
+                    raise KeyError(dependency_key)
+                declared[dependency_key] = row[0]
+        else:
+            declared = dict(dependencies)
+
+        with self.connection(commit=True) as con:
+            if replace:
+                con.execute(
+                    f'DELETE FROM {self.dependencies_table} WHERE dependent_key=?',
+                    (dependent_key,),
+                )
+            con.executemany(
+                f'INSERT OR REPLACE INTO {self.dependencies_table} '
+                '(dependent_key, dependency_key, version) VALUES (?,?,?)',
+                [
+                    (dependent_key, dependency_key, version)
+                    for dependency_key, version in declared.items()
+                ],
+            )
+        return dict(declared)
+
+    def get_dependencies(self, dependent_key: str) -> Dict[str, Optional[str]]:
+        """Return the declared dependencies of a cached item as ``{key: required_version}``"""
+        with self.connection() as con:
+            rows = con.execute(
+                f'SELECT dependency_key, version FROM {self.dependencies_table} '
+                'WHERE dependent_key=? ORDER BY rowid',
+                (dependent_key,),
+            ).fetchall()
+        return {dependency_key: version for dependency_key, version in rows}
+
+    def drop_dependencies(self, dependent_key: str):
+        """Remove all dependency declarations made by a cached item"""
+        with self.connection(commit=True) as con:
+            con.execute(
+                f'DELETE FROM {self.dependencies_table} WHERE dependent_key=?',
+                (dependent_key,),
+            )
+
+    def check_dependencies(self, key: str) -> DependencyStatus:
+        """Check whether a cached item's declared dependencies are still satisfied
+
+        Returns:
+            One of the :class:`DependencyStatus` values
+        """
+        status, _ = self._inspect_dependencies(key)
+        return status
+
+    def is_dependency_valid(self, key: str) -> bool:
+        """Return whether the item can be reused based on its dependencies. Items without
+        dependencies are always considered valid.
+        """
+        status = self.check_dependencies(key)
+        return status in (DependencyStatus.VALID, DependencyStatus.NO_DEPENDENCIES)
+
+    def raise_for_dependencies(self, key: str) -> DependencyStatus:
+        """Check dependencies and raise a specific error if the item cannot be reused
+
+        Raises:
+            MissingDependencyError: If a declared dependency is no longer in the cache
+            DependencyVersionMismatchError: If a dependency's content no longer matches the
+                declared version
+            DependencyCycleError: If the dependency declarations reachable from the key form a cycle
+        """
+        status, detail = self._inspect_dependencies(key)
+        if status == DependencyStatus.MISSING:
+            raise MissingDependencyError(key, detail['missing_key'])
+        if status == DependencyStatus.VERSION_MISMATCH:
+            raise DependencyVersionMismatchError(
+                key,
+                detail['dependency_key'],
+                detail['expected'],
+                detail['actual'],
+            )
+        if status == DependencyStatus.CYCLE:
+            raise DependencyCycleError(detail['cycle'])
+        return status
+
+    def _inspect_dependencies(self, key: str):
+        if self._get_version_row(key) is None:
+            return DependencyStatus.NOT_CACHED, None
+
+        own_dependencies = self.get_dependencies(key)
+        if not own_dependencies:
+            return DependencyStatus.NO_DEPENDENCIES, None
+
+        # DFS over the whole dependency graph reachable from key, validating each edge while
+        # detecting cycles; nodes in ``visited`` have already been fully validated
+        visited = set()
+        on_path = {key}
+        path = [key]
+        stack = [(key, iter(own_dependencies.items()))]
+        while stack:
+            parent, edges = stack[-1]
+            for dependency_key, expected in edges:
+                if dependency_key in on_path:
+                    index = path.index(dependency_key)
+                    return DependencyStatus.CYCLE, {'cycle': path[index:] + [dependency_key]}
+
+                # Validate every edge, even if the dependency was already reached via another path
+                row = self._get_version_row(dependency_key)
+                if row is None:
+                    return DependencyStatus.MISSING, {'missing_key': dependency_key}
+                if expected is not None and row[0] != expected:
+                    return DependencyStatus.VERSION_MISMATCH, {
+                        'dependency_key': dependency_key,
+                        'expected': expected,
+                        'actual': row[0],
+                    }
+                if dependency_key in visited:
+                    continue
+
+                on_path.add(dependency_key)
+                path.append(dependency_key)
+                stack.append(
+                    (dependency_key, iter(self.get_dependencies(dependency_key).items()))
+                )
+                break
+            else:
+                on_path.discard(parent)
+                visited.add(parent)
+                path.pop()
+                stack.pop()
+
+        return DependencyStatus.VALID, None
+
 
 def _format_sequence(values: Collection) -> Tuple[str, List]:
     """Get SQL parameter marks for a sequence-based query"""
     return ','.join(['?'] * len(values)), list(values)
+
+
+def get_content_version(value) -> Optional[str]:
+    """Compute a stable content version for a cached value.
+
+    For response objects this hashes only the stored response body, so refreshing an expiration
+    time without changing the body keeps the same version. For other values it falls back to a
+    stable representation of the value itself.
+    """
+    if hasattr(value, '_content'):
+        content = value._content or b''
+    else:
+        content = getattr(value, 'content', None)
+        if content is None:
+            content = value if isinstance(value, bytes) else repr(value).encode('utf-8')
+    if isinstance(content, str):
+        content = content.encode('utf-8')
+    return hashlib.sha256(content).hexdigest()
 
 
 def _get_sqlite_cache_path(
